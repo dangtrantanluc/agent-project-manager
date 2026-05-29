@@ -1,3 +1,41 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Node / Next.js
+node_modules/
+.next/
+frontend/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# Build
+dist/
+build/
+
+# Database / local data
 data/db/*.sqlite-shm
 data/db/*.sqlite-wal
-frontend/tsconfig.tsbuildinfo
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/settings.json
+
+# OS
+.DS_Store
+Thumbs.db
