@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BB Project Management</title>
+    <script type="module" crossorigin src="/assets/index-D1YdOqUa.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-C60peSaN.css">
+  </head>
+  <body>
+    <script>
+      // Apply theme before React loads to avoid flash
+      try {
+        const stored = JSON.parse(localStorage.getItem("bb-pm-theme") || "{}");
+        const theme = stored?.state?.theme ?? "system";
+        const dark = theme === "dark" || (theme === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+      } catch {}
+    </script>
+    <div id="root"></div>
+  </body>
+</html>

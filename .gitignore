@@ -1,0 +1,3 @@
+data/db/*.sqlite-shm
+data/db/*.sqlite-wal
+frontend/tsconfig.tsbuildinfo

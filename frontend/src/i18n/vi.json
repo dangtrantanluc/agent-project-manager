@@ -1,0 +1,14 @@
+{
+  "app.title": "BB Project Management",
+  "nav.dashboard": "Bảng điều khiển",
+  "nav.projects": "Dự án",
+  "nav.tasks": "Công việc",
+  "nav.worklogs": "Nhật ký",
+  "nav.members": "Thành viên",
+  "auth.login": "Đăng nhập",
+  "auth.register": "Đăng ký",
+  "auth.logout": "Đăng xuất",
+  "auth.email": "Email",
+  "auth.password": "Mật khẩu",
+  "auth.fullName": "Họ tên"
+}
