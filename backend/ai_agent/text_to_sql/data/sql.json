@@ -1,0 +1,64 @@
+{
+  "FewShots": [
+    {
+      "input": "Hiện tại có bao nhiêu dự án đang chạy?",
+      "query": "SELECT COUNT(*) AS total_in_progress_projects\nFROM projects p\nWHERE p.status = 'IN_PROGRESS'::\"ProjectStatus\";"
+    },
+    {
+      "input": "Danh sách các dự án đang chạy",
+      "query": "SELECT p.id, p.name AS project_name, p.code, p.priority, p.start_date, p.end_date\nFROM projects p\nWHERE p.status = 'IN_PROGRESS'::\"ProjectStatus\"\nORDER BY p.priority DESC, p.end_date NULLS LAST, p.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Dự án nào sắp tới deadline nhất?",
+      "query": "SELECT p.id, p.name AS project_name, p.end_date, p.status\nFROM projects p\nWHERE p.end_date IS NOT NULL\n  AND p.status NOT IN ('DONE'::\"ProjectStatus\", 'CANCELLED'::\"ProjectStatus\")\nORDER BY p.end_date ASC, p.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Liệt kê các task quá hạn",
+      "query": "SELECT t.id, t.name AS task_name, t.deadline, t.status, p.name AS project_name, u.full_name AS assignee_name\nFROM tasks t\nJOIN projects p ON p.id = t.project_id\nLEFT JOIN users u ON u.id = t.assignee_id\nWHERE t.deadline < CURRENT_DATE\n  AND t.status <> 'DONE'::\"TaskStatus\"\nORDER BY t.deadline ASC, t.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Danh sách task đang làm của dự án CRM",
+      "query": "SELECT t.id, t.name AS task_name, t.status, t.priority, t.deadline, u.full_name AS assignee_name\nFROM tasks t\nJOIN projects p ON p.id = t.project_id\nLEFT JOIN users u ON u.id = t.assignee_id\nWHERE p.name ILIKE '%CRM%'\n  AND t.status = 'IN_PROGRESS'::\"TaskStatus\"\nORDER BY t.deadline NULLS LAST, t.priority DESC, t.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Ai đang phụ trách các task urgent?",
+      "query": "SELECT t.id, t.name AS task_name, p.name AS project_name, u.full_name AS assignee_name, t.deadline\nFROM tasks t\nJOIN projects p ON p.id = t.project_id\nLEFT JOIN users u ON u.id = t.assignee_id\nWHERE t.priority = 'URGENT'::\"Priority\"\n  AND t.status <> 'DONE'::\"TaskStatus\"\nORDER BY t.deadline NULLS LAST, t.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Tiến độ từng milestone của dự án MTL",
+      "query": "SELECT m.id, m.name AS milestone_name, m.status, m.due_date, m.completion_pct, m.task_count, m.done_count\nFROM milestones m\nJOIN projects p ON p.id = m.project_id\nWHERE p.name ILIKE '%MTL%'\nORDER BY m.due_date NULLS LAST, m.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Tổng số giờ đã log theo từng dự án",
+      "query": "SELECT p.id, p.name AS project_name, COALESCE(SUM(w.hours), 0) AS total_logged_hours\nFROM projects p\nLEFT JOIN worklogs w ON w.project_id = p.id\nGROUP BY p.id, p.name\nORDER BY total_logged_hours DESC, p.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Danh sách worklog gần đây",
+      "query": "SELECT w.work_date, u.full_name AS user_name, t.name AS task_name, p.name AS project_name, w.description, w.hours\nFROM worklogs w\nLEFT JOIN users u ON u.id = w.user_id\nLEFT JOIN tasks t ON t.id = w.task_id\nLEFT JOIN projects p ON p.id = w.project_id\nORDER BY w.work_date DESC, w.id DESC\nLIMIT 10;"
+    },
+    {
+      "input": "Danh sách worklog của Nguyễn Văn A",
+      "query": "SELECT w.work_date, t.name AS task_name, p.name AS project_name, w.description, w.hours\nFROM worklogs w\nJOIN users u ON u.id = w.user_id\nLEFT JOIN tasks t ON t.id = w.task_id\nLEFT JOIN projects p ON p.id = w.project_id\nWHERE u.full_name ILIKE '%Nguyễn Văn A%'\nORDER BY w.work_date DESC, w.id DESC\nLIMIT 10;"
+    },
+    {
+      "input": "Mỗi thành viên đã log bao nhiêu giờ?",
+      "query": "SELECT u.id, u.full_name AS user_name, COALESCE(SUM(w.hours), 0) AS total_logged_hours\nFROM users u\nLEFT JOIN worklogs w ON w.user_id = u.id\nWHERE u.active = TRUE\nGROUP BY u.id, u.full_name\nORDER BY total_logged_hours DESC, u.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Tổng giờ đã log của từng dự án là bao nhiêu?",
+      "query": "SELECT p.id, p.name AS project_name, p.total_hours\nFROM projects p\nORDER BY p.total_hours DESC, p.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Task nào có tổng giờ log nhiều nhất?",
+      "query": "SELECT t.id, t.name AS task_name, p.name AS project_name, COALESCE(SUM(w.hours), 0) AS total_logged_hours\nFROM tasks t\nJOIN projects p ON p.id = t.project_id\nLEFT JOIN worklogs w ON w.task_id = t.id\nGROUP BY t.id, t.name, p.name\nORDER BY total_logged_hours DESC, t.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Task nào đang bị blocker hoặc có issue?",
+      "query": "SELECT t.id, t.name AS task_name, p.name AS project_name, t.status, t.issues, u.full_name AS assignee_name\nFROM tasks t\nJOIN projects p ON p.id = t.project_id\nLEFT JOIN users u ON u.id = t.assignee_id\nWHERE NULLIF(BTRIM(t.issues), '') IS NOT NULL\n  AND t.status <> 'DONE'::\"TaskStatus\"\nORDER BY t.deadline NULLS LAST, t.id ASC\nLIMIT 10;"
+    },
+    {
+      "input": "Câu hỏi này không liên quan đến dữ liệu dự án",
+      "query": "SELECT 'INVALID_QUESTION' AS message;"
+    }
+  ]
+}

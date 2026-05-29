@@ -1,0 +1,339 @@
+// BB-PM Database Schema — dbdiagram.io
+// Generated: 2026-05-23
+
+// ─── ENUMS ────────────────────────────────────────────────────────────────────
+
+Enum Role {
+  SUPER_ADMIN
+  ADMIN
+  MEMBER
+}
+
+Enum ProjectStatus {
+  PLANNED
+  PENDING
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+Enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+Enum TaskStatus {
+  PLANNED
+  IN_PROGRESS
+  DONE
+}
+
+Enum BlockerSeverity {
+  LOW
+  MED
+  HIGH
+}
+
+Enum ChannelKind {
+  gapo
+  zalo
+  slack
+}
+
+Enum FollowUpStatus {
+  PENDING
+  REPLIED
+  EXPIRED
+}
+
+Enum CheckinState {
+  IDLE
+  AWAITING_PROJECT
+  AWAITING_TASK
+  AWAITING_HOURS
+  CONFIRMING
+}
+
+Enum AgentAuditSource {
+  chat
+  webhook
+  cron
+}
+
+// ─── CORE ─────────────────────────────────────────────────────────────────────
+
+Table currencies {
+  id         int         [pk, increment]
+  code       text        [not null]
+  symbol     text        [not null]
+  rate       decimal     [not null, default: 1.0]
+}
+
+Table companies {
+  id          int         [pk, increment]
+  name        text        [not null]
+  code        text
+  currency_id int         [not null, ref: > currencies.id]
+  created_at  timestamp   [not null, default: `now()`]
+  updated_at  timestamp   [not null]
+}
+
+Table users {
+  id              int         [pk, increment]
+  email           text        [not null, unique]
+  password_hash   text        [not null]
+  full_name       text        [not null]
+  avatar_url      text
+  lang            text        [not null, default: 'vi_VN']
+  timezone        text        [not null, default: 'Asia/Ho_Chi_Minh']
+  role            Role        [not null, default: 'MEMBER']
+  department      text
+  position        text
+  company_id      int         [not null, ref: > companies.id]
+  active          boolean     [not null, default: true]
+  is_super_admin  boolean     [not null, default: false]
+  last_login_at   timestamp
+  created_at      timestamp   [not null, default: `now()`]
+  updated_at      timestamp   [not null]
+}
+
+// ─── PROJECTS ─────────────────────────────────────────────────────────────────
+
+Table projects {
+  id                     int            [pk, increment]
+  name                   text           [not null]
+  code                   text
+  status                 ProjectStatus  [not null, default: 'PLANNED']
+  priority               Priority       [not null, default: 'MEDIUM']
+  start_date             date
+  end_date               date
+  description            text
+  estimated_total_hours  float
+  total_hours            float          [not null, default: 0]
+  task_count             int            [not null, default: 0]
+  member_count           int            [not null, default: 0]
+  worklog_count          int            [not null, default: 0]
+  scope_count            int            [not null, default: 0]
+  milestone_count        int            [not null, default: 0]
+  customer_name          text
+  owner_id               int            [not null, ref: > users.id]
+  company_id             int            [not null, ref: > companies.id]
+  account_manager_id     int            [ref: > users.id]
+  currency_id            int            [ref: > currencies.id]
+  created_at             timestamp      [not null, default: `now()`]
+  updated_at             timestamp      [not null]
+}
+
+Table members {
+  id          int        [pk, increment]
+  project_id  int        [not null, ref: > projects.id]
+  user_id     int        [not null, ref: > users.id]
+  role        text
+  joined_at   timestamp  [not null, default: `now()`]
+  created_at  timestamp  [not null, default: `now()`]
+  updated_at  timestamp  [not null]
+}
+
+Table milestones {
+  id              int        [pk, increment]
+  name            text       [not null]
+  status          text
+  due_date        date
+  description     text
+  task_count      int        [not null, default: 0]
+  done_count      int        [not null, default: 0]
+  completion_pct  int        [not null, default: 0]
+  project_id      int        [not null, ref: > projects.id]
+  created_at      timestamp  [not null, default: `now()`]
+  updated_at      timestamp  [not null]
+}
+
+Table scopes {
+  id               int        [pk, increment]
+  sequence         int        [not null, default: 10]
+  name             text       [not null]
+  notes            text
+  estimated_hours  decimal
+  estimated_rate   decimal
+  estimated_cost   decimal
+  project_id       int        [not null, ref: > projects.id]
+  task_id          int        [ref: > tasks.id]
+  assignee_id      int        [ref: > users.id]
+  currency_id      int        [ref: > currencies.id]
+  created_at       timestamp  [not null, default: `now()`]
+  updated_at       timestamp  [not null]
+}
+
+// ─── TASKS ────────────────────────────────────────────────────────────────────
+
+Table tasks {
+  id           int         [pk, increment]
+  name         text        [not null]
+  status       TaskStatus  [not null, default: 'PLANNED']
+  priority     Priority    [not null, default: 'MEDIUM']
+  deadline     date
+  end_at       date
+  description  text
+  result       text
+  issues       text
+  total_cost   decimal     [not null, default: 0]
+  total_hours  float       [not null, default: 0]
+  project_id   int         [not null, ref: > projects.id]
+  company_id   int         [ref: > companies.id]
+  assignee_id  int         [ref: > users.id]
+  milestone_id int         [ref: > milestones.id]
+  currency_id  int         [ref: > currencies.id]
+  created_at   timestamp   [not null, default: `now()`]
+  updated_at   timestamp   [not null]
+}
+
+Table task_blockers {
+  id           int              [pk, increment]
+  task_id      int              [not null, ref: > tasks.id]
+  severity     BlockerSeverity  [not null, default: 'MED']
+  description  text             [not null]
+  resolved_at  timestamp
+  created_at   timestamp        [not null, default: `now()`]
+}
+
+// ─── WORKLOGS ─────────────────────────────────────────────────────────────────
+
+Table worklogs {
+  id           int        [pk, increment]
+  work_date    date       [not null]
+  description  text
+  hours        decimal    [not null]
+  task_id      int        [ref: > tasks.id]
+  project_id   int        [not null, ref: > projects.id]
+  company_id   int        [ref: > companies.id]
+  user_id      int        [not null, ref: > users.id]
+  created_at   timestamp  [not null, default: `now()`]
+  updated_at   timestamp  [not null]
+}
+
+// ─── AUTH & NOTIFICATIONS ─────────────────────────────────────────────────────
+
+Table refresh_tokens {
+  id          int        [pk, increment]
+  user_id     int        [not null, ref: > users.id]
+  token_hash  text       [not null]
+  expires_at  timestamp  [not null]
+  revoked_at  timestamp
+  created_at  timestamp  [not null, default: `now()`]
+}
+
+Table notifications {
+  id          int        [pk, increment]
+  user_id     int        [not null, ref: > users.id]
+  type        text       [not null]
+  title       text       [not null]
+  message     text
+  link        text
+  read_at     timestamp
+  created_at  timestamp  [not null, default: `now()`]
+}
+
+// ─── AI AGENT ─────────────────────────────────────────────────────────────────
+
+Table gapo_user_maps {
+  id              int        [pk, increment]
+  user_id         int        [not null, ref: > users.id]
+  gapo_user_id    bigint     [not null]
+  gapo_thread_id  bigint     [not null]
+  gapo_full_name  text
+  last_seen_at    timestamp  [not null, default: `now()`]
+  created_at      timestamp  [not null, default: `now()`]
+}
+
+Table channel_identities {
+  id             int          [pk, increment]
+  user_id        int          [not null, ref: > users.id]
+  channel        ChannelKind  [not null]
+  external_id    text         [not null]
+  external_name  text
+  thread_id      text
+  preferred      boolean      [not null, default: false]
+  last_seen_at   timestamp    [not null, default: `now()`]
+  created_at     timestamp    [not null, default: `now()`]
+  updated_at     timestamp    [not null]
+}
+
+Table checkin_sessions {
+  id                  int           [pk, increment]
+  user_id             int           [not null, ref: > users.id]
+  gapo_user_id        text          [not null]
+  thread_id           text          [not null]
+  current_project_id  int
+  current_task_id     int
+  state               CheckinState  [not null, default: 'IDLE']
+  expires_at          timestamp     [not null]
+  last_message_id     text
+  pending_text        text
+  pending_parsed      json
+  completed_at        timestamp
+  created_at          timestamp     [not null, default: `now()`]
+  updated_at          timestamp     [not null]
+}
+
+Table agent_memory {
+  id               int               [pk, increment]
+  company_id       int               [not null]
+  conversation_id  text
+  source           AgentAuditSource  [not null, default: 'chat']
+  user_text        text              [not null]
+  reply_text       text              [not null]
+  summary          text              [not null]
+  tools_used       json              [not null, default: '[]']
+  project_ids      int[]
+  task_ids         int[]
+  correlation_id   text
+  created_at       timestamp         [not null, default: `now()`]
+}
+
+Table agent_audit_log {
+  id              int               [pk, increment]
+  tool            text              [not null]
+  args_json       json              [not null]
+  result_json     json
+  error_message   text
+  duration_ms     int
+  correlation_id  text
+  source          AgentAuditSource  [not null, default: 'chat']
+  created_at      timestamp         [not null, default: `now()`]
+}
+
+Table agent_follow_ups {
+  id              int            [pk, increment]
+  task_id         int            [not null, ref: > tasks.id]
+  user_id         int            [not null, ref: > users.id]
+  channel         ChannelKind    [not null, default: 'gapo']
+  thread_id       text
+  question        text           [not null]
+  status          FollowUpStatus [not null, default: 'PENDING']
+  asked_at        timestamp      [not null, default: `now()`]
+  replied_at      timestamp
+  reply_text      text
+  correlation_id  text
+  created_at      timestamp      [not null, default: `now()`]
+  updated_at      timestamp      [not null]
+}
+
+Table automations {
+  id                 int        [pk, increment]
+  name               text       [not null]
+  workflow           text       [not null]
+  schedule           text       [not null]
+  inputs             json       [not null, default: '{}']
+  target             text
+  active             boolean    [not null, default: true]
+  owner_id           int        [not null, ref: > users.id]
+  company_id         int        [not null, ref: > companies.id]
+  created_at         timestamp  [not null, default: `now()`]
+  updated_at         timestamp  [not null]
+  last_run_at        timestamp
+  last_run_status    text
+  last_run_error     text
+  consecutive_fails  int        [not null, default: 0]
+}

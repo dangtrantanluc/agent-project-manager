@@ -1,0 +1,53 @@
+# PM Domain Glossary
+# Reference for Text2SQL prompt engineering and fast-path intent matching.
+# Not imported at runtime — used as documentation for LLM prompt construction.
+
+terms:
+  project_owner:
+    description: "Người phụ trách chính / chủ dự án"
+    sql_conditions:
+      - "p.owner_id = u.id"
+    roles:
+      - OWNER
+      - PM
+      - MANAGER
+      - LEAD
+    aliases:
+      - người phụ trách
+      - ai phụ trách
+      - owner
+      - PM dự án
+      - chủ dự án
+      - quản lý dự án
+
+  active_project:
+    description: "Dự án đang hoạt động (chưa hoàn thành, chưa hủy)"
+    sql_condition: "status::text NOT IN ('COMPLETED', 'CANCELLED')"
+    aliases:
+      - dự án đang chạy
+      - dự án active
+      - dự án hiện tại
+      - project đang hoạt động
+
+  delayed_task:
+    description: "Task quá hạn chưa hoàn thành"
+    sql_conditions:
+      - "t.deadline < CURRENT_DATE"
+      - "t.status::text NOT IN ('DONE', 'CANCELLED')"
+    aliases:
+      - task trễ
+      - quá hạn
+      - chậm deadline
+      - overdue
+      - task trễ deadline
+
+  progress:
+    description: "Tiến độ hoàn thành — tỷ lệ task DONE / tổng task"
+    formula: "COUNT(*) FILTER (WHERE status='DONE') / NULLIF(COUNT(*), 0)"
+    aliases:
+      - tiến độ
+      - làm tới đâu
+      - hoàn thành bao nhiêu
+      - progress
+      - "%"
+      - tỷ lệ hoàn thành

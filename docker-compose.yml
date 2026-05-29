@@ -1,0 +1,135 @@
+services:
+  db:
+    image: postgres:16
+    container_name: db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agent_pm
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init/schema.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+      - ./init/002-bb-pm-migration.sql:/docker-entrypoint-initdb.d/002-migration.sql:ro
+      - ./init/003-align-live-backend-schema.sql:/docker-entrypoint-initdb.d/003-align-live-backend-schema.sql:ro
+      - ./init/005-simplify-status-company-budget-rates.sql:/docker-entrypoint-initdb.d/005-simplify-status-company-budget-rates.sql:ro
+      - ./init/006-project-status-pending-cancelled.sql:/docker-entrypoint-initdb.d/006-project-status-pending-cancelled.sql:ro
+      - ./init/007-task-status-three-state.sql:/docker-entrypoint-initdb.d/007-task-status-three-state.sql:ro
+      - ./init/008-restore-task-status-remove-cost-budget.sql:/docker-entrypoint-initdb.d/008-restore-task-status-remove-cost-budget.sql:ro
+      - ./init/009-task-status-four-state.sql:/docker-entrypoint-initdb.d/009-task-status-four-state.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d agent_pm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: agent_pm
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:5173,http://localhost:80}"
+      AGENT_API_TOKEN: ${AGENT_API_TOKEN:-dev-agent-token}
+      AGENT_USER_EMAIL: ${AGENT_USER_EMAIL:-pm-agent@bluebolt.local}
+      PYTHONPATH: /app
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - uploads_data:/app/uploads
+      - ./backend:/app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: /api/v1
+    container_name: frontend
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-5173}:80"
+    depends_on:
+      - backend
+  9router:
+    image: decolua/9router:latest
+    container_name: 9router
+    ports:
+      - "20128:20128"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DATA_DIR=/app/data
+      - PORT=20128
+      - HOSTNAME=0.0.0.0
+      - DEBUG=true
+    restart: unless-stopped
+
+  chatbot_agent:
+    build:
+      context: ./chatbot_agent
+      dockerfile: Dockerfile
+    container_name: chatbot_agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      BB_PM_API_URL: http://backend:8000/api/v1
+      BB_PM_AGENT_TOKEN: ${AGENT_API_TOKEN:-dev-agent-token}
+      REDIS_URL: redis://redis:6379
+      LLM_PROVIDER: ${LLM_PROVIDER:-default}
+      LLM_BASE_URL: ${LLM_BASE_URL:-${BASE_URL:-http://9router:20128/v1}}
+      LLM_API_KEY: ${LLM_API_KEY:-${API_KEY:-not-needed}}
+      LLM_MODEL: ${LLM_MODEL:-${MODEL_NAME:-Qwen/Qwen3.6-27B-FP8}}
+      NINE_ROUTER_BASE_URL: ${NINE_ROUTER_BASE_URL:-http://9router:20128/v1}
+      NINE_ROUTER_API_KEY: ${NINE_ROUTER_API_KEY:-not-needed}
+      NINE_ROUTER_MODEL: ${NINE_ROUTER_MODEL:-gemini/gemini-3-flash-preview}
+      GAPO_API_URL: ${GAPO_API_URL:-https://api.gapowork.vn/3rd-bot/v1.0/3rd/messages}
+      GAPO_BOT_TOKEN: ${GAPO_BOT_TOKEN:-}
+      GAPO_BOT_ID: ${GAPO_BOT_ID:-}
+      GAPO_SEND_TOKEN: ${GAPO_SEND_TOKEN:-}
+      GAPO_DRY_RUN: ${GAPO_DRY_RUN:-true}
+      PORT: 8001
+    ports:
+      - "${PM_AGENT_PORT:-18789}:8001"
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      9router:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  uploads_data:
+  redis_data:
