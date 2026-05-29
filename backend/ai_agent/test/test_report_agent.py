@@ -17,6 +17,10 @@ class _FakeLLM:
     async def ainvoke(self, messages):
         self.calls.append(messages)
         if len(self.calls) == 1:
+            # select_template: không khớp template nào -> fallback freeform
+            return SimpleNamespace(content='{"template_id": null, "params": {}}')
+        if len(self.calls) == 2:
+            # generate_report_plan (freeform fallback)
             return SimpleNamespace(content="""
             {
               "need_clarification": false,
@@ -38,7 +42,7 @@ class _FakeSQLAgent:
     def is_safe_sql(self, sql):
         return sql.lower().startswith("select") and sql.endswith(";")
 
-    async def execute_sql(self, sql):
+    async def execute_sql(self, sql, args=None):
         self.executed.append(sql)
         return [{"total_projects": 7}]
 
@@ -58,6 +62,8 @@ def test_report_agent_rejects_unsafe_plan_query_but_still_summarizes():
         async def ainvoke(self, messages):
             self.calls.append(messages)
             if len(self.calls) == 1:
+                return SimpleNamespace(content='{"template_id": null, "params": {}}')
+            if len(self.calls) == 2:
                 return SimpleNamespace(content='{"need_clarification": false, "queries": [{"name": "bad", "sql": "DROP TABLE projects;"}]}')
             return SimpleNamespace(content="Không thể tạo báo cáo vì query không an toàn.")
 

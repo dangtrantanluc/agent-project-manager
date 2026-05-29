@@ -17,6 +17,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 from ai_agent.prompt.prompt import SCHEMA_COMPACT
 from ai_agent.text_to_sql.text2sql import Text2SQLAgent
+from ai_agent.report_generator import report_templates
 
 
 load_dotenv()
@@ -61,6 +62,28 @@ Yêu cầu:
 - Ngắn gọn, dễ đọc.
 """
 
+REPORT_TEMPLATE_PROMPT = f"""
+Bạn là Report Template Selector.
+
+Có sẵn các template báo cáo (đã tối ưu). Hãy chọn template phù hợp nhất với yêu
+cầu và trích xuất tham số. Nếu KHÔNG có template nào phù hợp, trả template_id = null.
+
+Danh sách template:
+{report_templates.render_catalog()}
+
+Output JSON DUY NHẤT, không markdown, không giải thích:
+{{
+  "template_id": "<id template>" hoặc null,
+  "params": {{ "ten_tham_so": "giá trị" }}
+}}
+
+Quy tắc:
+- Chỉ chọn template khi yêu cầu khớp rõ ràng; nếu mơ hồ/khác loại, để template_id = null.
+- Điền đủ tham số bắt buộc; tham số chuỗi chỉ lấy từ khoá ngắn gọn (vd 'CRM', 'Lan').
+- Tham số enum chỉ dùng đúng các giá trị trong [ngoặc vuông].
+- Không bịa template_id ngoài danh sách trên.
+"""
+
 
 class ReportAgent:
     def __init__(self, llm: ChatOpenAI | None = None, sql_agent: Text2SQLAgent | None = None):
@@ -91,10 +114,51 @@ class ReportAgent:
       ])
       return benchmark_result.content
 
-    async def generate_report(self, request: str, memory_context: str = "") -> str:
-        """Generate a final user-facing report by planning, executing, then summarizing SQL queries."""
+    async def select_template(self, request: str, memory_context: str = "") -> dict[str, Any]:
+        """LLM call NHỎ: chọn template báo cáo + trích tham số bị mask.
+
+        Trả về {"template_id": str|None, "params": {...}}. Nếu không khớp template
+        nào, template_id = None để gọi đường fallback freeform.
+        """
+        memory_block = f"\nNgữ cảnh hội thoại trước đó:\n{memory_context}\n" if memory_context else ""
+        prompt = f"{REPORT_TEMPLATE_PROMPT}{memory_block}\nYêu cầu báo cáo: {request}\nOutput JSON:"
+        result = await self.benmark_time("select_template", self.llm.ainvoke, [
+            SystemMessage(content=prompt),
+            HumanMessage(content="Chọn template báo cáo"),
+        ])
+        return self._parse_report_plan(result.content)
+
+    async def _plan_queries(self, request: str, memory_context: str = "") -> dict[str, Any]:
+        """Tạo plan query theo hybrid: template-first, fallback freeform.
+
+        Trả về plan dạng {"queries": [{name, sql, args}], "need_clarification", "_source"}.
+        """
+        try:
+            selection = await self.select_template(request, memory_context=memory_context)
+        except Exception as exc:  # selector lỗi -> fallback freeform
+            print(f"select_template failed, fallback freeform: {exc}")
+            selection = {}
+
+        template_id = selection.get("template_id")
+        if template_id and template_id in report_templates.REGISTRY:
+            try:
+                queries = report_templates.build_queries(template_id, selection.get("params") or {})
+                return {
+                    "queries": queries,
+                    "need_clarification": False,
+                    "_source": f"template:{template_id}",
+                }
+            except (KeyError, ValueError) as exc:  # thiếu tham số -> fallback freeform
+                print(f"template build failed ({template_id}), fallback freeform: {exc}")
+
         raw_plan = await self.generate_report_plan(request, memory_context=memory_context)
         plan = self._parse_report_plan(raw_plan)
+        plan["_source"] = "freeform"
+        return plan
+
+    async def generate_report(self, request: str, memory_context: str = "") -> str:
+        """Generate a final user-facing report by planning, executing, then summarizing SQL queries."""
+        plan = await self._plan_queries(request, memory_context=memory_context)
 
         if plan.get("need_clarification"):
             return plan.get("clarification_question") or "Bạn cho mình thêm thông tin để tạo báo cáo chính xác hơn nhé."
@@ -113,8 +177,7 @@ class ReportAgent:
     ) -> AsyncIterator[dict]:
         full_answer = ""
         yield {"type": "status", "content": "Đang lập kế hoạch báo cáo..."}
-        raw_plan = await self.generate_report_plan(request, memory_context=memory_context)
-        plan = self._parse_report_plan(raw_plan)
+        plan = await self._plan_queries(request, memory_context=memory_context)
 
         if plan.get("need_clarification"):
             answer = plan.get("clarification_question") or "Bạn cho mình thêm thông tin để tạo báo cáo chính xác hơn nhé."
@@ -153,6 +216,7 @@ class ReportAgent:
         for item in plan.get("queries") or []:
             name = str(item.get("name") or "query")
             sql = self.sql_agent._clean_sql(str(item.get("sql") or ""))
+            args = item.get("args") or None
             if not self.sql_agent.is_safe_sql(sql):
                 query_results.append({
                     "name": name,
@@ -163,7 +227,7 @@ class ReportAgent:
                 continue
 
             try:
-                rows = await self.sql_agent.execute_sql(sql)
+                rows = await self.sql_agent.execute_sql(sql, args)
                 query_results.append({
                     "name": name,
                     "sql": sql,
@@ -243,14 +307,24 @@ class ReportAgent:
 
 
 async def main():
-    agent=ReportAgent()
-    request = ["Cho tôi một báo cáo về tiến độ dự án MTL trong tháng 5, bao gồm số lượng task đã hoàn thành, số lượng task còn lại, và những rủi ro tiềm ẩn mà dự án đang gặp phải.", 
-               "Tôi muốn một báo cáo về workload của Trần Thị Lan, bao gồm số lượng task đang làm, số lượng task đã hoàn thành, và dự đoán khối lượng công việc trong tuần tới dựa trên tiến độ hiện tại.",
-               "Hãy tạo một báo cáo về chi phí của dự án THACO, bao gồm tổng chi phí đã phát sinh, chi phí dự kiến cho phần còn lại của dự án, và những yếu tố nào đang ảnh hưởng đến chi phí."]
-    
-    for r in request:
-        result = await agent.generate_report(r)
-        print(result)
+    agent = ReportAgent()
+    requests = [
+        "tiến độ của dự án CRM là gì",          # -> template:project_progress (project_kw=CRM)
+        "tiến độ tuần này ra sao",               # -> template:period_progress (period=week)
+        "tiến độ tháng này thì sao",             # -> template:period_progress (period=month)
+        "những task nào đang quá hạn",           # -> template:overdue_upcoming
+        "workload của Phương Thảo thế nào",      # -> template:workload_by_person
+        "báo cáo chi phí dự án THACO",           # -> freeform fallback (không có template)
+    ]
+
+    for r in requests:
+        plan = await agent._plan_queries(r)
+        print(f"\n=== {r}  ->  source={plan.get('_source')}")
+        for q in plan.get("queries", []):
+            print(f"  - {q.get('name')}: args={q.get('args')}")
+        results = await agent.execute_report_queries(plan)
+        answer = await agent.generate_report_result(request=r, query_results=results)
+        print(answer)
       
 if __name__ == "__main__":
   asyncio.run(main())

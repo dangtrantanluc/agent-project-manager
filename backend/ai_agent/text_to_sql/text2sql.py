@@ -141,10 +141,12 @@ class Text2SQLAgent:
         print(f"Generate SQL time: {elapsed:.3f}s")
         return sql
     
-    async def execute_sql(self, sql: str):
+    async def execute_sql(self, sql: str, args: list | tuple | None = None):
         """Thực thi câu truy vấn SQL trên cơ sở dữ liệu và trả về kết quả.
         Args:
             sql (str): Câu truy vấn SQL cần thực thi.
+            args (list|tuple|None): Tham số positional ($1,$2,...) cho query template.
+                Mặc định None -> chạy như cũ (không tham số), tương thích ngược.
         Returns:
             list[dict]: Kết quả trả về từ việc thực thi câu truy vấn SQL, dưới dạng một danh sách các dictionary, mỗi dictionary đại diện cho một hàng kết quả với tên cột là key và giá trị là value.
         """
@@ -157,7 +159,7 @@ class Text2SQLAgent:
         )
 
         try:
-            rows = await conn.fetch(sql)
+            rows = await conn.fetch(sql, *(args or []))
             return [dict(row) for row in rows]
 
         finally:
