@@ -2,9 +2,25 @@
 --  MOCK SEED DATA — BB-PM
 --  Công ty: BBSW Software
 --  Password mặc định tất cả user: 123456
---  Không còn bảng currencies / customers —
---    tiền tệ & khách hàng được inline trực tiếp vào projects.
+--  Schema (init.sql) chỉ tạo cấu trúc; toàn bộ data (kể cả lookup
+--    currencies & task_status) nằm ở file này.
+--  Tiền tệ trên projects/tasks tham chiếu currencies qua currency_id.
 -- =============================================================
+
+-- ─── CURRENCIES (lookup) ─────────────────────────────────────
+INSERT INTO currencies (code, symbol, rate) VALUES
+  ('VND', '₫', 1.0),
+  ('USD', '$', 25000.0),
+  ('EUR', '€', 27000.0)
+ON CONFLICT (code) DO NOTHING;
+
+-- ─── TASK STATUS (lookup UI: todo/in_progress/done/cancelled) ─
+INSERT INTO task_status (code, label, color, sort_order) VALUES
+  ('todo',        'Todo',        '#94a3b8', 1),
+  ('in_progress', 'In Progress', '#3b82f6', 2),
+  ('done',        'Done',        '#22c55e', 3),
+  ('cancelled',   'Cancelled',   '#ef4444', 4)
+ON CONFLICT (code) DO NOTHING;
 
 -- ─── COMPANIES ────────────────────────────────────────────────
 INSERT INTO companies (id, name, code, updated_at)
@@ -27,7 +43,8 @@ INSERT INTO users (email, password_hash, full_name, role, department, position, 
   ('duc.dev@bbsw.vn',    '$2b$10$a1aOazHbNVhGEXBVU6zXHe.zI0wvuJF9vM4uS5BA1UUZP3v8rfD9S', 'Vũ Đức Anh',        'MEMBER',  'Kỹ thuật',      'Fullstack Developer',false, NOW()),
   ('hoa.qa@bbsw.vn',     '$2b$10$a1aOazHbNVhGEXBVU6zXHe.zI0wvuJF9vM4uS5BA1UUZP3v8rfD9S', 'Đinh Thị Hoa',      'MEMBER',  'Kiểm thử',      'QA Engineer',        false, NOW()),
   ('tung.ba@bbsw.vn',    '$2b$10$a1aOazHbNVhGEXBVU6zXHe.zI0wvuJF9vM4uS5BA1UUZP3v8rfD9S', 'Hoàng Minh Tùng',   'MEMBER',  'Phân tích',     'Business Analyst',   false, NOW()),
-  ('son.devops@bbsw.vn', '$2b$10$a1aOazHbNVhGEXBVU6zXHe.zI0wvuJF9vM4uS5BA1UUZP3v8rfD9S', 'Bùi Thanh Sơn',     'MEMBER',  'Hạ tầng',       'DevOps Engineer',    false, NOW())
+  ('son.devops@bbsw.vn', '$2b$10$a1aOazHbNVhGEXBVU6zXHe.zI0wvuJF9vM4uS5BA1UUZP3v8rfD9S', 'Bùi Thanh Sơn',     'MEMBER',  'Hạ tầng',       'DevOps Engineer',    false, NOW()),
+  ('luc@bbsw.vn',        '$2b$10$a1aOazHbNVhGEXBVU6zXHe.zI0wvuJF9vM4uS5BA1UUZP3v8rfD9S', 'Đặng Trần Tấn Lực', 'MEMBER',  'Kỹ thuật',      'Developer',          false, NOW())
 ON CONFLICT (email) DO NOTHING;
 
 -- ─── PROJECTS ────────────────────────────────────────────────
@@ -37,7 +54,7 @@ INSERT INTO projects (
   start_date, end_date, description,
   total_hours,
   task_count, member_count, worklog_count, milestone_count,
-  currency_code, currency_symbol,
+  currency_id,
   customer_name,
   owner_id, account_manager_id,
   updated_at
@@ -49,7 +66,7 @@ INSERT INTO projects (
     'Triển khai hệ thống CRM cho THACO Group — giai đoạn 1 bao gồm quản lý khách hàng, cơ hội bán hàng và báo cáo.',
     0,
     0, 0, 0, 0,
-    'VND', '₫',
+    (SELECT id FROM currencies WHERE code='VND'),
     'THACO Group',
     (SELECT id FROM users WHERE email='lan.pm@bbsw.vn'),
     (SELECT id FROM users WHERE email='lan.pm@bbsw.vn'),
@@ -62,7 +79,7 @@ INSERT INTO projects (
     'Nâng cấp hệ thống Odoo từ v16 lên v19 cho MTL Việt Nam, bao gồm migration dữ liệu và custom module.',
     0,
     0, 0, 0, 0,
-    'VND', '₫',
+    (SELECT id FROM currencies WHERE code='VND'),
     'MTL Việt Nam',
     (SELECT id FROM users WHERE email='hung.pm@bbsw.vn'),
     (SELECT id FROM users WHERE email='hung.pm@bbsw.vn'),
@@ -75,7 +92,7 @@ INSERT INTO projects (
     'Xây dựng công cụ quản lý dự án nội bộ tích hợp AI Agent để tự động hóa báo cáo và theo dõi tiến độ.',
     0,
     0, 0, 0, 0,
-    'VND', '₫',
+    (SELECT id FROM currencies WHERE code='VND'),
     NULL,
     (SELECT id FROM users WHERE email='admin@bbsw.vn'),
     (SELECT id FROM users WHERE email='lan.pm@bbsw.vn'),
@@ -88,7 +105,7 @@ INSERT INTO projects (
     'Xây dựng nền tảng dữ liệu tập trung cho Vingroup — data lake, ETL pipeline và dashboard BI.',
     0,
     0, 0, 0, 0,
-    'VND', '₫',
+    (SELECT id FROM currencies WHERE code='VND'),
     'Vingroup JSC',
     (SELECT id FROM users WHERE email='lan.pm@bbsw.vn'),
     (SELECT id FROM users WHERE email='lan.pm@bbsw.vn'),
@@ -101,7 +118,7 @@ INSERT INTO projects (
     'Ứng dụng mobile quản lý đại lý và giám sát KPI cho hệ thống phân phối THACO.',
     0,
     0, 0, 0, 0,
-    'VND', '₫',
+    (SELECT id FROM currencies WHERE code='VND'),
     'THACO Group',
     (SELECT id FROM users WHERE email='hung.pm@bbsw.vn'),
     (SELECT id FROM users WHERE email='hung.pm@bbsw.vn'),
@@ -201,209 +218,209 @@ VALUES
    (SELECT id FROM projects WHERE code='THACO-MOB-P2'), 10, 10, 100, NOW());
 
 -- ─── TASKS — THACO-CRM-P1 ────────────────────────────────────
-INSERT INTO tasks (name, status, priority, deadline, description, project_id, assignee_id, milestone_id, currency_code, currency_symbol, total_hours, total_cost, updated_at)
+INSERT INTO tasks (name, status, priority, deadline, description, project_id, assignee_id, milestone_id, total_hours, updated_at)
 VALUES
   ('Phân tích nghiệp vụ CRM', 'DONE', 'HIGH', '2026-02-10',
    'Thu thập và tài liệu hóa yêu cầu từ stakeholder THACO',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='tung.ba@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M1: Phân tích & Thiết kế'),
-   'VND', '₫', 40, 10800000, NOW()),
+   40, NOW()),
 
   ('Thiết kế DB Schema', 'DONE', 'HIGH', '2026-02-15',
    'Thiết kế schema PostgreSQL cho module customer, lead, opportunity',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M1: Phân tích & Thiết kế'),
-   'VND', '₫', 24, 7200000, NOW()),
+   24, NOW()),
 
   ('Wireframe & Prototype UI', 'DONE', 'MEDIUM', '2026-02-20',
    'Thiết kế wireframe các màn hình chính trong Figma',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='linh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M1: Phân tích & Thiết kế'),
-   'VND', '₫', 32, 8960000, NOW()),
+   32, NOW()),
 
   ('API Customer Management', 'DONE', 'HIGH', '2026-03-31',
    'CRUD API cho quản lý khách hàng, liên hệ, địa chỉ',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M2: Backend API Core'),
-   'VND', '₫', 48, 14400000, NOW()),
+   48, NOW()),
 
   ('API Lead & Opportunity', 'IN_PROGRESS', 'HIGH', '2026-05-15',
    'API quản lý lead, chuyển đổi lead → opportunity, pipeline stages',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M2: Backend API Core'),
-   'VND', '₫', 24, 4800000, NOW()),
+   24, NOW()),
 
   ('API Report & Dashboard', 'IN_PROGRESS', 'MEDIUM', '2026-05-30',
    'API thống kê doanh số, conversion rate, KPI theo dealer',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M2: Backend API Core'),
-   'VND', '₫', 16, 2400000, NOW()),
+   16, NOW()),
 
   ('Frontend: Customer List & Detail', 'DONE', 'HIGH', '2026-04-15',
    'Màn hình danh sách và chi tiết khách hàng, filter, search',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='linh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M2: Backend API Core'),
-   'VND', '₫', 40, 11200000, NOW()),
+   40, NOW()),
 
-  ('Frontend: Lead Pipeline', 'PLANNED', 'HIGH', '2026-06-01',
+  ('Frontend: Lead Pipeline', 'TODO', 'HIGH', '2026-06-01',
    'Kanban board quản lý lead, drag & drop pipeline',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='linh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M3: Frontend & UAT'),
-   'VND', '₫', 0, 0, NOW()),
+   0, NOW()),
 
   ('Test API Customer Module', 'DONE', 'MEDIUM', '2026-04-20',
    'Viết và chạy test case API customer, regression test',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='hoa.qa@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M2: Backend API Core'),
-   'VND', '₫', 24, 6000000, NOW()),
+   24, NOW()),
 
-  ('Deploy staging & UAT setup', 'PLANNED', 'HIGH', '2026-06-10',
+  ('Deploy staging & UAT setup', 'TODO', 'HIGH', '2026-06-10',
    'Cài đặt môi trường staging, hướng dẫn UAT cho THACO',
    (SELECT id FROM projects WHERE code='THACO-CRM-P1'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='M3: Frontend & UAT'),
-   'VND', '₫', 0, 0, NOW());
+   0, NOW());
 
 -- ─── TASKS — MTL-ODOO19 ──────────────────────────────────────
-INSERT INTO tasks (name, status, priority, deadline, description, project_id, assignee_id, milestone_id, currency_code, currency_symbol, total_hours, total_cost, updated_at)
+INSERT INTO tasks (name, status, priority, deadline, description, project_id, assignee_id, milestone_id, total_hours, updated_at)
 VALUES
   ('Gap Analysis Odoo 16→19', 'DONE', 'URGENT', '2026-03-15',
    'Phân tích các thay đổi breaking change, deprecated API giữa v16 và v19',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='duc.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 1: Analysis & Setup'),
-   'VND', '₫', 32, 9920000, NOW()),
+   32, NOW()),
 
   ('Setup môi trường Odoo 19', 'DONE', 'HIGH', '2026-03-20',
    'Cài đặt Odoo 19, PostgreSQL 16, cấu hình Docker dev/staging',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='duc.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 1: Analysis & Setup'),
-   'VND', '₫', 16, 4960000, NOW()),
+   16, NOW()),
 
   ('Migration dữ liệu master (Customer, Product)', 'DONE', 'HIGH', '2026-04-30',
    'Script migration data từ v16 sang v19: res.partner, product.template',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 2: Core Migration'),
-   'VND', '₫', 48, 14400000, NOW()),
+   48, NOW()),
 
   ('Port custom module: mtl_sale_order', 'IN_PROGRESS', 'URGENT', '2026-05-20',
    'Refactor module sale order custom của MTL cho tương thích Odoo 19',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='duc.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 2: Core Migration'),
-   'VND', '₫', 32, 6400000, NOW()),
+   32, NOW()),
 
   ('Port custom module: mtl_inventory', 'IN_PROGRESS', 'HIGH', '2026-05-25',
    'Refactor module inventory custom cho Odoo 19',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='duc.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 2: Core Migration'),
-   'VND', '₫', 8, 2480000, NOW()),
+   8, NOW()),
 
-  ('Test regression module chuẩn Odoo', 'PLANNED', 'HIGH', '2026-06-15',
+  ('Test regression module chuẩn Odoo', 'TODO', 'HIGH', '2026-06-15',
    'Kiểm thử các module Purchase, Sale, Inventory, Accounting trên v19',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='hoa.qa@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 2: Core Migration'),
-   'VND', '₫', 0, 0, NOW()),
+   0, NOW()),
 
-  ('Training người dùng MTL', 'PLANNED', 'MEDIUM', '2026-07-15',
+  ('Training người dùng MTL', 'TODO', 'MEDIUM', '2026-07-15',
    'Tổ chức 3 buổi training cho team kế toán, kho, bán hàng',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='tung.ba@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 3: Testing & Go-Live'),
-   'VND', '₫', 0, 0, NOW()),
+   0, NOW()),
 
-  ('Go-live cutover plan', 'PLANNED', 'URGENT', '2026-07-25',
+  ('Go-live cutover plan', 'TODO', 'URGENT', '2026-07-25',
    'Lên kế hoạch chuyển đổi production, backup, rollback strategy',
    (SELECT id FROM projects WHERE code='MTL-ODOO19'),
    (SELECT id FROM users WHERE email='hung.pm@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Sprint 3: Testing & Go-Live'),
-   'VND', '₫', 0, 0, NOW());
+   0, NOW());
 
 -- ─── TASKS — BBPM-INTERNAL ───────────────────────────────────
-INSERT INTO tasks (name, status, priority, deadline, description, project_id, assignee_id, milestone_id, currency_code, currency_symbol, total_hours, total_cost, updated_at)
+INSERT INTO tasks (name, status, priority, deadline, description, project_id, assignee_id, milestone_id, total_hours, updated_at)
 VALUES
   ('Setup monorepo & CI/CD', 'DONE', 'HIGH', '2026-04-10',
    'Cấu hình Docker Compose, GitHub Actions, linting',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='son.devops@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 24, 7680000, NOW()),
+   24, NOW()),
 
   ('Auth module (JWT + Refresh token)', 'DONE', 'HIGH', '2026-04-15',
    'Đăng nhập, refresh token, phân quyền role-based',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 32, 9600000, NOW()),
+   32, NOW()),
 
   ('Project CRUD API', 'DONE', 'HIGH', '2026-04-20',
    'API tạo, cập nhật, xóa dự án, quản lý thành viên',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 40, 12000000, NOW()),
+   40, NOW()),
 
   ('Task CRUD & Worklog API', 'DONE', 'HIGH', '2026-04-30',
    'API quản lý công việc, log giờ làm việc',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 36, 10800000, NOW()),
+   36, NOW()),
 
   ('Dashboard UI - Project List', 'DONE', 'HIGH', '2026-05-05',
    'Giao diện danh sách dự án, filter, search, pagination',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='linh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 28, 7840000, NOW()),
+   28, NOW()),
 
   ('Dashboard UI - Task Board', 'IN_PROGRESS', 'HIGH', '2026-05-25',
    'Kanban board tasks, drag & drop, inline edit',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='linh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 16, 4480000, NOW()),
+   16, NOW()),
 
   ('Worklog UI & Timer', 'IN_PROGRESS', 'MEDIUM', '2026-05-30',
    'Giao diện log giờ, timer tự động, weekly summary',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='duc.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 1: Foundation'),
-   'VND', '₫', 12, 3720000, NOW()),
+   12, NOW()),
 
-  ('AI Agent: Text-to-SQL', 'PLANNED', 'HIGH', '2026-07-15',
+  ('AI Agent: Text-to-SQL', 'TODO', 'HIGH', '2026-07-15',
    'Tích hợp LLM để convert câu hỏi tự nhiên thành SQL query',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 2: AI Agent'),
-   'VND', '₫', 0, 0, NOW()),
+   0, NOW()),
 
-  ('AI Agent: Checkin Bot', 'PLANNED', 'HIGH', '2026-07-25',
+  ('AI Agent: Checkin Bot', 'TODO', 'HIGH', '2026-07-25',
    'Bot nhận báo cáo checkin qua Gapo/Zalo, parse NLP, lưu worklog',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='duc.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 2: AI Agent'),
-   'VND', '₫', 0, 0, NOW()),
+   0, NOW()),
 
-  ('AI Agent: Report Generator', 'PLANNED', 'MEDIUM', '2026-07-30',
+  ('AI Agent: Report Generator', 'TODO', 'MEDIUM', '2026-07-30',
    'Tự động tổng hợp báo cáo tuần/tháng theo dự án và cá nhân',
    (SELECT id FROM projects WHERE code='BBPM-INTERNAL'),
    (SELECT id FROM users WHERE email='minh.dev@bbsw.vn'),
    (SELECT id FROM milestones WHERE name='Phase 2: AI Agent'),
-   'VND', '₫', 0, 0, NOW());
+   0, NOW());
 
 -- ─── WORKLOGS ─────────────────────────────────────────────────
 INSERT INTO worklogs (work_date, description, hours, task_id, project_id, user_id, updated_at)
@@ -462,11 +479,20 @@ UPDATE projects p SET
   total_hours     = COALESCE((SELECT SUM(hours)      FROM worklogs w WHERE w.project_id = p.id), 0),
   updated_at      = NOW();
 
+-- ─── GAPO USER MAPS ──────────────────────────────────────────
+-- Liên kết tài khoản Gapo Work ↔ user nội bộ (bot tra để biết tin nhắn của ai).
+-- Dùng subquery theo email để không phụ thuộc thứ tự serial id.
+INSERT INTO gapo_user_maps (user_id, gapo_user_id, gapo_thread_id, gapo_full_name)
+SELECT id, 608678190, 1779201401766, 'Đặng Trần Tấn Lực'
+FROM users WHERE email = 'luc@bbsw.vn'
+ON CONFLICT (user_id) DO NOTHING;
+
 -- ─── VERIFY ──────────────────────────────────────────────────
 SELECT 'users'         AS tbl, COUNT(*) FROM users
-UNION ALL SELECT 'projects',   COUNT(*) FROM projects
-UNION ALL SELECT 'members',    COUNT(*) FROM members
-UNION ALL SELECT 'milestones', COUNT(*) FROM milestones
-UNION ALL SELECT 'tasks',      COUNT(*) FROM tasks
-UNION ALL SELECT 'worklogs',   COUNT(*) FROM worklogs
+UNION ALL SELECT 'projects',       COUNT(*) FROM projects
+UNION ALL SELECT 'members',        COUNT(*) FROM members
+UNION ALL SELECT 'milestones',     COUNT(*) FROM milestones
+UNION ALL SELECT 'tasks',          COUNT(*) FROM tasks
+UNION ALL SELECT 'worklogs',       COUNT(*) FROM worklogs
+UNION ALL SELECT 'gapo_user_maps', COUNT(*) FROM gapo_user_maps
 ORDER BY tbl;
