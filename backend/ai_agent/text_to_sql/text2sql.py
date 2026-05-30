@@ -1,7 +1,6 @@
 import time
 import re
 import json
-from collections.abc import AsyncIterator
 
 import asyncpg
 from langchain_community.utilities import SQLDatabase
@@ -55,7 +54,7 @@ class Text2SQLAgent:
         """
         self.db = db
         self.top_k = top_k
-        self.llm = ChatOpenAI(model=os.getenv("MODEL_NAME"), timeout=60, streaming=True, api_key=os.getenv("API_KEY"), base_url=os.getenv("BASE_URL")) if llm is None else llm
+        self.llm = ChatOpenAI(model=os.getenv("MODEL_NAME"), timeout=60, api_key=os.getenv("API_KEY"), base_url=os.getenv("BASE_URL")) if llm is None else llm
 
     def _schema_context(self) -> str:
         if self.db is not None and hasattr(self.db, "get_table_info"):
@@ -165,42 +164,6 @@ class Text2SQLAgent:
         finally:
             await conn.close()
     
-    async def stream_execute(self, question: str, memory_context: str = "", current_user_id: int | str | None = None):
-        full_answer = ""
-        yield {
-            "type": "status",
-            "content": "Đang tạo SQL..."
-        }
-        sql = await self.generate_sql(
-            question,
-            memory_context=memory_context,
-            current_user_id=current_user_id,
-        )
-        yield {
-            "type": "status",
-            "content": "Đang thực thi SQL..."
-        }
-        result = await self.execute_sql(sql)
-        yield {
-            "type": "status",
-            "content": "Đang diễn giải kết quả..."
-        }
-        async for event in self.stream_summarize_result(question, result, memory_context=memory_context):
-            if event["type"] == "answer_chunk":
-                full_answer += event["content"]
-            yield event
-
-
-        yield {
-            "type": "result",
-            "content": {
-                "question": question,
-                "sql": sql,
-                "result": result,
-                "answer": full_answer,
-            }
-        }
-    
     def _build_summary_prompt(self, question: str, rows: list[dict], memory_context: str = "") -> str:
             memory_block = f"""
         Ngữ cảnh hội thoại trước đó:
@@ -225,38 +188,16 @@ class Text2SQLAgent:
         """
 
     async def summarize_result(self, question: str, rows: list[dict], memory_context: str = "") -> str:
-        """Dùng LLM diễn giải kết quả truy vấn thành một chuỗi trả lời hoàn chỉnh."""
-        chunks = []
-        async for event in self.stream_summarize_result(question, rows, memory_context=memory_context):
-            if event["type"] == "answer_chunk":
-                chunks.append(event["content"])
-        return "".join(chunks).strip()
-
-    async def stream_summarize_result(
-        self,
-        question: str,
-        rows: list[dict],
-        memory_context: str = "",
-    ) -> AsyncIterator[dict[str, str]]:
-        """Dùng LLM diễn giải kết quả truy vấn thành câu trả lời gửi cho người dùng."""
+        """Dùng LLM diễn giải kết quả truy vấn thành câu trả lời gửi cho người dùng (1 call)."""
         if not rows:
-            yield {
-                "type": "answer_chunk",
-                "content": "Mình không tìm thấy dữ liệu phù hợp để trả lời câu hỏi này."
-            }
-            return
-        
-        prompt_text = self._build_summary_prompt(question, rows, memory_context)
+            return "Mình không tìm thấy dữ liệu phù hợp để trả lời câu hỏi này."
 
-        async for chunk in self.llm.astream([
+        prompt_text = self._build_summary_prompt(question, rows, memory_context)
+        response = await self.llm.ainvoke([
             SystemMessage(content=prompt_text),
             HumanMessage(content="Hãy trả lời câu hỏi dựa trên kết quả truy vấn database ở trên.")
-        ]):
-            if chunk.content:
-                yield {
-                    "type": "answer_chunk",
-                    "content": chunk.content
-                }
+        ])
+        return (response.content or "").strip()
 
     async def execute(
         self,

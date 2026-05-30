@@ -5,7 +5,6 @@ import re
 import sys
 import time
 from pathlib import Path
-from collections.abc import AsyncIterator
 from typing import Any
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
@@ -18,7 +17,6 @@ from dotenv import load_dotenv
 from ai_agent.prompt.prompt import SCHEMA_COMPACT
 from ai_agent.text_to_sql.text2sql import Text2SQLAgent
 from ai_agent.report_generator import report_templates
-
 
 load_dotenv()
 
@@ -84,13 +82,11 @@ Quy tắc:
 - Không bịa template_id ngoài danh sách trên.
 """
 
-
 class ReportAgent:
     def __init__(self, llm: ChatOpenAI | None = None, sql_agent: Text2SQLAgent | None = None):
         self.llm = ChatOpenAI(
             model=os.getenv("MODEL_NAME"),
             timeout=60,
-            streaming = True,
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
         ) if llm is None else llm
@@ -170,47 +166,6 @@ class ReportAgent:
             memory_context=memory_context,
         )
 
-    async def stream_generate_report(
-        self,
-        request: str,
-        memory_context: str = "",
-    ) -> AsyncIterator[dict]:
-        full_answer = ""
-        yield {"type": "status", "content": "Đang lập kế hoạch báo cáo..."}
-        plan = await self._plan_queries(request, memory_context=memory_context)
-
-        if plan.get("need_clarification"):
-            answer = plan.get("clarification_question") or "Bạn cho mình thêm thông tin để tạo báo cáo chính xác hơn nhé."
-            yield {"type": "answer_chunk", "content": answer}
-            yield {
-                "type": "result",
-                "content": {"request": request, "plan": plan, "query_results": [], "answer": answer},
-            }
-            return
-
-        yield {"type": "status", "content": "Đang chạy truy vấn báo cáo..."}
-        query_results = await self.execute_report_queries(plan)
-
-        yield {"type": "status", "content": "Đang tổng hợp báo cáo..."}
-        async for event in self.stream_generate_report_result(
-            request=request,
-            query_results=query_results,
-            memory_context=memory_context,
-        ):
-            if event["type"] == "answer_chunk":
-                full_answer += event["content"]
-            yield event
-
-        yield {
-            "type": "result",
-            "content": {
-                "request": request,
-                "plan": plan,
-                "query_results": query_results,
-                "answer": full_answer.strip(),
-            },
-        }
-    
     async def execute_report_queries(self, plan: dict[str, Any]) -> list[dict[str, Any]]:
         query_results = []
         for item in plan.get("queries") or []:
@@ -261,29 +216,6 @@ class ReportAgent:
         ])
         return response.content.strip()
 
-    async def stream_generate_report_result(
-        self,
-        request: str,
-        query_results: list[dict[str, Any]],
-        memory_context: str = "",
-    ) -> AsyncIterator[dict[str, str]]:
-        memory_block = f"\nNgữ cảnh hội thoại trước đó:\n{memory_context}\n" if memory_context else ""
-        prompt = f"""
-        {memory_block}
-
-        Yêu cầu báo cáo:
-        {request}
-
-        Kết quả truy vấn dạng JSON:
-        {json.dumps(query_results, ensure_ascii=False, default=str)}
-        """
-        async for chunk in self.llm.astream([
-            SystemMessage(content=REPORT_RESULT_PROMPT),
-            HumanMessage(content=prompt),
-        ]):
-            if chunk.content:
-                yield {"type": "answer_chunk", "content": chunk.content}
-
     def _parse_report_plan(self, raw_plan: str | dict[str, Any]) -> dict[str, Any]:
         if isinstance(raw_plan, dict):
             return raw_plan
@@ -304,7 +236,6 @@ class ReportAgent:
         if not isinstance(parsed, dict):
             raise ValueError("Report plan must be a JSON object")
         return parsed
-
 
 async def main():
     agent = ReportAgent()

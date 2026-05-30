@@ -3,7 +3,6 @@ import logging
 import time
 import asyncio
 from datetime import date
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,7 +29,6 @@ class NotificationPayload:
     thread_id: str | None
     message: str
 
-
 class NotificationAgent:
     def __init__(self, llm: ChatOpenAI | None = None):
         self.llm = llm
@@ -47,7 +45,6 @@ class NotificationAgent:
             else:
                 self.llm = ChatOpenAI(
                     model=model,
-                    streaming = True,
                     timeout=60,
                     api_key=api_key,
                     base_url=base_url,
@@ -67,25 +64,6 @@ class NotificationAgent:
         log.info(f"Notification generation time: {end - start:.2f} seconds")
         return response.content.strip()
 
-    async def stream_generate_notification_message(
-        self,
-        raw_message: str,
-        memory_context: str = "",
-    ) -> AsyncIterator[dict[str, str]]:
-        if self.llm is None:
-            raise ValueError("NotificationAgent LLM is not configured")
-
-        memory_block = f"Ngữ cảnh hội thoại trước đó:\n{memory_context}\n\n" if memory_context else ""
-        start = time.perf_counter()
-        async for chunk in self.llm.astream([
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"{memory_block}Tạo nội dung thông báo từ thông tin sau:\n{raw_message}")
-        ]):
-            if chunk.content:
-                yield {"type": "answer_chunk", "content": chunk.content}
-        end = time.perf_counter()
-        log.info("Notification streaming generation time: %.2f seconds", end - start)
-
     async def prepare_notification(
         self,
         user_id: str,
@@ -100,34 +78,6 @@ class NotificationAgent:
             thread_id=thread_id,
             message=content,
         )
-
-    async def stream_prepare_notification(
-        self,
-        user_id: str,
-        thread_id: str | None,
-        message: str,
-        memory_context: str = "",
-    ) -> AsyncIterator[dict]:
-        full_answer = ""
-        yield {"type": "status", "content": "Đang tạo nội dung thông báo..."}
-        async for event in self.stream_generate_notification_message(message, memory_context=memory_context):
-            if event["type"] == "answer_chunk":
-                full_answer += event["content"]
-            yield event
-
-        payload = NotificationPayload(
-            user_id=user_id,
-            thread_id=thread_id,
-            message=full_answer.strip(),
-        )
-        yield {
-            "type": "result",
-            "content": {
-                "user_id": payload.user_id,
-                "thread_id": payload.thread_id,
-                "message": payload.message,
-            },
-        }
 
     async def prepare_deadline_digest(
         self,
@@ -272,7 +222,6 @@ class NotificationAgent:
             parts.append(f"{upcoming_count} task còn khoảng 2 ngày đến hạn")
         return "Bạn có " + " và ".join(parts) + ":"
 
-
 async def main():
     agent = NotificationAgent()
 
@@ -283,7 +232,6 @@ async def main():
     )
 
     print(notification)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

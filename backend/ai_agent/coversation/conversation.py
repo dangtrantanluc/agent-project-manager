@@ -1,6 +1,5 @@
 import os
 import asyncio
-from collections.abc import AsyncIterator
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
@@ -20,13 +19,11 @@ load_dotenv()
 
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
 
-
 def _now_in_timezone(timezone_name: str | None = None) -> datetime:
     try:
         return datetime.now(ZoneInfo(timezone_name or DEFAULT_TIMEZONE))
     except ZoneInfoNotFoundError:
         return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
-
 
 class ConversationAgent:
     def __init__(self, llm: ChatAnthropic | None = None):
@@ -36,7 +33,6 @@ class ConversationAgent:
         # Khởi tạo LLM
         self.llm = ChatAnthropic(
             model=os.getenv("MODEL_NAME"),
-            streaming = True,
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
         ) if llm is None else llm
@@ -176,45 +172,6 @@ class ConversationAgent:
                     }
                 await asyncio.sleep(1)
 
-    async def stream_process_message(
-        self,
-        message,
-        user_context=None,
-        timezone_name: str | None = None,
-    ) -> AsyncIterator[dict]:
-        standard_response = self.get_standard_response(message, timezone_name)
-        if standard_response:
-            content = standard_response["message"]
-            yield {"type": "answer_chunk", "content": content}
-            yield {"type": "result", "content": standard_response}
-            return
-
-        retries = 0
-        while retries < self.max_retries:
-            try:
-                user_context_str = user_context if user_context else "Không có thông tin ngữ cảnh."
-                full_answer = ""
-                async for chunk in self.chain.astream({"input": message, "user_context": user_context_str}):
-                    content = getattr(chunk, "content", "")
-                    if content:
-                        full_answer += content
-                        yield {"type": "answer_chunk", "content": content}
-
-                yield {
-                    "type": "result",
-                    "content": {"type": "conversation", "message": full_answer.strip()},
-                }
-                return
-            except Exception as e:
-                retries += 1
-                print(f"Lỗi streaming (thử lại {retries}/{self.max_retries}): {str(e)}")
-                if retries == self.max_retries:
-                    message = "Xin lỗi, tôi đang gặp vấn đề kỹ thuật. Vui lòng thử lại sau."
-                    yield {"type": "answer_chunk", "content": message}
-                    yield {"type": "result", "content": {"type": "error", "message": message}}
-                    return
-                await asyncio.sleep(1)
-    
     def process_message(self, message, user_context=None, timezone_name: str | None = None):
         """
         Xử lý tin nhắn của người dùng và trả về phản hồi.

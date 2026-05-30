@@ -1,7 +1,6 @@
 import json
 import logging
 from dataclasses import dataclass
-from collections.abc import AsyncIterator
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +22,6 @@ class AgentReply:
     agent: str
     confidence: float = 0.0
     metadata: dict | None = None
-
 
 class AgentMessageRouter:
     def __init__(self):
@@ -102,91 +100,6 @@ class AgentMessageRouter:
                 metadata=metadata,
             )
 
-    async def stream_message(
-        self,
-        message: str,
-        user_id: str,
-        channel: str = "gapo",
-        thread_id: str | None = None,
-        metadata: dict | None = None,
-        db: AsyncSession | None = None,
-        conversation_id: str | None = None,
-        correlation_id: str | None = None,
-    ) -> AsyncIterator[dict]:
-        metadata = metadata or {}
-        conversation_id = conversation_id or thread_id
-        memory_context = ""
-
-        try:
-            if db is not None and conversation_id:
-                memory_context = await self._load_memory_context(conversation_id, db)
-                metadata = {
-                    **metadata,
-                    "conversation_id": conversation_id,
-                    "correlation_id": correlation_id,
-                    "memory_loaded": bool(memory_context),
-                }
-
-            selected = self.intent_router.selected_agents(message)
-            agent_name, confidence = self._pick_agent(selected)
-            agent_name = self._fallback_agent_for_message(message, agent_name, confidence)
-            metadata = {"selected_agents": self._selected_metadata(selected), **metadata}
-
-            yield {"type": "status", "content": f"Đang xử lý bằng agent {agent_name}..."}
-
-            full_answer = ""
-            agent_result: Any = None
-            async for event in self._stream_agent(
-                agent_name,
-                message,
-                user_id,
-                channel,
-                thread_id,
-                metadata,
-                memory_context,
-            ):
-                event_type = event.get("type")
-                if event_type == "answer_chunk":
-                    full_answer += str(event.get("content") or "")
-                    yield event
-                elif event_type == "result":
-                    agent_result = event.get("content")
-                else:
-                    yield event
-
-            if not full_answer.strip() and agent_result is not None:
-                full_answer = self._format_agent_result(agent_name, agent_result)
-
-            yield {
-                "type": "result",
-                "content": {
-                    "answer": full_answer.strip(),
-                    "agent": agent_name,
-                    "confidence": confidence,
-                    "metadata": metadata,
-                    "agent_result": self._jsonable(agent_result),
-                },
-            }
-        except Exception:
-            logger.exception(
-                "stream message routing failed user_id=%s channel=%s thread_id=%s",
-                user_id,
-                channel,
-                thread_id,
-            )
-            answer = "Xin lỗi, mình đang gặp lỗi khi xử lý tin nhắn này. Bạn thử lại giúp mình nhé."
-            yield {"type": "answer_chunk", "content": answer}
-            yield {
-                "type": "result",
-                "content": {
-                    "answer": answer,
-                    "agent": "error",
-                    "confidence": 0.0,
-                    "metadata": metadata,
-                    "agent_result": None,
-                },
-            }
-
     def _pick_agent(self, selected: list[Agent] | list[str]) -> tuple[str, float]:
         if not selected:
             return "conversation", 0.0
@@ -217,8 +130,6 @@ class AgentMessageRouter:
             "danh sách",
             "ai là",
         )
-
-
 
         if any(keyword in lowered for keyword in planning_keywords):
             return "planning"
@@ -279,61 +190,6 @@ class AgentMessageRouter:
             timezone_name=self._timezone_name(metadata),
         )
         return self._format_conversation(result)
-
-    async def _stream_agent(
-        self,
-        agent_name: str,
-        message: str,
-        user_id: str,
-        channel: str,
-        thread_id: str | None,
-        metadata: dict,
-        memory_context: str = "",
-    ) -> AsyncIterator[dict]:
-        if agent_name == "conversation":
-            async for event in self.conversation_agent.stream_process_message(
-                message,
-                user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata),
-                timezone_name=self._timezone_name(metadata),
-            ):
-                yield event
-            return
-
-        if agent_name == "text2sql":
-            async for event in self.text2sql_agent.stream_execute(
-                message,
-                memory_context=memory_context,
-                current_user_id=user_id,
-            ):
-                yield event
-            return
-
-        if agent_name == "report":
-            async for event in self.report_agent.stream_generate_report(message, memory_context=memory_context):
-                yield event
-            return
-
-        if agent_name == "planning":
-            async for event in self.planning_agent.stream_generate_project_plan(message, memory_context=memory_context):
-                yield event
-            return
-
-        if agent_name == "notification":
-            async for event in self.notification_agent.stream_prepare_notification(
-                user_id=user_id,
-                thread_id=thread_id,
-                message=message,
-                memory_context=memory_context,
-            ):
-                yield event
-            return
-
-        async for event in self.conversation_agent.stream_process_message(
-            message,
-            user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata),
-            timezone_name=self._timezone_name(metadata),
-        ):
-            yield event
 
     async def _load_memory_context(self, conversation_id: str, db: AsyncSession) -> str:
         try:

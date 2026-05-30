@@ -4,7 +4,6 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,7 +14,6 @@ from ai_agent.router.message_router import AgentMessageRouter
 router = APIRouter(prefix="/agent", tags=["agent"])
 _message_router: AgentMessageRouter | None = None
 
-
 def _get_message_router() -> AgentMessageRouter:
     global _message_router
     if _message_router is None:
@@ -25,14 +23,11 @@ def _get_message_router() -> AgentMessageRouter:
 _SELECT_ONLY = re.compile(r"^\s*select\b", re.IGNORECASE)
 _MUTATION = re.compile(r"\b(insert|update|delete|drop|alter|truncate|create)\b", re.IGNORECASE)
 
-
 def _iso(value):
     return value.isoformat() if value else None
 
-
 def _json(value, default):
     return json.dumps(value if value is not None else default)
-
 
 def _session_row(r) -> dict:
     return {
@@ -42,7 +37,6 @@ def _session_row(r) -> dict:
         "pendingParsed": r[10], "completedAt": _iso(r[11]),
         "createdAt": _iso(r[12]), "updatedAt": _iso(r[13]),
     }
-
 
 def _backlog_row(r) -> dict:
     return {
@@ -55,7 +49,6 @@ def _backlog_row(r) -> dict:
         "createdAt": _iso(r[12]), "updatedAt": _iso(r[13]),
     }
 
-
 def _worklog_checkin_row(r) -> dict:
     source = r[12] or "worklog"
     return {
@@ -67,7 +60,6 @@ def _worklog_checkin_row(r) -> dict:
         "user": {"id": r[6], "fullName": r[9]} if r[6] else None,
         "createdAt": _iso(r[10]), "updatedAt": _iso(r[11]),
     }
-
 
 async def _fetch_backlog(db: AsyncSession, backlog_id: int) -> dict:
     row = (await db.execute(
@@ -87,7 +79,6 @@ async def _fetch_backlog(db: AsyncSession, backlog_id: int) -> dict:
         raise HTTPException(status_code=404, detail="Backlog không tồn tại")
     return _backlog_row(row)
 
-
 async def _fetch_checkin_worklog(db: AsyncSession, worklog_id: int) -> dict:
     row = (await db.execute(
         text("""
@@ -105,7 +96,6 @@ async def _fetch_checkin_worklog(db: AsyncSession, worklog_id: int) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="Worklog không tồn tại")
     return _worklog_checkin_row(row)
-
 
 @router.get("/user-by-channel")
 async def user_by_channel(
@@ -151,7 +141,6 @@ async def user_by_channel(
         }
     }
 
-
 @router.get("/gapo-thread/{user_id}")
 async def gapo_thread(
     user_id: int,
@@ -182,7 +171,6 @@ async def gapo_thread(
         raise HTTPException(status_code=404, detail="Gapo mapping không tồn tại")
     return {"gapoUserId": row[0], "gapoThreadId": row[1], "externalName": row[2]}
 
-
 @router.get("/channel-identity/{user_id}")
 async def list_channel_identity(
     user_id: int,
@@ -207,7 +195,6 @@ async def list_channel_identity(
         }
         for r in rows
     ]
-
 
 @router.post("/channel-identity")
 async def upsert_channel_identity(
@@ -248,7 +235,6 @@ async def upsert_channel_identity(
     )).fetchone()
     await db.commit()
     return {"id": row[0]}
-
 
 @router.post("/checkins/import", status_code=201)
 async def import_checkin(
@@ -297,7 +283,6 @@ async def import_checkin(
     )
     return await _fetch_checkin_worklog(db, row[0])
 
-
 @router.patch("/checkins/{backlog_id}")
 async def update_checkin(
     backlog_id: int,
@@ -327,7 +312,6 @@ async def update_checkin(
     )
     return await _fetch_checkin_worklog(db, backlog_id)
 
-
 @router.get("/checkins/projects")
 async def checkin_projects(
     user_id: int = Query(alias="userId"),
@@ -348,7 +332,6 @@ async def checkin_projects(
         {"uid": user_id},
     )).fetchall()
     return [{"id": r[0], "name": r[1], "status": r[2]} for r in rows]
-
 
 @router.get("/checkins/status")
 async def checkin_status(
@@ -381,7 +364,6 @@ async def checkin_status(
         params,
     )).fetchall()
     return [_worklog_checkin_row(r) for r in rows]
-
 
 @router.get("/checkins/missing")
 async def missing_checkins(
@@ -422,7 +404,6 @@ async def missing_checkins(
         for r in rows
     ]
 
-
 @router.get("/checkins/project-daily-summary")
 async def project_daily_summary(
     project_id: int = Query(alias="projectId"),
@@ -445,7 +426,6 @@ async def project_daily_summary(
         "totalHours": float(sum(r[2] or 0 for r in rows)),
         "items": [{"userFullName": r[0], "description": r[1], "hours": float(r[2] or 0), "status": r[3]} for r in rows],
     }
-
 
 @router.post("/checkin-sessions/start", status_code=201)
 async def start_checkin_session(
@@ -488,7 +468,6 @@ async def start_checkin_session(
     await db.commit()
     return _session_row(row)
 
-
 @router.get("/checkin-sessions/current")
 async def current_checkin_session(
     user_id: int = Query(alias="userId"),
@@ -508,7 +487,6 @@ async def current_checkin_session(
         {"uid": user_id},
     )).fetchone()
     return _session_row(row) if row else None
-
 
 @router.patch("/checkin-sessions/{session_id}")
 async def patch_checkin_session(
@@ -548,7 +526,6 @@ async def patch_checkin_session(
         raise HTTPException(status_code=404, detail="Session không tồn tại")
     return _session_row(row)
 
-
 @router.post("/checkin-sessions/{session_id}/complete")
 async def complete_checkin_session(
     session_id: int,
@@ -570,7 +547,6 @@ async def complete_checkin_session(
     if not row:
         raise HTTPException(status_code=404, detail="Session không tồn tại")
     return _session_row(row)
-
 
 @router.post("/memory", status_code=201)
 async def post_memory(
@@ -601,7 +577,6 @@ async def post_memory(
     )).fetchone()
     await db.commit()
     return {"id": row[0], "createdAt": _iso(row[1])}
-
 
 @router.get("/memory/search")
 async def search_memory(
@@ -645,7 +620,6 @@ async def search_memory(
         for r in rows
     ]
 
-
 @router.post("/follow-up", status_code=201)
 async def post_follow_up(body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     row = (await db.execute(
@@ -669,7 +643,6 @@ async def post_follow_up(body: dict, agent_user: dict = Depends(get_agent_user),
     )).fetchone()
     await db.commit()
     return {"id": row[0]}
-
 
 @router.get("/follow-ups")
 async def list_follow_ups(
@@ -710,7 +683,6 @@ async def list_follow_ups(
         for r in rows
     ]
 
-
 @router.patch("/follow-up/{follow_up_id}")
 async def patch_follow_up(
     follow_up_id: int,
@@ -736,7 +708,6 @@ async def patch_follow_up(
         raise HTTPException(status_code=404, detail="Follow-up không tồn tại")
     return {"id": row[0]}
 
-
 @router.get("/users")
 async def agent_users(agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(
@@ -747,7 +718,6 @@ async def agent_users(agent_user: dict = Depends(get_agent_user), db: AsyncSessi
         {},
     )).fetchall()
     return [{"id": r[0], "email": r[1], "fullName": r[2], "role": r[3], "avatarUrl": r[4], "companyName": r[5], "department": r[6], "position": r[7]} for r in rows]
-
 
 @router.get("/users-workload")
 async def users_workload(
@@ -773,7 +743,6 @@ async def users_workload(
         params,
     )).fetchall()
     return [{"id": r[0], "fullName": r[1], "role": r[2], "openTasks": r[3]} for r in rows]
-
 
 @router.get("/digests/role-based")
 async def role_based_digest(
@@ -806,7 +775,6 @@ async def role_based_digest(
         "overview": {"openTasks": stats[0] or 0, "overdueTasks": stats[1] or 0, "blockedTasks": stats[2] or 0},
     }
 
-
 @router.get("/report/schema")
 async def report_schema(agent_user: dict = Depends(get_agent_user)):
     return {
@@ -820,40 +788,6 @@ async def report_schema(agent_user: dict = Depends(get_agent_user)):
         )
     }
 
-
-@router.post("/chat/stream")
-async def chat_stream(
-    body: dict,
-    agent_user: dict = Depends(get_agent_user),
-    db: AsyncSession = Depends(get_db),
-):
-    message = str(body.get("message") or body.get("text") or "").strip()
-    if not message:
-        raise HTTPException(status_code=400, detail="message is required")
-
-    user_id = str(body.get("userId") or body.get("user_id") or agent_user.get("id") or "")
-    channel = str(body.get("channel") or "web")
-    thread_id = body.get("threadId") or body.get("thread_id")
-    conversation_id = body.get("conversationId") or body.get("conversation_id") or thread_id
-    correlation_id = body.get("correlationId") or body.get("correlation_id")
-    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
-
-    async def event_generator():
-        async for event in _get_message_router().stream_message(
-            message=message,
-            user_id=user_id,
-            channel=channel,
-            thread_id=thread_id,
-            metadata=metadata,
-            db=db,
-            conversation_id=conversation_id,
-            correlation_id=correlation_id,
-        ):
-            yield f"data: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
 @router.post("/report/query")
 async def report_query(body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     sql = str(body.get("sql") or "").strip()
@@ -862,7 +796,6 @@ async def report_query(body: dict, agent_user: dict = Depends(get_agent_user), d
     rows = (await db.execute(text(sql))).mappings().fetchall()
     data = [dict(r) for r in rows]
     return {"rows": data, "rowCount": len(data)}
-
 
 @router.post("/audit", status_code=201)
 async def post_audit(body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
@@ -888,7 +821,6 @@ async def post_audit(body: dict, agent_user: dict = Depends(get_agent_user), db:
     await db.commit()
     return {"id": row[0], "createdAt": _iso(row[1])}
 
-
 @router.post("/audit/cleanup")
 async def cleanup_audit(body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     days = int(body.get("days", 90))
@@ -901,7 +833,6 @@ async def cleanup_audit(body: dict, agent_user: dict = Depends(get_agent_user), 
         await db.execute(text("DELETE FROM agent_audit_log WHERE created_at < :cutoff"), {"cutoff": cutoff})
         await db.commit()
     return {"deleted": 0 if body.get("dryRun") else count, "matched": count, "dryRun": bool(body.get("dryRun"))}
-
 
 @router.get("/automations")
 async def list_automations(
@@ -935,7 +866,6 @@ async def list_automations(
         for r in rows
     ]
 
-
 @router.post("/automations", status_code=201)
 async def create_automation(body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     row = (await db.execute(
@@ -957,7 +887,6 @@ async def create_automation(body: dict, agent_user: dict = Depends(get_agent_use
     await db.commit()
     return {"id": row[0]}
 
-
 @router.patch("/automations/{automation_id}")
 async def patch_automation(automation_id: int, body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     field_map = {"name": "name", "workflow": "workflow", "schedule": "schedule", "target": "target", "active": "active"}
@@ -975,7 +904,6 @@ async def patch_automation(automation_id: int, body: dict, agent_user: dict = De
     if not row:
         raise HTTPException(status_code=404, detail="Automation không tồn tại")
     return {"id": row[0]}
-
 
 @router.delete("/automations/{automation_id}", status_code=204)
 async def delete_automation(automation_id: int, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
