@@ -9,7 +9,6 @@ export const projectCreateSchema = z.object({
   startDate: z.string().date().optional(),
   endDate: z.string().date().optional(),
   description: z.string().optional(),
-  estimatedTotalHours: z.coerce.number().nonnegative().optional(),
   ownerId: z.number().int().positive(),
   customerName: z.string().max(200).optional(),
   accountManagerId: z.number().int().positive().optional(),

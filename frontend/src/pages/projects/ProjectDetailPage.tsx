@@ -130,7 +130,6 @@ function OverviewTab({ project: p }: { project: any }) {
           <Info label="Bắt đầu" value={formatDate(p.startDate)} />
           <Info label="Kết thúc" value={formatDate(p.endDate)} />
           <Info label="Giờ đã duyệt" value={formatHours(p.totalHours)} />
-          <Info label="Giờ ước tính" value={formatHours(p.estimatedTotalHours)} />
         </dl>
         {p.description && <p className="mt-4 whitespace-pre-wrap text-sm text-slate-600">{p.description}</p>}
       </div>

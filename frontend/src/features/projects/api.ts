@@ -19,7 +19,6 @@ export type ProjectListItem = {
 
 type ProjectResponse = ProjectListItem & {
   description?: string | null;
-  estimatedTotalHours?: number | null;
   worklogCount?: number;
   backlogCount?: number;
   scopeCount?: number;
