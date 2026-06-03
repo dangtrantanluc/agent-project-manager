@@ -4,10 +4,8 @@ import { useAuth } from "@/features/auth/store";
 import { formatDate } from "@/lib/format";
 import { Link } from "react-router-dom";
 import {
-  Bot,
   Building2,
   CalendarDays,
-  CheckCircle2,
   ClipboardList,
   ListChecks,
 } from "lucide-react";
@@ -145,27 +143,6 @@ export function DashboardPage() {
         </DetailCard>
       </div>
 
-      <div className="card overflow-hidden bg-gradient-to-br from-white to-blue-50 dark:from-slate-900 dark:to-slate-900">
-        <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-4">
-            <div className="grid h-20 w-20 place-items-center rounded-full bg-blue-600 text-white shadow-lg shadow-blue-600/20">
-              <Bot className="h-10 w-10" />
-            </div>
-            <div>
-              <h2 className="text-xl font-bold">PM Agent</h2>
-              <p className="text-sm text-slate-500">Theo dõi tình trạng dự án và nhắc việc từ dữ liệu hiện tại.</p>
-            </div>
-          </div>
-          <div className="grid gap-2 text-sm sm:grid-cols-2">
-            {(overview?.agentCapabilities ?? ["Nhắc việc", "Theo dõi tiến độ", "Tóm tắt tình trạng", "Việc còn thiếu"]).map((capability) => (
-              <div key={capability} className="flex items-center gap-2">
-                <CheckCircle2 className="h-4 w-4 text-blue-600" />
-                <span>{capability}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
     </div>
   );
 }

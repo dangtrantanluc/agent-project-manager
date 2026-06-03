@@ -26,7 +26,6 @@ class GapoAdapter:
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
         )
-        self.llm = llm
         self.checkin = CheckinFlowService(
             gapo=self.client,
             worklog_parser=WorklogParserService(llm=llm),
@@ -163,7 +162,6 @@ class GapoAdapter:
                         tools_used=[getattr(result, "agent", "unknown")],
                         correlation_id=correlation_id,
                         db=db,
-                        llm=self.llm,
                         user_id=mapped_user["user_id"] if mapped_user else None,
                         company_id=mapped_user.get("company_id") if mapped_user else None,
                     )

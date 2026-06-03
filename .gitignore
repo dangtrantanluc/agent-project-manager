@@ -25,8 +25,12 @@ dist/
 build/
 
 # Database / local data
+data/db/*.sqlite
 data/db/*.sqlite-shm
 data/db/*.sqlite-wal
+data/db/backups/
+data/auth/
+data/bin/
 
 # Logs
 *.log
@@ -39,4 +43,5 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+# Virtual environments
 venv

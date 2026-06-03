@@ -1,17 +1,18 @@
 from typing import List
-from urllib import response
 from pydantic import BaseModel, Field
-from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
 from dotenv import load_dotenv
 import asyncio
+import logging
 import time
 import json
-import os   
+import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
@@ -20,9 +21,9 @@ if str(BACKEND_ROOT) not in sys.path:
 load_dotenv()
 
 PLANNING_SYSTEM_PROMPT = """
-Bạn là Planning Agent.
+Bạn là Planning Agent cho hệ thống quản lý dự án.
 
-Chỉ trả về JSON hợp lệ.
+Chỉ trả về JSON hợp lệ, không thêm bất kỳ text nào khác.
 
 Output:
 {
@@ -49,12 +50,10 @@ Output:
 Giới hạn:
 - Tối đa 3 milestones
 - Mỗi milestone tối đa 2 tasks
-- Không assumptions
-- Không deliverables
-- Không dependencies
-- Không acceptance_criteria
 - Description tối đa 10 từ
-- Không markdown
+- Không markdown, không deliverables, không dependencies
+- Nếu có thông tin về dự án hiện tại, dựa vào đó để tạo kế hoạch phù hợp
+- Nếu có thông tin về thành viên, gán role phù hợp với từng người
 """
 
 class TaskPlan(BaseModel):
@@ -83,24 +82,52 @@ class PlanningAgent:
         """
         self.llm = ChatOpenAI(model=os.getenv("MODEL_NAME"),
                               timeout=60,
-
+                            temperature=0.4,
                               api_key=os.getenv("API_KEY"), 
                               base_url=os.getenv("BASE_URL")) if llm is None else llm
         self.output_parser = JsonOutputParser()
 
     
-    async def generate_project_plan(self, project_description: str, memory_context: str = "") -> ProjectPlan:
-        memory_block = f"\n\nNgữ cảnh hội thoại trước đó:\n{memory_context}" if memory_context else ""
-        prompt = f"{PLANNING_SYSTEM_PROMPT}{memory_block}\n\nMô tả dự án: {project_description}\n\nHãy tạo kế hoạch dự án chi tiết theo mô tả trên."
+    def _build_context_block(self, user_profile: dict) -> str:
+        if not user_profile:
+            return ""
+        parts = []
+        name = user_profile.get("full_name", "")
+        role = user_profile.get("role", "")
+        if name:
+            parts.append(f"Người lập kế hoạch: {name}" + (f" ({role})" if role else ""))
+
+        projects = user_profile.get("active_projects", [])
+        if projects:
+            names = ", ".join(p["name"] for p in projects[:5])
+            parts.append(f"Dự án đang tham gia: {names}")
+
+        if not parts:
+            return ""
+        return "\n\nThông tin người dùng:\n" + "\n".join(parts)
+
+    async def generate_project_plan(
+        self,
+        project_description: str,
+        memory_context: str = "",
+        user_profile: dict | None = None,
+    ) -> ProjectPlan:
+        context_block = self._build_context_block(user_profile or {})
+        memory_block = f"\n\nNgữ cảnh hội thoại:\n{memory_context}" if memory_context else ""
+        human_content = (
+            f"Mô tả dự án: {project_description}"
+            f"{context_block}"
+            f"{memory_block}"
+            "\n\nHãy tạo kế hoạch dự án theo mô tả trên."
+        )
         start = time.perf_counter()
         response = await self.llm.ainvoke([
             SystemMessage(content=PLANNING_SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
+            HumanMessage(content=human_content),
         ])
         elapsed = time.perf_counter() - start
-        print(f"generate_project_plan took {elapsed:.2f} seconds")
-        raw = response.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
+        logger.info("generate_project_plan took %.2fs", elapsed)
+        raw = response.content.strip().replace("```json", "").replace("```", "").strip()
         plan_dict = self.output_parser.parse(raw)
         return ProjectPlan(**plan_dict)
 
@@ -122,7 +149,7 @@ async def main():
     agent = PlanningAgent()
     project_description = "Phát triển một ứng dụng quản lý công việc cho nhóm nhỏ, bao gồm các tính năng như tạo task, phân công task, theo dõi tiến độ và báo cáo."
     project_plan = await agent.generate_project_plan(project_description)
-    print(json.dumps(project_plan.dict(), indent=2, ensure_ascii=False))
+    print(json.dumps(project_plan.model_dump(), indent=2, ensure_ascii=False))
 
 if __name__ == "__main__":
     asyncio.run(main())

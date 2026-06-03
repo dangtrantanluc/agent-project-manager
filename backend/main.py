@@ -23,6 +23,7 @@ from app.modules.uploads.router import router as uploads_router
 from app.modules.users.router import router as users_router
 from app.modules.worklogs.router import router as worklogs_router
 from ai_agent.checkin.scheduler import start_checkin_scheduler, stop_checkin_scheduler
+from core.redis import close_redis
 from gapo.gapo_webhook import router as gapo_webhook_router
 
 load_dotenv()
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop_checkin_scheduler()
+        await close_redis()
 
 
 app = FastAPI(title="BB Project Management API", lifespan=lifespan)

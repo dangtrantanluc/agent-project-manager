@@ -26,30 +26,29 @@ def start_checkin_scheduler() -> None:
     deadline_hour = int(os.getenv("DEADLINE_NOTIFY_HOUR", "9"))
     deadline_minute = int(os.getenv("DEADLINE_NOTIFY_MINUTE", "0"))
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_checkin_slot(CheckinSlot.LUNCH)),
-        CronTrigger(hour=11, minute=50, timezone=_VN_TZ), id="checkin_lunch", replace_existing=True,
+        run_checkin_slot, CronTrigger(hour=11, minute=50, timezone=_VN_TZ),
+        id="checkin_lunch", replace_existing=True, args=[CheckinSlot.LUNCH],
     )
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_reminder_slot(CheckinSlot.LUNCH)),
-        CronTrigger(hour=12, minute=30, timezone=_VN_TZ), id="reminder_lunch", replace_existing=True,
+        run_reminder_slot, CronTrigger(hour=12, minute=30, timezone=_VN_TZ),
+        id="reminder_lunch", replace_existing=True, args=[CheckinSlot.LUNCH],
     )
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_checkin_slot(CheckinSlot.END_DAY)),
-        CronTrigger(hour=17, minute=50, timezone=_VN_TZ), id="checkin_end_day", replace_existing=True,
+        run_checkin_slot, CronTrigger(hour=17, minute=50, timezone=_VN_TZ),
+        id="checkin_end_day", replace_existing=True, args=[CheckinSlot.END_DAY],
     )
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_reminder_slot(CheckinSlot.END_DAY)),
-        CronTrigger(hour=18, minute=30, timezone=_VN_TZ), id="reminder_end_day", replace_existing=True,
+        run_reminder_slot, CronTrigger(hour=18, minute=30, timezone=_VN_TZ),
+        id="reminder_end_day", replace_existing=True, args=[CheckinSlot.END_DAY],
     )
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_missing_summary()),
-        CronTrigger(hour=19, minute=0, timezone=_VN_TZ), id="missing_summary", replace_existing=True,
+        run_missing_summary, CronTrigger(hour=19, minute=0, timezone=_VN_TZ),
+        id="missing_summary", replace_existing=True,
     )
     _scheduler.add_job(
-        lambda: asyncio.ensure_future(run_deadline_notifications()),
+        run_deadline_notifications,
         CronTrigger(hour=deadline_hour, minute=deadline_minute, timezone=_VN_TZ),
-        id="deadline_notifications",
-        replace_existing=True,
+        id="deadline_notifications", replace_existing=True,
     )
     _scheduler.start()
     logger.info("[Scheduler] Check-in scheduler started")

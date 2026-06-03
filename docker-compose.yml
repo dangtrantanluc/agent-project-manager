@@ -49,6 +49,8 @@ services:
       DB_NAME: agent_pm
       DB_USER: postgres
       DB_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       CORS_ORIGIN: "${CORS_ORIGIN:-http://localhost:5173,http://localhost:80}"
       AGENT_API_TOKEN: ${AGENT_API_TOKEN:-dev-agent-token}
       AGENT_USER_EMAIL: ${AGENT_USER_EMAIL:-pm-agent@bluebolt.local}
@@ -58,6 +60,8 @@ services:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     volumes:
       - uploads_data:/app/uploads
@@ -75,6 +79,7 @@ services:
       - "${WEB_PORT:-5173}:80"
     depends_on:
       - backend
+      
   9router:
     image: decolua/9router:latest
     container_name: 9router

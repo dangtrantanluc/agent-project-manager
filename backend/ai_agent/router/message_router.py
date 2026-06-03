@@ -1,9 +1,13 @@
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from database import AsyncSessionLocal
 
 from ai_agent.coversation.conversation import ConversationAgent
 from ai_agent.memory.memory import load_memory
@@ -47,30 +51,37 @@ class AgentMessageRouter:
         metadata = metadata or {}
         conversation_id = conversation_id or thread_id
         memory_context = ""
+        t_total = time.perf_counter()
 
         try:
+            user_profile: dict = {}
+            t_route = time.perf_counter()
             if db is not None and conversation_id:
-                memory_context = await self._load_memory_context(conversation_id, db)
+                selected_task = asyncio.create_task(self.intent_router.selected_agents(message))
+                memory_context, user_profile = await asyncio.gather(
+                    self._load_memory_context_new_session(conversation_id),
+                    self._load_user_profile_new_session(user_id),
+                )
+                selected = await selected_task
                 metadata = {
                     **metadata,
                     "conversation_id": conversation_id,
                     "correlation_id": correlation_id,
                     "memory_loaded": bool(memory_context),
                 }
+            else:
+                selected = await self.intent_router.selected_agents(message)
+            route_ms = (time.perf_counter() - t_route) * 1000
 
-            selected = self.intent_router.selected_agents(message)
             agent_name, confidence = self._pick_agent(selected)
             agent_name = self._fallback_agent_for_message(message, agent_name, confidence)
 
             logger.info(
-                "message routed agent=%s confidence=%s user_id=%s channel=%s thread_id=%s",
-                agent_name,
-                confidence,
-                user_id,
-                channel,
-                thread_id,
+                "routed agent=%s confidence=%.2f route_ms=%.0f user_id=%s thread_id=%s",
+                agent_name, confidence, route_ms, user_id, thread_id,
             )
 
+            t_exec = time.perf_counter()
             answer = await self._run_agent(
                 agent_name,
                 message,
@@ -79,6 +90,14 @@ class AgentMessageRouter:
                 thread_id,
                 metadata,
                 memory_context,
+                user_profile,
+            )
+            exec_ms = (time.perf_counter() - t_exec) * 1000
+            total_ms = (time.perf_counter() - t_total) * 1000
+
+            logger.info(
+                "request_done agent=%s exec_ms=%.0f total_ms=%.0f user_id=%s thread_id=%s",
+                agent_name, exec_ms, total_ms, user_id, thread_id,
             )
             return AgentReply(
                 answer=answer,
@@ -87,11 +106,10 @@ class AgentMessageRouter:
                 metadata={"selected_agents": self._selected_metadata(selected), **metadata},
             )
         except Exception:
+            total_ms = (time.perf_counter() - t_total) * 1000
             logger.exception(
-                "message routing failed user_id=%s channel=%s thread_id=%s",
-                user_id,
-                channel,
-                thread_id,
+                "request_failed total_ms=%.0f user_id=%s thread_id=%s",
+                total_ms, user_id, thread_id,
             )
             return AgentReply(
                 answer="Xin lỗi, mình đang gặp lỗi khi xử lý tin nhắn này. Bạn thử lại giúp mình nhé.",
@@ -150,11 +168,13 @@ class AgentMessageRouter:
         thread_id: str | None,
         metadata: dict,
         memory_context: str = "",
+        user_profile: dict | None = None,
     ) -> str:
         if agent_name == "conversation":
             result = await self.conversation_agent.process_message_async(
                 message,
-                user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata),
+                user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata, user_profile),
+                user_profile=user_profile or {},
                 timezone_name=self._timezone_name(metadata),
             )
             return self._format_conversation(result)
@@ -172,7 +192,11 @@ class AgentMessageRouter:
             return self._format_report(result)
 
         if agent_name == "planning":
-            result = await self.planning_agent.generate_project_plan(message, memory_context=memory_context)
+            result = await self.planning_agent.generate_project_plan(
+                message,
+                memory_context=memory_context,
+                user_profile=user_profile or {},
+            )
             return self._format_planning(result)
 
         if agent_name == "notification":
@@ -186,10 +210,25 @@ class AgentMessageRouter:
 
         result = await self.conversation_agent.process_message_async(
             message,
-            user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata),
+            user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata, user_profile),
+            user_profile=user_profile or {},
             timezone_name=self._timezone_name(metadata),
         )
         return self._format_conversation(result)
+
+    async def _load_memory_context_new_session(self, conversation_id: str) -> str:
+        t = time.perf_counter()
+        async with AsyncSessionLocal() as db:
+            result = await self._load_memory_context(conversation_id, db)
+        logger.info("memory_load_ms=%.0f", (time.perf_counter() - t) * 1000)
+        return result
+
+    async def _load_user_profile_new_session(self, user_id: str) -> dict:
+        t = time.perf_counter()
+        async with AsyncSessionLocal() as db:
+            result = await self._load_user_profile(user_id, db)
+        logger.info("profile_load_ms=%.0f", (time.perf_counter() - t) * 1000)
+        return result
 
     async def _load_memory_context(self, conversation_id: str, db: AsyncSession) -> str:
         try:
@@ -198,6 +237,63 @@ class AgentMessageRouter:
             logger.exception("Failed to load memory for conversation %s", conversation_id)
             return ""
         return self._build_memory_context(summary, recent_turns)
+
+    async def _load_user_profile(self, user_id: str, db: AsyncSession) -> dict:
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            return {}
+        try:
+            # Query 1: user info + overdue count + nearest deadline
+            row = (await db.execute(
+                text("""
+                    SELECT
+                        u.full_name, u.role, u.department, u.position,
+                        (SELECT COUNT(*) FROM tasks
+                         WHERE assignee_id = u.id
+                           AND status <> 'DONE'::"TaskStatus"
+                           AND deadline < CURRENT_DATE) AS overdue_count,
+                        (SELECT name FROM tasks
+                         WHERE assignee_id = u.id
+                           AND status <> 'DONE'::"TaskStatus"
+                           AND deadline >= CURRENT_DATE
+                         ORDER BY deadline ASC LIMIT 1) AS nearest_task,
+                        (SELECT deadline FROM tasks
+                         WHERE assignee_id = u.id
+                           AND status <> 'DONE'::"TaskStatus"
+                           AND deadline >= CURRENT_DATE
+                         ORDER BY deadline ASC LIMIT 1) AS nearest_deadline
+                    FROM users u WHERE u.id = :uid
+                """),
+                {"uid": uid},
+            )).fetchone()
+            if not row:
+                return {}
+            profile: dict = {
+                "full_name": row[0], "role": row[1],
+                "department": row[2], "position": row[3],
+                "overdue_count": row[4] or 0,
+            }
+            if row[5]:
+                profile["nearest_task"] = row[5]
+                profile["nearest_deadline"] = str(row[6])
+            # Query 2: active projects
+            proj_rows = (await db.execute(
+                text("""
+                    SELECT DISTINCT p.id, p.name
+                    FROM projects p
+                    LEFT JOIN members m ON m.project_id = p.id
+                    WHERE (p.owner_id = :uid OR m.user_id = :uid)
+                      AND p.status IN ('PLANNED'::"ProjectStatus", 'IN_PROGRESS'::"ProjectStatus")
+                    ORDER BY p.name LIMIT 10
+                """),
+                {"uid": uid},
+            )).fetchall()
+            profile["active_projects"] = [{"id": r[0], "name": r[1]} for r in proj_rows]
+            return profile
+        except Exception:
+            logger.exception("Failed to load user profile for user_id=%s", user_id)
+            return {}
 
     def _build_memory_context(self, summary: str, recent_turns: list[dict]) -> str:
         parts = []
@@ -218,14 +314,39 @@ class AgentMessageRouter:
         thread_id: str | None,
         memory_context: str = "",
         metadata: dict | None = None,
+        user_profile: dict | None = None,
     ) -> str:
-        parts = [f"user_id={user_id}", f"channel={channel}"]
-        parts.append(f"timezone={self._timezone_name(metadata)}")
-        if thread_id:
-            parts.append(f"thread_id={thread_id}")
+        profile = user_profile or {}
+        parts = []
+
+        name = profile.get("full_name", "")
+        role = profile.get("role", "")
+        dept = profile.get("department", "")
+        position = profile.get("position", "")
+        if name:
+            label = " — ".join(filter(None, [role, dept, position]))
+            parts.append(f"Tên: {name}" + (f" ({label})" if label else ""))
+
+        projects = profile.get("active_projects", [])
+        if projects:
+            proj_names = ", ".join(p["name"] for p in projects[:4])
+            parts.append(f"Dự án đang tham gia: {proj_names}")
+
+        overdue = profile.get("overdue_count", 0)
+        if overdue:
+            parts.append(f"Task quá hạn: {overdue}")
+
+        nearest_task = profile.get("nearest_task")
+        nearest_deadline = profile.get("nearest_deadline")
+        if nearest_task and nearest_deadline:
+            parts.append(f"Deadline gần nhất: '{nearest_task}' ({nearest_deadline})")
+
+        parts.append(f"Kênh: {channel} | Timezone: {self._timezone_name(metadata)}")
+
         if memory_context:
-            parts.append(f"memory_context={memory_context}")
-        return ", ".join(parts)
+            parts.append(f"\nLịch sử hội thoại:\n{memory_context}")
+
+        return "\n".join(parts)
 
     def _timezone_name(self, metadata: dict | None = None) -> str:
         if metadata and metadata.get("timezone"):

@@ -1,12 +1,10 @@
 import os
 import asyncio
-from dotenv import load_dotenv
-from langchain_anthropic import ChatAnthropic
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableSequence
 import time
-from datetime import datetime
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from datetime import datetime
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -19,6 +17,19 @@ load_dotenv()
 
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
 
+def _tone_context(timezone_name: str | None = None) -> str:
+    try:
+        now = datetime.now(ZoneInfo(timezone_name or DEFAULT_TIMEZONE))
+    except ZoneInfoNotFoundError:
+        now = datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+    hour = now.hour
+    if 5 <= hour < 12:
+        return "Hiện đang buổi sáng."
+    if 12 <= hour < 18:
+        return "Hiện đang buổi chiều."
+    return "Hiện đang buổi tối."
+
+
 def _now_in_timezone(timezone_name: str | None = None) -> datetime:
     try:
         return datetime.now(ZoneInfo(timezone_name or DEFAULT_TIMEZONE))
@@ -26,13 +37,13 @@ def _now_in_timezone(timezone_name: str | None = None) -> datetime:
         return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
 
 class ConversationAgent:
-    def __init__(self, llm: ChatAnthropic | None = None):
+    def __init__(self, llm: ChatOpenAI | None = None):
         """Khởi tạo agent xử lý giao tiếp và lời chào."""
         load_dotenv()
-        
-        # Khởi tạo LLM
-        self.llm = ChatAnthropic(
+
+        self.llm = ChatOpenAI(
             model=os.getenv("MODEL_NAME"),
+            temperature=0.7,
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
         ) if llm is None else llm
@@ -42,26 +53,24 @@ class ConversationAgent:
         self.conversation_prompt = ChatPromptTemplate.from_messages([
             (
                 "system",
-                """
-        Bạn là trợ lý thông tin dự án, task, milestone, worklog.
+                """Bạn là PM-Bot, trợ lý quản lý dự án của team.
 
-        Hãy phản hồi:
-        - lịch sự
-        - chuyên nghiệp
-        - đúng trọng tâm
-        - bằng tiếng Việt
+Phong cách:
+- Gọi user bằng tên nếu biết (ví dụ "anh Luc", "chị Mai") — dùng tên cuối trong tiếng Việt
+- Thân thiện, ngắn gọn, đúng trọng tâm — không dài dòng
+- Khi trả lời số liệu: nhận xét ngắn thay vì chỉ liệt kê (ví dụ "tiến độ tốt" hay "đang chậm")
+- Nếu trong context có task quá hạn hoặc deadline gần, chủ động đề cập cuối câu
+- Không dùng bullet list cho câu trả lời ngắn — viết tự nhiên như người thật
+- Luôn dùng tiếng Việt
 
-        Thông tin người dùng:
-        {user_context}
-        """
+{tone_context}
+
+Thông tin người dùng:
+{user_context}"""
             ),
-
             (
                 "human",
-                """
-        Tin nhắn người dùng:
-        {input}
-        """
+                "{input}"
             )
         ])
         # Sử dụng RunnableSequence thay vì LLMChain
@@ -88,83 +97,73 @@ class ConversationAgent:
         message = message.lower()
         return any(question in message for question in self.common_questions)
     
-    def get_standard_response(self, message, timezone_name: str | None = None):
-        """Trả về phản hồi chuẩn cho các trường hợp thông thường."""
-        message = message.lower()
-        
-        if self.is_greeting(message):
-            current_hour = _now_in_timezone(timezone_name).hour
-            
-            if 5 <= current_hour < 12:
-                greeting = "Chào buổi sáng"
-            elif 12 <= current_hour < 18:
-                greeting = "Chào buổi chiều"
+    def _greeting_word(self, timezone_name: str | None = None) -> str:
+        hour = _now_in_timezone(timezone_name).hour
+        if 5 <= hour < 12:
+            return "Chào buổi sáng"
+        if 12 <= hour < 18:
+            return "Chào buổi chiều"
+        return "Chào buổi tối"
+
+    def _first_name(self, full_name: str) -> str:
+        parts = full_name.strip().split()
+        return parts[-1] if parts else ""
+
+    def get_standard_response(self, message, user_profile: dict | None = None, timezone_name: str | None = None):
+        lowered = message.lower()
+
+        if self.is_greeting(lowered):
+            profile = user_profile or {}
+            name = self._first_name(profile.get("full_name", ""))
+            greeting = self._greeting_word(timezone_name)
+            name_part = f" {name}" if name else ""
+
+            overdue = profile.get("overdue_count", 0)
+            nearest_task = profile.get("nearest_task")
+            nearest_deadline = profile.get("nearest_deadline")
+
+            if overdue > 0:
+                hint = f" Hiện có {overdue} task quá hạn đang chờ."
+            elif nearest_task and nearest_deadline:
+                hint = f" Deadline gần nhất: '{nearest_task}' ({nearest_deadline})."
             else:
-                greeting = "Chào buổi tối"
-                
+                hint = ""
+
             return {
                 "type": "greeting",
-                "message": f"{greeting}! Tôi là trợ lý thông tin dự án. Tôi có thể giúp gì cho bạn về thông tin dự án, task, milestone, hoặc worklog?"
+                "message": f"{greeting}{name_part}!{hint} Mình có thể giúp gì không?",
             }
-        
-        elif self.is_help_request(message):
+
+        if self.is_help_request(lowered):
             return {
                 "type": "help",
-                "message": """Tôi có thể giúp bạn:
-                1. Tìm kiếm thông tin dự án và task
-                2. Tra cứu milestone và worklog
-                3. Truy vấn cơ sở dữ liệu về thông tin dự án và lịch sử công việc
-                4. Trả lời các câu hỏi chung về quản lý dự án và công việc
-
-                Bạn có thể hỏi những câu như:
-                - "Hiện tại có bao nhiêu dự án?"
-                - "Cho tôi thông tin về task X!"
-                - "Thông tin về project Y?"
-                """
+                "message": (
+                    "Mình có thể giúp bạn:\n"
+                    "• Tra cứu thông tin dự án, task, milestone, worklog\n"
+                    "• Tạo báo cáo tiến độ\n"
+                    "• Lập kế hoạch và phân chia công việc\n"
+                    "• Trả lời câu hỏi bằng ngôn ngữ tự nhiên (không cần biết SQL)"
+                ),
             }
-        
+
         return None
 
-    async def process_message_async(self, message, user_context=None, timezone_name: str | None = None):
-        """
-        Xử lý tin nhắn của người dùng và trả về phản hồi bằng cách bất đồng bộ.
-        
-        Args:
-            message (str): Tin nhắn của người dùng
-            user_context (str, optional): Thông tin ngữ cảnh của người dùng
-        Returns:
-            Dict chứa loại và nội dung phản hồi
-        """
-        # Hàm chạy các tác vụ chặn trong thread riêng
-        async def run_in_executor(func, *args, **kwargs):
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-        
-        # Kiểm tra các trường hợp chuẩn trước
-        standard_response = await run_in_executor(self.get_standard_response, message, timezone_name)
+    async def process_message_async(self, message, user_context=None, user_profile=None, timezone_name: str | None = None):
+        standard_response = self.get_standard_response(message, user_profile=user_profile, timezone_name=timezone_name)
         if standard_response:
             return standard_response
-        
-        # Xử lý với LLM nếu không phải trường hợp chuẩn
+
         retries = 0
         while retries < self.max_retries:
             try:
-                user_context_str = user_context if user_context else "Không có thông tin ngữ cảnh."
-                
-                # Sử dụng invoke trong thread riêng để không chặn event loop
-                response = await run_in_executor(
-                    self.chain.invoke,
-                    {"input": message, "user_context": user_context_str}
-                )
-                
-                return {
-                    "type": "conversation",
-                    "message": response.content.strip()
-                }
-            
+                response = await self.chain.ainvoke({
+                    "input": message,
+                    "user_context": user_context or "Không có thông tin ngữ cảnh.",
+                    "tone_context": _tone_context(timezone_name),
+                })
+                return {"type": "conversation", "message": response.content.strip()}
             except Exception as e:
                 retries += 1
-                print(f"Lỗi (thử lại {retries}/{self.max_retries}): {str(e)}")
                 if retries == self.max_retries:
                     return {
                         "type": "error",
@@ -183,7 +182,7 @@ class ConversationAgent:
             Dict chứa loại và nội dung phản hồi
         """
         # Kiểm tra các trường hợp chuẩn trước
-        standard_response = self.get_standard_response(message, timezone_name)
+        standard_response = self.get_standard_response(message, timezone_name=timezone_name)
         if standard_response:
             return standard_response
         

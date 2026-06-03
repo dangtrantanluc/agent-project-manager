@@ -372,30 +372,41 @@ async def list_project_candidates(
     db: AsyncSession, *, user_id: int, limit: int = 8, q: str | None = None
 ) -> list[dict]:
     params: dict = {"uid": user_id, "lim": limit}
-    q_clause = ""
     if q:
-        q_clause = "AND p.name ILIKE :q"
+        # Search across ALL projects (not just user's) so user can checkin any project
         params["q"] = f"%{q}%"
-    rows = (await db.execute(text(f"""
-        SELECT p.id, p.name, p.status
-        FROM projects p
-        WHERE p.status::text <> 'DONE'
-          {q_clause}
-          AND (
-            EXISTS (SELECT 1 FROM members m WHERE m.project_id = p.id AND m.user_id = :uid)
-            OR
-            EXISTS (
-                SELECT 1 FROM tasks t
-                WHERE t.project_id = p.id AND t.assignee_id = :uid
-                  AND t.status::text <> 'DONE'
-            )
-          )
-        GROUP BY p.id
-        ORDER BY
-          CASE p.status::text WHEN 'IN_PROGRESS' THEN 0 ELSE 1 END,
-          MAX(p.updated_at) DESC
-        LIMIT :lim
-    """), params)).fetchall()
+        rows = (await db.execute(text("""
+            SELECT p.id, p.name, p.status
+            FROM projects p
+            WHERE p.status::text <> 'DONE'
+              AND p.name ILIKE :q
+            GROUP BY p.id
+            ORDER BY
+              CASE p.status::text WHEN 'IN_PROGRESS' THEN 0 ELSE 1 END,
+              MAX(p.updated_at) DESC
+            LIMIT :lim
+        """), params)).fetchall()
+    else:
+        # Initial menu: show projects the user is a member of or has tasks assigned
+        rows = (await db.execute(text("""
+            SELECT p.id, p.name, p.status
+            FROM projects p
+            WHERE p.status::text <> 'DONE'
+              AND (
+                EXISTS (SELECT 1 FROM members m WHERE m.project_id = p.id AND m.user_id = :uid)
+                OR
+                EXISTS (
+                    SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id AND t.assignee_id = :uid
+                      AND t.status::text <> 'DONE'
+                )
+              )
+            GROUP BY p.id
+            ORDER BY
+              CASE p.status::text WHEN 'IN_PROGRESS' THEN 0 ELSE 1 END,
+              MAX(p.updated_at) DESC
+            LIMIT :lim
+        """), params)).fetchall()
     return [{"id": r[0], "name": r[1], "status": r[2]} for r in rows]
 
 
@@ -432,14 +443,9 @@ async def validate_project_access(
 ) -> bool:
     row = (await db.execute(text("""
         SELECT 1 FROM projects p
-        WHERE p.id = :pid
-          AND (
-            EXISTS (SELECT 1 FROM members m WHERE m.project_id = p.id AND m.user_id = :uid)
-            OR
-            EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.assignee_id = :uid)
-          )
+        WHERE p.id = :pid AND p.status::text <> 'DONE'
         LIMIT 1
-    """), {"pid": project_id, "uid": user_id})).fetchone()
+    """), {"pid": project_id})).fetchone()
     return row is not None
 
 

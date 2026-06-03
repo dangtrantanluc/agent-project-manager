@@ -1,3 +1,4 @@
+import hashlib
 import time
 import re
 import json
@@ -10,8 +11,37 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 import os
 import asyncio
+import logging
 from pathlib import Path
 import sys
+
+logger = logging.getLogger(__name__)
+
+SQL_CACHE_TTL = int(os.getenv("SQL_CACHE_TTL", 3600))
+
+
+# Câu hỏi có thời gian tương đối → không cache vì kết quả thay đổi theo ngày
+_SKIP_CACHE_PATTERNS = (
+    "hôm nay", "hôm qua", "tuần này", "tuần trước",
+    "tháng này", "tháng trước", "năm nay",
+    "mới nhất", "gần đây", "vừa", "hiện tại",
+)
+
+_db_pool: asyncpg.Pool | None = None
+
+async def _get_pool() -> asyncpg.Pool:
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = await asyncpg.create_pool(
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME"),
+            host=os.getenv("DB_HOST", "localhost"),
+            port=int(os.getenv("DB_PORT", 5432)),
+            min_size=2,
+            max_size=10,
+        )
+    return _db_pool
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
@@ -54,7 +84,13 @@ class Text2SQLAgent:
         """
         self.db = db
         self.top_k = top_k
-        self.llm = ChatOpenAI(model=os.getenv("MODEL_NAME"), timeout=60, api_key=os.getenv("API_KEY"), base_url=os.getenv("BASE_URL")) if llm is None else llm
+        self.llm = ChatOpenAI(
+               model=os.getenv("MODEL_NAME"),
+               timeout=45,
+               max_tokens=512,
+            api_key=os.getenv("API_KEY"),
+            base_url=os.getenv("BASE_URL"),
+        ) if llm is None else llm
 
     def _schema_context(self) -> str:
         if self.db is not None and hasattr(self.db, "get_table_info"):
@@ -84,7 +120,16 @@ class Text2SQLAgent:
         if user_id is None:
             return sql
         return _USER_ID_PLACEHOLDER.sub(str(user_id), sql)
-    
+
+    def _cache_key(self, question: str, user_id: int | None) -> str:
+        normalized = " ".join(question.lower().split())
+        raw = f"{normalized}:{user_id or 'anon'}"
+        return f"sql_cache:{hashlib.md5(raw.encode()).hexdigest()}"
+
+    def _should_cache(self, question: str) -> bool:
+        lowered = question.lower()
+        return not any(p in lowered for p in _SKIP_CACHE_PATTERNS)
+
     def is_safe_sql(self, sql: str) -> bool:
         normalized = self._clean_sql(sql).strip()
         if not normalized.lower().startswith(("select", "with")):
@@ -104,40 +149,50 @@ class Text2SQLAgent:
 
         return True
 
-    async def generate_sql(
-        self,
-        question: str,
-        memory_context: str = "",
-        current_user_id: int | str | None = None,
-    ) -> str:
-        """Sử dụng LLM để tạo câu truy vấn SQL từ câu hỏi của người dùng.
-            Args:
-                question (str): Câu hỏi của người dùng về dự án, task.
-            Returns:
-                str: Câu truy vấn SQL được tạo ra để trả lời câu hỏi."""
+    async def generate_sql(self, question: str, memory_context: str = "", current_user_id: int | str | None = None) -> str:
+        user_id = self._coerce_user_id(current_user_id)
+        cacheable = self._should_cache(question)
+
+        # Thử đọc cache trước khi gọi LLM
+        if cacheable:
+            try:
+                from core.redis import get_redis
+                redis = await get_redis()
+                cache_key = self._cache_key(question, user_id)
+                cached_sql = await redis.get(cache_key)
+                if cached_sql:
+                    logger.info("SQL cache hit key=%s", cache_key)
+                    return cached_sql
+            except Exception:
+                logger.warning("Redis unavailable, skipping SQL cache read", exc_info=True)
 
         start = time.perf_counter()
-
         tenant_rule = "- Hệ thống hiện single-company; không thêm điều kiện company_id và không dùng bảng companies."
         memory_block = f"\n        Ngữ cảnh hội thoại trước đó:\n        {memory_context}\n" if memory_context else ""
-        user_id = self._coerce_user_id(current_user_id)
         user_context_block = (
             f"\n        User hiện tại có users.id = {user_id}. "
             "Nếu người dùng hỏi 'của tôi', 'của mình', hãy lọc bằng id này; không dùng placeholder.\n"
             if user_id is not None else ""
         )
-        response = await self.llm.ainvoke([
-            SystemMessage(content=SYSTEM_PROMPT + "\n\n" + tenant_rule + memory_block + user_context_block),
-            HumanMessage(content=f"Hãy tạo SQL cho câu hỏi: {question}"),
-        ])
-
+        response = await self.llm.ainvoke(SYSTEM_PROMPT + tenant_rule + user_context_block + memory_block + f"\n\nCâu hỏi: {question}\n\nHãy tạo câu truy vấn SQL phù hợp để trả lời câu hỏi này, tuân thủ các yêu cầu đã nêu trong prompt.")
         elapsed = time.perf_counter() - start
-        print("GENERATED SQL")
+
         sql = self._bind_allowed_context_values(self._clean_sql(response.content), current_user_id)
         if not self.is_safe_sql(sql):
             raise ValueError(f"Unsafe SQL generated: {sql}")
-        print(sql)
-        print(f"Generate SQL time: {elapsed:.3f}s")
+        logger.info("SQL generated in %.3fs: %s", elapsed, sql)
+
+        # Lưu vào cache sau khi validate thành công
+        if cacheable:
+            try:
+                from core.redis import get_redis
+                redis = await get_redis()
+                cache_key = self._cache_key(question, user_id)
+                await redis.setex(cache_key, SQL_CACHE_TTL, sql)
+                logger.info("SQL cache set key=%s ttl=%ds", cache_key, SQL_CACHE_TTL)
+            except Exception:
+                logger.warning("Redis unavailable, skipping SQL cache write", exc_info=True)
+
         return sql
     
     async def execute_sql(self, sql: str, args: list | tuple | None = None):
@@ -149,43 +204,28 @@ class Text2SQLAgent:
         Returns:
             list[dict]: Kết quả trả về từ việc thực thi câu truy vấn SQL, dưới dạng một danh sách các dictionary, mỗi dictionary đại diện cho một hàng kết quả với tên cột là key và giá trị là value.
         """
-        conn = await asyncpg.connect(
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME"),
-            host=os.getenv("DB_HOST", "localhost"),
-            port=int(os.getenv("DB_PORT", 5432)),
-        )
-
-        try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *(args or []))
             return [dict(row) for row in rows]
 
-        finally:
-            await conn.close()
     
     def _build_summary_prompt(self, question: str, rows: list[dict], memory_context: str = "") -> str:
-            memory_block = f"""
-        Ngữ cảnh hội thoại trước đó:
-        {memory_context}
-        """ if memory_context else ""
+        memory_block = f"\nNgữ cảnh hội thoại trước:\n{memory_context}\n" if memory_context else ""
+        return f"""Bạn là PM-Bot, trợ lý quản lý dự án. Trả lời câu hỏi dựa trên kết quả truy vấn database.
+{memory_block}
+Câu hỏi: {question}
 
-            return f"""
-        Bạn là trợ lý quản lý dự án. Hãy trả lời câu hỏi của người dùng dựa trên kết quả truy vấn database.
-        {memory_block}
+Kết quả:
+{json.dumps(rows, ensure_ascii=False, default=str)}
 
-        Câu hỏi:
-        {question}
-
-        Kết quả truy vấn dạng JSON:
-        {json.dumps(rows, ensure_ascii=False, default=str)}
-
-        Yêu cầu output:
-        - Chỉ trả về câu trả lời cuối cùng cho người dùng
-        - Không hiển thị SQL
-        - Không hiển thị schema, tên bảng kỹ thuật, hoặc JSON thô
-        - Trả lời ngắn gọn, tự nhiên bằng tiếng Việt
-        """
+Yêu cầu:
+- Trả lời tự nhiên bằng tiếng Việt, ngắn gọn
+- Không hiển thị SQL, tên bảng, hoặc JSON thô
+- Đừng chỉ đọc số — hãy nói ý nghĩa: tốt hay chưa tốt, đúng hạn hay trễ
+- Nếu dữ liệu cho thấy vấn đề (task trễ, không có worklog, milestone sắp hết), nhận xét 1 câu
+- Nếu kết quả rỗng, nói rõ không tìm thấy và gợi ý hỏi lại cụ thể hơn
+"""
 
     async def summarize_result(self, question: str, rows: list[dict], memory_context: str = "") -> str:
         """Dùng LLM diễn giải kết quả truy vấn thành câu trả lời gửi cho người dùng (1 call)."""
@@ -199,12 +239,27 @@ class Text2SQLAgent:
         ])
         return (response.content or "").strip()
 
-    async def execute(
-        self,
-        question: str,
-        memory_context: str = "",
-        current_user_id: int | str | None = None,
-    ):
+    def _answer_cache_key(self, sql: str, result: list[dict]) -> str:
+        raw = f"{sql}:{json.dumps(result, sort_keys=True, default=str)}"
+        return f"answer_cache:{hashlib.md5(raw.encode()).hexdigest()}"
+
+    async def _get_cached_answer(self, sql: str, result: list[dict]) -> str | None:
+        try:
+            from core.redis import get_redis
+            redis = await get_redis()
+            return await redis.get(self._answer_cache_key(sql, result))
+        except Exception:
+            return None
+
+    async def _set_cached_answer(self, sql: str, result: list[dict], answer: str) -> None:
+        try:
+            from core.redis import get_redis
+            redis = await get_redis()
+            await redis.setex(self._answer_cache_key(sql, result), SQL_CACHE_TTL, answer)
+        except Exception:
+            logger.warning("Redis unavailable, skipping answer cache write", exc_info=True)
+
+    async def execute(self, question: str, memory_context: str = "", current_user_id: int | str | None = None,):
       """Thực thi câu truy vấn SQL được tạo ra từ câu hỏi của người dùng và trả về kết quả.
       Args:
           question (str): Câu hỏi của người dùng về dự án, task.
@@ -212,11 +267,7 @@ class Text2SQLAgent:
           dict: Kết quả trả về từ việc thực thi câu truy vấn SQL, bao gồm câu hỏi gốc, câu truy vấn SQL và kết quả truy vấn.
       """
       try:
-        sql = await self.generate_sql(
-            question,
-            memory_context=memory_context,
-            current_user_id=current_user_id,
-        )
+        sql = await self.generate_sql(question, memory_context=memory_context, current_user_id=current_user_id)
       except ValueError as e:
         print(f"Error generating SQL: {e}")
         return {
@@ -240,8 +291,15 @@ class Text2SQLAgent:
         }
 
       elapsed = time.perf_counter() - start
-      print(f"DB execution time: {elapsed:.3f}s")
-      answer = await self.summarize_result(question, result, memory_context=memory_context)
+      logger.info("DB execution time: %.3fs", elapsed)
+
+      cached_answer = await self._get_cached_answer(sql, result)
+      if cached_answer:
+          answer = cached_answer
+      else:
+          answer = await self.summarize_result(question, result, memory_context=memory_context)
+          if answer:
+              await self._set_cached_answer(sql, result, answer)
 
       return {
           "question": question,
@@ -257,6 +315,9 @@ if __name__ == "__main__":
                 "Ai là người quản lý dự án MTL?", 
                 "Dự án nào có deadline sắp tới nhất?", 
                 "Tổng số giờ đã được ghi lại cho dự án Vingroup?"]
-    for q in question:
-        result = asyncio.run(agent.execute(q))
-        print(result)
+    async def _main():
+        for q in question:
+            result = await agent.execute(q)
+            print(result)
+
+    asyncio.run(_main())

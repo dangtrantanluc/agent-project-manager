@@ -1,9 +1,10 @@
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
 import json
 import logging
+import os
+
+from openai import AsyncOpenAI
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +142,9 @@ async def save_memory(
     tools_used: list[str],
     correlation_id: str,
     db: AsyncSession,
-    llm: ChatOpenAI,
     company_id: int | None = None,
     user_id: int | str | None = None,
+    **_kwargs,  # absorb deprecated llm= callers
 ) -> None:
     has_company_id = await _has_column(db, "agent_memory", "company_id")
     insert_columns = "conversation_id, source, user_text, reply_text, summary, tools_used, correlation_id"
@@ -183,7 +184,7 @@ async def save_memory(
     )
     turn_count = count_result.scalar() or 0
 
-    if turn_count < 4:
+    if turn_count % 4 != 0:
         return
 
     try:
@@ -192,11 +193,23 @@ async def save_memory(
         for turn in recent:
             ctx += f"User: {turn['user']}\nBot: {turn['bot']}\n"
 
-        resp = await llm.ainvoke([
-            SystemMessage(content=MEMORY_SUMMARY_SYSTEM_PROMPT),
-            HumanMessage(content=ctx.strip()),
-        ])
-        summary = (resp.content or "").strip()
+        client = AsyncOpenAI(
+            api_key=os.getenv("API_KEY"),
+            base_url=os.getenv("BASE_URL"),
+        )
+        resp = await client.chat.completions.create(
+            model=os.getenv("MODEL_NAME", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": MEMORY_SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": ctx.strip()},
+            ],
+            temperature=0,
+        )
+        if isinstance(resp, str):
+            summary = resp.strip()
+        else:
+            summary = (resp.choices[0].message.content if resp.choices else "") or ""
+            summary = summary.strip()
     except Exception:
         logger.exception("Failed to create memory summary for conversation %s", conversation_id)
         return

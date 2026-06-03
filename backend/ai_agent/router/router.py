@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import json
 import re
@@ -8,7 +9,6 @@ from fastapi import APIRouter, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 from dotenv import load_dotenv
 import os
 import time
@@ -43,8 +43,15 @@ class PMMultiAgentRouter:
         """
         Khởi tạo bộ định tuyến đa tác nhân cho các câu hỏi liên quan đến quản lý dự án.
         """
-        self.llm = ChatOpenAI(model=os.getenv("MODEL_NAME"), api_key=os.getenv("API_KEY"), base_url=os.getenv("BASE_URL"))
-        logger.info("PMMultiAgentRouter initialized with LLM: %s", self.llm.model)
+        self.llm = ChatOpenAI(
+            model="gemini-2.5-flash",
+            timeout=10,
+            max_tokens=100,
+            max_retries=0,
+            api_key=os.getenv("API_KEY"),
+            base_url=os.getenv("BASE_URL"),
+        )
+        logger.info("PMMultiAgentRouter initialized with LLM: %s", self.llm.model_name)
         self.agents = [
             Agent(
                 name="report",
@@ -110,16 +117,16 @@ class PMMultiAgentRouter:
             logger.info(f"Điểm tin cậy sau khi phân tích thủ công: {confidence_dict}")
             return confidence_dict
         
-    def calculate_confidence(self, message: str) -> List[Agent]:
+    async def calculate_confidence(self, message: str) -> List[Agent]:
         """Tính toán điểm tin cậy cho từng tác nhân dựa trên câu hỏi đầu vào.
         Args:
             message (str): Câu hỏi đầu vào từ người dùng
         Returns:
             List[Agent]: Danh sách các tác nhân với điểm tin cậy đã được tính toán
         """
-        try: 
+        try:
             time_es = time.perf_counter()
-            agents = self._llm_intent_classification(message)
+            agents = await self._llm_intent_classification(message)
             elapsed = time.perf_counter() - time_es
             logger.info(f"Phân loại ý định mất {elapsed:.3f} giây")
             
@@ -132,7 +139,7 @@ class PMMultiAgentRouter:
                 agent.selected = False
             return self.agents
         
-    def _llm_intent_classification(self, question: str) -> List[Agent]:
+    async def _llm_intent_classification(self, question: str) -> List[Agent]:
         """Sử dụng LLM để phân loại ý định của câu hỏi.
         Args:
             question (str): Câu hỏi đầu vào từ người dùng
@@ -159,7 +166,7 @@ class PMMultiAgentRouter:
         Ví dụ: {{"report": 0.3, "text2sql": 0.2, "planning": 0.4, "conversation": 0.1, "notification": 0.0}}
 
         """
-        raw_output = self.llm.invoke(prompt)
+        raw_output = await self.llm.ainvoke(prompt)
         confidence_dict = self.parse_confidence_json(raw_output.content)
 
         for agent in self.agents:
@@ -170,29 +177,33 @@ class PMMultiAgentRouter:
         
         return self.agents
 
-    def selected_agents(self, question: str) -> List[Agent]:
+    async def selected_agents(self, question: str) -> List[Agent]:
         """Trả về danh sách các tác nhân được chọn dựa trên điểm tin cậy và ngưỡng đã định.
         Args:
             question (str): Câu hỏi đầu vào từ người dùng
         Returns:
             List[Agent]: Danh sách các tác nhân được chọn
         """
-        self.calculate_confidence(question)
+        await self.calculate_confidence(question)
         start = time.perf_counter()
         selected = [agent for agent in self.agents if agent.selected]
         elapsed = time.perf_counter() - start
         logger.info(f"Lựa chọn tác nhân mất {elapsed:.3f} giây")
         logger.info(f"Tác nhân được chọn: {[agent.name for agent in selected]}")
-        return selected if selected else ["conversation"]  # Mặc định chọn conversation nếu không có tác nhân nào đạt ngưỡng
+        if selected:
+            return selected
+        # Mặc định chọn conversation nếu không có tác nhân nào đạt ngưỡng
+        fallback = next((a for a in self.agents if a.name == "conversation"), None)
+        return [fallback] if fallback is not None else []
 
-    def detail_agents(self, question: str) -> Dict[str, Any]:
+    async def detail_agents(self, question: str) -> Dict[str, Any]:
         """Trả về chi tiết điểm tin cậy và trạng thái của tất cả các tác nhân.
         Args:
             question (str): Câu hỏi đầu vào từ người dùng
         Returns:
             Dict[str, Any]: Chi tiết về điểm tin cậy và trạng thái của tất cả các tác nhân
         """
-        self.calculate_confidence(question)
+        await self.calculate_confidence(question)
 
         details = {
             agent.name: {
@@ -219,7 +230,7 @@ class PMMultiAgentRouter:
             raise
 
 
-def main():
+async def main():
     router = PMMultiAgentRouter()
     questions = ["Dự án X có bao nhiêu task đã hoàn thành và tiến độ tổng thể là gì?",
                 "Hôm nay tôi muốn biết dự án X đang ở giai đoạn nào và có những rủi ro gì?",
@@ -229,10 +240,10 @@ def main():
 
     for q in questions:
         print(f"\nQuestion: {q}")
-        details = router.detail_agents(q)
+        details = await router.detail_agents(q)
         print(f"Routing result: {details}")
-        selected_agents = router.selected_agents(q)
+        selected_agents = await router.selected_agents(q)
         print(f"Selected agents: {selected_agents}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
