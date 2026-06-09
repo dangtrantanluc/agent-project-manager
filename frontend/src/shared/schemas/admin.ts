@@ -2,9 +2,9 @@ import { z } from "zod";
 import { Role } from "../enums";
 
 export const userCreateSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(8).max(128),
-  fullName: z.string().min(1).max(120),
+  email: z.string().email("Email không hợp lệ"),
+  password: z.string().min(6, "Mật khẩu tối thiểu 6 ký tự").max(128),
+  fullName: z.string().min(1, "Vui lòng nhập họ tên").max(120),
   role: z.nativeEnum(Role).default("MEMBER"),
 });
 export type UserCreateInput = z.infer<typeof userCreateSchema>;
@@ -13,7 +13,7 @@ export const userAdminUpdateSchema = z.object({
   fullName: z.string().min(1).max(120).optional(),
   role: z.nativeEnum(Role).optional(),
   active: z.boolean().optional(),
-  password: z.string().min(8).max(128).optional(),
+  password: z.string().min(6, "Mật khẩu tối thiểu 6 ký tự").max(128).optional(),
 });
 export type UserAdminUpdateInput = z.infer<typeof userAdminUpdateSchema>;
 

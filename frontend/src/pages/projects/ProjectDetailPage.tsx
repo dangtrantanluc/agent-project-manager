@@ -4,12 +4,15 @@ import { getProject, transitionProject } from "@/features/projects/api";
 import { Badge } from "@/components/ui/Badge";
 import { formatDate, formatHours, statusColors, statusLabels, priorityColors } from "@/lib/format";
 import type { ProjectStatus } from "@bb-pm/shared";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Pencil } from "lucide-react";
+import { useState } from "react";
 import { TaskKanbanBoard } from "../tasks/TaskKanbanBoard";
 import { MilestonesTab } from "../milestones/MilestonesTab";
 import { WorklogsTab } from "../worklogs/WorklogsTab";
 import { MembersTab as NewMembersTab } from "../members/MembersTab";
 import { ScopeTab } from "../scopes/ScopeTab";
+import { ProjectFormModal } from "./ProjectFormModal";
+import { useAuth } from "@/features/auth/store";
 
 const nextStatuses: Record<ProjectStatus, ProjectStatus[]> = {
   PLANNED: ["PENDING", "IN_PROGRESS", "CANCELLED"],
@@ -35,6 +38,10 @@ export function ProjectDetailPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = (searchParams.get("tab") as TabId) ?? "overview";
   const qc = useQueryClient();
+  const [editing, setEditing] = useState(false);
+  const role = useAuth((s) => s.user?.role);
+  const isSuperAdmin = useAuth((s) => s.user?.isSuperAdmin);
+  const canEdit = isSuperAdmin || role === "MANAGER" || role === "ADMIN";
 
   const q = useQuery({ queryKey: ["project", projectId], queryFn: () => getProject(projectId), enabled: !!projectId });
 
@@ -68,6 +75,14 @@ export function ProjectDetailPage() {
             </div>
           </div>
           <div className="flex flex-wrap gap-2">
+            {canEdit && (
+              <button
+                className="btn-ghost border border-slate-200 text-xs"
+                onClick={() => setEditing(true)}
+              >
+                <Pencil className="mr-1 h-3 w-3" /> Sửa
+              </button>
+            )}
             {nextStatuses[p.status as ProjectStatus].map((s) => (
               <button
                 key={s}
@@ -81,6 +96,18 @@ export function ProjectDetailPage() {
           </div>
         </div>
       </div>
+
+      {canEdit && (
+        <ProjectFormModal
+          open={editing}
+          onClose={() => setEditing(false)}
+          project={p as any}
+          onSaved={() => {
+            qc.invalidateQueries({ queryKey: ["project", projectId] });
+            qc.invalidateQueries({ queryKey: ["projects"] });
+          }}
+        />
+      )}
 
       {/* Tabs */}
       <div className="border-b border-slate-200">

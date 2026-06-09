@@ -2,50 +2,19 @@ from typing import List
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.output_parsers import JsonOutputParser
 from dotenv import load_dotenv
 import asyncio
 import logging
 import time
 import json
 import os
-import sys
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
-if str(BACKEND_ROOT) not in sys.path:
-    sys.path.insert(0, str(BACKEND_ROOT))
 
 load_dotenv()
 
 PLANNING_SYSTEM_PROMPT = """
 Bạn là Planning Agent cho hệ thống quản lý dự án.
-
-Chỉ trả về JSON hợp lệ, không thêm bất kỳ text nào khác.
-
-Output:
-{
-  "project_name": "string",
-  "summary": "string",
-  "milestones": [
-    {
-      "name": "string",
-      "goal": "string",
-      "estimated_days": 1,
-      "tasks": [
-        {
-          "title": "string",
-          "description": "string",
-          "priority": "high|medium|low",
-          "estimated_hours": 1,
-          "role": "string"
-        }
-      ]
-    }
-  ]
-}
 
 Giới hạn:
 - Tối đa 3 milestones
@@ -80,12 +49,14 @@ class PlanningAgent:
         Args:
             llm (ChatOpenAI | None): Một instance của ChatOpenAI để tạo kế hoạch dự án. Nếu None, sẽ tạo một instance mới với cấu hình mặc định.
         """
-        self.llm = ChatOpenAI(model=os.getenv("MODEL_NAME"),
+        base_llm = ChatOpenAI(model=os.getenv("MODEL_NAME"),
                               timeout=60,
-                            temperature=0.4,
-                              api_key=os.getenv("API_KEY"), 
+                              temperature=0.4,
+                              api_key=os.getenv("API_KEY"),
                               base_url=os.getenv("BASE_URL")) if llm is None else llm
-        self.output_parser = JsonOutputParser()
+        # Ép LLM trả thẳng đối tượng ProjectPlan đã validate (qua tool-calling).
+        # Bỏ hẳn parse JSON thủ công — proxy đã xác nhận hỗ trợ function_calling.
+        self.llm = base_llm.with_structured_output(ProjectPlan, method="function_calling")
 
     
     def _build_context_block(self, user_profile: dict) -> str:
@@ -121,15 +92,28 @@ class PlanningAgent:
             "\n\nHãy tạo kế hoạch dự án theo mô tả trên."
         )
         start = time.perf_counter()
-        response = await self.llm.ainvoke([
-            SystemMessage(content=PLANNING_SYSTEM_PROMPT),
-            HumanMessage(content=human_content),
-        ])
-        elapsed = time.perf_counter() - start
-        logger.info("generate_project_plan took %.2fs", elapsed)
-        raw = response.content.strip().replace("```json", "").replace("```", "").strip()
-        plan_dict = self.output_parser.parse(raw)
-        return ProjectPlan(**plan_dict)
+        # with_structured_output trả thẳng ProjectPlan đã validate (hoặc None nếu
+        # model không gọi tool). Bọc lỗi để không ném exception lên router — trả
+        # về ProjectPlan rỗng kèm thông báo thân thiện thay vì câu lỗi chung chung.
+        try:
+            plan = await self.llm.ainvoke([
+                SystemMessage(content=PLANNING_SYSTEM_PROMPT),
+                HumanMessage(content=human_content),
+            ])
+            if not isinstance(plan, ProjectPlan):
+                raise ValueError(f"Kế hoạch không hợp lệ: {type(plan).__name__}")
+        except Exception:
+            logger.exception("generate_project_plan: không tạo/validate được kế hoạch")
+            plan = ProjectPlan(
+                project_name=project_description[:60].strip() or "Kế hoạch dự án",
+                summary=(
+                    "Mình chưa lập được kế hoạch chi tiết cho yêu cầu này. "
+                    "Bạn mô tả rõ hơn về mục tiêu và phạm vi dự án giúp mình nhé."
+                ),
+            )
+        finally:
+            logger.info("generate_project_plan took %.2fs", time.perf_counter() - start)
+        return plan
 
     def format_project_plan(self, plan: ProjectPlan) -> str:
         lines = [f"Kế hoạch dự án: {plan.project_name}"]

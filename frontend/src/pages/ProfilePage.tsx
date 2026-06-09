@@ -41,18 +41,22 @@ export function ProfilePage() {
   });
 
   const fileRef = useRef<HTMLInputElement>(null);
+  // URL hiển thị ngay sau upload (không chờ refetch). null = dùng giá trị form/me.
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const upload = useMutation({
     mutationFn: uploadAvatar,
     onSuccess: (url) => {
-      form.setValue("avatarUrl", url);
+      form.setValue("avatarUrl", url, { shouldDirty: true });
+      setPreviewUrl(url);
       setStoreUser({ ...(useAuth.getState().user as any), avatarUrl: url });
-      qc.invalidateQueries({ queryKey: ["me"] });
+      // Cập nhật cache "me" tại chỗ để tránh form bị reset về giá trị cũ khi refetch.
+      qc.setQueryData(["me"], (old: any) => (old ? { ...old, avatarUrl: url } : old));
       setMsg("Đã upload avatar");
       setTimeout(() => setMsg(null), 2000);
     },
   });
 
-  const currentAvatar = form.watch("avatarUrl") ?? meQ.data?.avatarUrl;
+  const currentAvatar = previewUrl ?? form.watch("avatarUrl") ?? meQ.data?.avatarUrl;
 
   return (
     <div className="space-y-4 p-6">

@@ -35,6 +35,42 @@ export async function updateAdminUser(id: number, input: UserAdminUpdateInput) {
   return data.data;
 }
 
+// ── Gapo linking ────────────────────────────────────────────────────────────
+
+export type GapoMap = {
+  userId: number;
+  email: string;
+  fullName: string;
+  active: boolean;
+  linked: boolean;
+  gapoUserId: string | null;
+  gapoThreadId: string | null;
+  gapoFullName: string | null;
+  linkedAt: string | null;
+  activeCode: string | null;
+  codeExpiresAt: string | null;
+};
+
+export async function listGapoMaps(params: { q?: string } = {}) {
+  const { data } = await apiClient.get<{ data: GapoMap[] }>("/admin/gapo-maps", { params });
+  return data.data;
+}
+
+export type GapoLinkCode = { code: string; expiresAt: string; ttlHours: number };
+
+export async function createGapoLinkCode(userId: number, relink = false) {
+  const { data } = await apiClient.post<{ data: GapoLinkCode }>(
+    `/admin/gapo-maps/${userId}/link-code`,
+    null,
+    { params: { relink } },
+  );
+  return data.data;
+}
+
+export async function unlinkGapoMap(userId: number) {
+  await apiClient.delete(`/admin/gapo-maps/${userId}`);
+}
+
 export type CompanyInfo = {
   id: number;
   name: string;

@@ -7,6 +7,7 @@ import { listWorklogs } from "@/features/worklogs/api";
 import { listMilestones } from "@/features/milestones/api";
 import { listMembers } from "@/features/members/api";
 import { Modal } from "@/components/ui/Modal";
+import { DateField } from "@/components/ui/DateField";
 import { useEffect } from "react";
 import { formatDate, formatHours } from "@/lib/format";
 
@@ -52,7 +53,8 @@ export function TaskFormModal({
         name: task.name,
         status: task.status,
         priority: task.priority as any,
-        deadline: task.deadline ?? undefined,
+        deadline: task.deadline ? task.deadline.slice(0, 10) : undefined,
+        endAt: task.endAt ? task.endAt.slice(0, 10) : undefined,
         description: task.description ?? undefined,
         assigneeId: task.assignee?.id,
         milestoneId: task.milestone?.id,
@@ -60,10 +62,29 @@ export function TaskFormModal({
     } else if (open) {
       form.reset({ priority: "MEDIUM", status: "TODO" });
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task, open]);
 
+  // <select> phải controlled: native select chỉ render đúng value khi <option> đã có
+  // trong DOM, mà options (members/milestones) tải bất đồng bộ sau reset → nếu để
+  // uncontrolled sẽ hiển thị "—". Đọc value từ RHF và set lại qua onChange.
+  const assigneeId = form.watch("assigneeId");
+  const milestoneId = form.watch("milestoneId");
+
+  // Khi SỬA: chỉ gửi các trường người dùng thực sự thay đổi (dirty), giữ nguyên
+  // mọi thông tin cũ. Khi TẠO MỚI: gửi toàn bộ form.
+  const buildPatch = (v: TaskCreateInput): Partial<TaskCreateInput> => {
+    const dirty = form.formState.dirtyFields as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    for (const key of Object.keys(dirty)) {
+      patch[key] = (v as Record<string, unknown>)[key];
+    }
+    return patch as Partial<TaskCreateInput>;
+  };
+
   const save = useMutation({
-    mutationFn: async (v: TaskCreateInput) => (task ? updateTask(task.id, v) : createTask(projectId, v)),
+    mutationFn: async (v: TaskCreateInput) =>
+      task ? updateTask(task.id, buildPatch(v)) : createTask(projectId, v),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] });
       qc.invalidateQueries({ queryKey: ["worklogs"] });
@@ -96,7 +117,15 @@ export function TaskFormModal({
           </div>
           <div>
             <label className="label">Assignee</label>
-            <select className="input" {...form.register("assigneeId", { setValueAs: (v) => (v ? Number(v) : undefined) })}>
+            <select
+              className="input"
+              value={assigneeId ?? ""}
+              onChange={(e) =>
+                form.setValue("assigneeId", e.target.value ? Number(e.target.value) : undefined, {
+                  shouldDirty: true,
+                })
+              }
+            >
               <option value="">—</option>
               {membersQ.data?.map((u) => (
                 <option key={u.id} value={u.id}>{u.fullName}</option>
@@ -105,7 +134,15 @@ export function TaskFormModal({
           </div>
           <div>
             <label className="label">Milestone</label>
-            <select className="input" {...form.register("milestoneId", { setValueAs: (v) => (v ? Number(v) : undefined) })}>
+            <select
+              className="input"
+              value={milestoneId ?? ""}
+              onChange={(e) =>
+                form.setValue("milestoneId", e.target.value ? Number(e.target.value) : undefined, {
+                  shouldDirty: true,
+                })
+              }
+            >
               <option value="">—</option>
               {msQ.data?.map((m) => (
                 <option key={m.id} value={m.id}>{m.name}</option>
@@ -114,11 +151,11 @@ export function TaskFormModal({
           </div>
           <div>
             <label className="label">Deadline</label>
-            <input type="date" className="input" {...form.register("deadline")} />
+            <DateField form={form} name="deadline" />
           </div>
           <div>
             <label className="label">End at</label>
-            <input type="date" className="input" {...form.register("endAt")} />
+            <DateField form={form} name="endAt" />
           </div>
           <div className="col-span-2">
             <label className="label">Mô tả</label>

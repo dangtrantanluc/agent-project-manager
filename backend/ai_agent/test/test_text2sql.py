@@ -54,7 +54,9 @@ def build_agent(llm_sql: str, monkeypatch) -> Text2SQLAgent:
 def test_text2sql_generates_safe_select(case, monkeypatch):
     agent = build_agent(case["llm_sql"], monkeypatch)
 
-    sql = asyncio.run(agent.generate_sql(case["question"]))
+    # Các case này là truy vấn toàn cục -> cần quyền ADMIN/MANAGER. MEMBER/VIEWER
+    # bị buộc scope theo user (xem test_text2sql_restricted_*).
+    sql = asyncio.run(agent.generate_sql(case["question"], user_role="ADMIN"))
     normalized_sql = normalize_sql(sql)
 
     assert agent.is_safe_sql(sql)
@@ -70,7 +72,7 @@ def test_text2sql_generates_safe_select(case, monkeypatch):
 def test_text2sql_keeps_single_company_schema(case, monkeypatch):
     agent = build_agent(case["llm_sql"], monkeypatch)
 
-    sql = asyncio.run(agent.generate_sql(case["question"]))
+    sql = asyncio.run(agent.generate_sql(case["question"], user_role="ADMIN"))
     normalized_sql = normalize_sql(sql)
 
     for table in case.get("tenant_tables", []):
@@ -81,7 +83,7 @@ def test_text2sql_keeps_single_company_schema(case, monkeypatch):
 def test_text2sql_out_of_scope_returns_invalid_question_sql(case, monkeypatch):
     agent = build_agent(case["llm_sql"], monkeypatch)
 
-    sql = asyncio.run(agent.generate_sql(case["question"]))
+    sql = asyncio.run(agent.generate_sql(case["question"], user_role="ADMIN"))
     normalized_sql = normalize_sql(sql)
 
     assert agent.is_safe_sql(sql)
@@ -92,8 +94,9 @@ def test_text2sql_out_of_scope_returns_invalid_question_sql(case, monkeypatch):
 def test_text2sql_rejects_unsafe_sql(monkeypatch):
     agent = build_agent("DROP TABLE projects;", monkeypatch)
 
+    # Dùng ADMIN để vượt qua lớp restriction, chạm tới lớp kiểm tra SQL an toàn.
     with pytest.raises(ValueError, match="Unsafe SQL generated"):
-        asyncio.run(agent.generate_sql("Xóa toàn bộ dự án"))
+        asyncio.run(agent.generate_sql("Xóa toàn bộ dự án", user_role="ADMIN"))
 
 
 def test_text2sql_rejects_named_placeholders(monkeypatch):
@@ -105,7 +108,7 @@ def test_text2sql_rejects_named_placeholders(monkeypatch):
     """, monkeypatch)
 
     with pytest.raises(ValueError, match="Unsafe SQL generated"):
-        asyncio.run(agent.generate_sql("Danh sách task của dự án này"))
+        asyncio.run(agent.generate_sql("Danh sách task của dự án này", user_role="ADMIN"))
 
 
 def test_text2sql_binds_current_user_placeholder(monkeypatch):

@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_user, get_db
 from app.core.security import (
     create_access_token,
-    hash_password,
     verify_password,
 )
 from app.modules.auth.schemas import (
@@ -36,58 +35,14 @@ def _make_access_token(row) -> str:
     })
 
 
-@router.post("/register", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/register", status_code=status.HTTP_403_FORBIDDEN)
 async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    existing = (await db.execute(
-        text("SELECT id FROM users WHERE email = :email LIMIT 1"),
-        {"email": req.email},
-    )).fetchone()
-    if existing:
-        raise HTTPException(status_code=409, detail="Email đã được sử dụng")
-
-    company_name = (req.companyName or "").strip()
-    if not company_name:
-        raise HTTPException(status_code=400, detail="Cần cung cấp companyName")
-    role = "ADMIN"
-
-    company_row = (await db.execute(
-        text("""
-            INSERT INTO companies (name, code, currency_id, updated_at)
-            VALUES (:name, :code, 1, NOW())
-            ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()
-            RETURNING id, name
-        """),
-        {"name": company_name, "code": company_name.lower().replace(" ", "-")[:50]},
-    )).fetchone()
-
-    user_row = (await db.execute(
-        text("""
-            INSERT INTO users (email, password_hash, full_name, company_id, role, is_super_admin, updated_at)
-            VALUES (:email, :hash, :name, :company_id, CAST(:role AS "Role"), true, NOW())
-            RETURNING id, email, full_name, avatar_url, role,
-                      :company_name AS company_name, lang, timezone, is_super_admin
-        """),
-        {
-            "email": req.email,
-            "hash": hash_password(req.password),
-            "name": req.fullName,
-            "company_id": company_row[0],
-            "company_name": company_row[1],
-            "role": role,
-        },
-    )).fetchone()
-
-    token_row = (await db.execute(
-        text("""
-            SELECT u.id, u.email, u.role, c.name, u.is_super_admin
-            FROM users u LEFT JOIN companies c ON c.id = u.company_id
-            WHERE u.id = :uid
-        """),
-        {"uid": user_row[0]},
-    )).fetchone()
-    await db.commit()
-
-    return AuthResponse(user=_user_dto(user_row), accessToken=_make_access_token(token_row))
+    # Hệ thống nội bộ một công ty: không cho tự đăng ký. Mọi tài khoản nhân viên
+    # do ADMIN tạo qua POST /admin/users. Giữ endpoint để client cũ nhận lỗi rõ ràng.
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Đăng ký đã bị vô hiệu hóa. Vui lòng liên hệ quản trị viên để được cấp tài khoản.",
+    )
 
 
 @router.post("/login", response_model=AuthResponse)

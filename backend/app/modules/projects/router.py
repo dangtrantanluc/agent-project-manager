@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_agent_user, get_current_user, get_db, require_role
+from app.core.deps import get_agent_user, get_current_user, get_db, require_role, is_restricted
 from app.modules.tasks.ai_import_service import (
     AiImportConfirmBody,
     confirm_ai_import,
@@ -29,8 +29,12 @@ _SELECT_PROJECT = """
            p.description, p.total_hours,
            p.task_count, p.member_count, p.worklog_count, p.scope_count, p.milestone_count,
            p.owner_id, p.customer_name, p.account_manager_id, p.currency_id,
-           p.created_at, p.updated_at
+           p.created_at, p.updated_at,
+           o.full_name AS owner_name, o.avatar_url AS owner_avatar,
+           am.full_name AS account_manager_name
     FROM projects p
+    LEFT JOIN users o ON o.id = p.owner_id
+    LEFT JOIN users am ON am.id = p.account_manager_id
 """
 
 
@@ -91,7 +95,40 @@ def _row_to_dict(r) -> dict:
         "ownerId": r[14], "customerName": r[15],
         "accountManagerId": r[16], "currencyId": r[17],
         "createdAt": r[18].isoformat(), "updatedAt": r[19].isoformat(),
+        # Owner / account-manager names are only present when the row comes from
+        # _SELECT_PROJECT (which LEFT JOINs users). RETURNING rows from
+        # create/update/transition are shorter — guard with len() so they don't
+        # IndexError; those callers re-read via _SELECT_PROJECT to hydrate names.
+        "owner": (
+            {"id": r[14], "fullName": r[20], "avatarUrl": r[21]}
+            if len(r) > 21 and r[20] else None
+        ),
+        "accountManager": (
+            {"id": r[16], "fullName": r[22]}
+            if len(r) > 22 and r[22] else None
+        ),
     }
+
+
+# Vai trò được xem toàn bộ project. MEMBER/VIEWER chỉ thấy project họ tham gia.
+_FULL_PROJECT_ACCESS_ROLES = {"ADMIN", "MANAGER"}
+
+# Điều kiện "user tham gia project p": là member, owner, account manager,
+# được assign task, hoặc đã điền worklog/backlog vào project (vd người ngoài
+# vào support fix bug rồi log giờ). Dùng EXISTS để không nhân bản dòng.
+_PROJECT_ACCESS_CLAUSE = """
+    p.owner_id = :access_uid
+    OR p.account_manager_id = :access_uid
+    OR EXISTS (SELECT 1 FROM members m WHERE m.project_id = p.id AND m.user_id = :access_uid)
+    OR EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.assignee_id = :access_uid)
+    OR EXISTS (SELECT 1 FROM worklogs w WHERE w.project_id = p.id AND w.user_id = :access_uid)
+    OR EXISTS (SELECT 1 FROM backlogs b WHERE b.project_id = p.id AND b.user_id = :access_uid)
+"""
+
+
+def _restricted(current_user: dict) -> bool:
+    """True nếu user chỉ được thấy project mình tham gia (không phải ADMIN/MANAGER)."""
+    return is_restricted(current_user)
 
 
 @router.get("")
@@ -104,6 +141,9 @@ async def list_projects(
 ):
     where = "WHERE TRUE"
     params: dict = {"limit": page_size}
+    if _restricted(current_user):
+        where += f" AND ({_PROJECT_ACCESS_CLAUSE})"
+        params["access_uid"] = current_user["id"]
     if status:
         where += " AND p.status::text = :status"
         params["status"] = status
@@ -239,11 +279,17 @@ async def get_project(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    where = "WHERE p.id = :pid"
+    params: dict = {"pid": project_id}
+    if _restricted(current_user):
+        where += f" AND ({_PROJECT_ACCESS_CLAUSE})"
+        params["access_uid"] = current_user["id"]
     row = (await db.execute(
-        text(f'{_SELECT_PROJECT} WHERE p.id = :pid'),
-        {"pid": project_id},
+        text(f'{_SELECT_PROJECT} {where}'),
+        params,
     )).fetchone()
     if not row:
+        # 404 (không 403) để không lộ sự tồn tại của project ngoài quyền.
         raise HTTPException(status_code=404, detail="Dự án không tồn tại")
     return _row_to_dict(row)
 
@@ -280,18 +326,17 @@ async def update_project(
         sets.append('status = CAST(:status AS "ProjectStatus")')
         params["status"] = body["status"]
 
-    row = (await db.execute(
-        text(f"""
-            UPDATE projects SET {', '.join(sets)} WHERE id = :pid
-            RETURNING id, name, code, status, priority, start_date, end_date,
-                      description, total_hours,
-                      task_count, member_count, worklog_count, scope_count, milestone_count,
-                      owner_id, customer_name, account_manager_id, currency_id,
-                      created_at, updated_at
-        """),
+    await db.execute(
+        text(f"UPDATE projects SET {', '.join(sets)} WHERE id = :pid"),
         params,
-    )).fetchone()
+    )
     await db.commit()
+    # Re-read through _SELECT_PROJECT so the response includes owner / account
+    # manager names (RETURNING can't JOIN users).
+    row = (await db.execute(
+        text(f'{_SELECT_PROJECT} WHERE p.id = :pid'),
+        {"pid": project_id},
+    )).fetchone()
     return _row_to_dict(row)
 
 
@@ -329,19 +374,18 @@ async def transition_project(
     if new_status not in allowed:
         raise HTTPException(status_code=400, detail=f"Không thể chuyển từ {row[0]} sang {new_status}")
 
-    updated = (await db.execute(
+    await db.execute(
         text("""
             UPDATE projects SET status = CAST(:status AS "ProjectStatus"), updated_at = NOW()
             WHERE id = :pid
-            RETURNING id, name, code, status, priority, start_date, end_date,
-                      description, total_hours,
-                      task_count, member_count, worklog_count, scope_count, milestone_count,
-                      owner_id, customer_name, account_manager_id, currency_id,
-                      created_at, updated_at
         """),
         {"pid": project_id, "status": new_status},
-    )).fetchone()
+    )
     await db.commit()
+    updated = (await db.execute(
+        text(f'{_SELECT_PROJECT} WHERE p.id = :pid'),
+        {"pid": project_id},
+    )).fetchone()
     return _row_to_dict(updated)
 
 
@@ -451,7 +495,7 @@ async def import_tasks_preview(
     request: Request,
     file: UploadFile | None = File(default=None),
     sheet: Optional[str] = Query(default=None),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_role("MANAGER", "ADMIN")),
     db: AsyncSession = Depends(get_db),
 ):
     row = (await db.execute(
@@ -477,7 +521,7 @@ async def import_tasks_preview(
 async def import_tasks_confirm(
     project_id: int,
     body: ImportConfirmBody,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_role("MANAGER", "ADMIN")),
     db: AsyncSession = Depends(get_db),
 ):
     row = (await db.execute(
@@ -501,7 +545,7 @@ async def ai_import_preview(
     project_id: int,
     request: Request,
     file: UploadFile | None = File(default=None),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_role("MANAGER", "ADMIN")),
     db: AsyncSession = Depends(get_db),
 ):
     row = (await db.execute(
@@ -529,7 +573,7 @@ async def ai_import_preview(
 async def ai_import_confirm(
     project_id: int,
     body: AiImportConfirmBody,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_role("MANAGER", "ADMIN")),
     db: AsyncSession = Depends(get_db),
 ):
     row = (await db.execute(

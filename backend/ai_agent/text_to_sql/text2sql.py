@@ -20,26 +20,42 @@ logger = logging.getLogger(__name__)
 SQL_CACHE_TTL = int(os.getenv("SQL_CACHE_TTL", 3600))
 
 
-# Câu hỏi có thời gian tương đối → không cache vì kết quả thay đổi theo ngày
-_SKIP_CACHE_PATTERNS = (
+# Câu hỏi có thời gian tương đối ("hôm nay", "tuần này"...). Với loại câu này ta
+# VẪN cache được CHUỖI SQL, miễn là SQL dùng hàm ngày động (CURRENT_DATE/now()/
+# date_trunc) thay vì đóng băng một ngày cố định. CURRENT_DATE được Postgres tính
+# lúc THỰC THI nên chuỗi SQL tái dùng ngày mai vẫn cho kết quả của ngày mai.
+# => chỉ chặn cache khi SQL chứa literal ngày hard-code (xem _sql_is_date_safe).
+_RELATIVE_TIME_PATTERNS = (
     "hôm nay", "hôm qua", "tuần này", "tuần trước",
     "tháng này", "tháng trước", "năm nay",
     "mới nhất", "gần đây", "vừa", "hiện tại",
 )
 
+# Literal ngày bị đóng băng trong SQL: 'YYYY-MM-DD' (có/không có giờ). Nếu xuất hiện
+# trong câu thời-gian-tương-đối thì KHÔNG được cache (mai sẽ trả kết quả cũ).
+_HARDCODED_DATE = re.compile(r"'\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2})?")
+
 _db_pool: asyncpg.Pool | None = None
+
+# Timeout cứng cho mọi câu truy vấn của agent (chặn pg_sleep / query nặng làm cạn pool).
+_STATEMENT_TIMEOUT_MS = os.getenv("AGENT_STATEMENT_TIMEOUT_MS", "5000")
+
 
 async def _get_pool() -> asyncpg.Pool:
     global _db_pool
     if _db_pool is None:
+        # Ưu tiên credential read-only riêng cho agent (DB_AGENT_USER); nếu không
+        # cấu hình thì fallback về DB_USER. Xem init/agent_role.sql để tạo role.
         _db_pool = await asyncpg.create_pool(
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
+            user=os.getenv("DB_AGENT_USER") or os.getenv("DB_USER"),
+            password=os.getenv("DB_AGENT_PASSWORD") or os.getenv("DB_PASSWORD"),
             database=os.getenv("DB_NAME"),
             host=os.getenv("DB_HOST", "localhost"),
             port=int(os.getenv("DB_PORT", 5432)),
             min_size=2,
             max_size=10,
+            # statement_timeout áp cho mọi connection trong pool → DoS-resistant.
+            server_settings={"statement_timeout": _STATEMENT_TIMEOUT_MS},
         )
     return _db_pool
 
@@ -62,6 +78,27 @@ _MUTATION_SQL = re.compile(
 _NAMED_SQL_PLACEHOLDER = re.compile(r"(?<!:):[A-Za-z_][A-Za-z0-9_]*")
 _USER_ID_PLACEHOLDER = re.compile(r"(?<!:):user_id\b")
 
+# Chặn truy cập dữ liệu nhạy cảm / hàm nguy hiểm ngay ở tầng ứng dụng.
+# Đây là lớp phòng thủ phụ; lớp chính là DB role read-only (init/agent_role.sql).
+# - password_hash: tránh exfiltration hash mật khẩu (kể cả qua prompt injection).
+# - pg_catalog/information_schema: tránh liệt kê schema/đoán cột.
+# - pg_read_file/pg_sleep/lo_*/dblink/copy: đọc file hệ thống, DoS, ra ngoài DB.
+_FORBIDDEN_SQL = re.compile(
+    r"\b(password_hash|pg_read_file|pg_read_binary_file|pg_ls_dir|pg_sleep|"
+    r"pg_catalog|information_schema|dblink|lo_import|lo_export|copy)\b",
+    re.IGNORECASE,
+)
+
+# Comment SQL có thể che mutation keyword hoặc dấu ; → phải bóc trước khi kiểm tra.
+_SQL_LINE_COMMENT = re.compile(r"--[^\n]*")
+_SQL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+
+def _strip_sql_comments(sql: str) -> str:
+    sql = _SQL_BLOCK_COMMENT.sub(" ", sql)
+    sql = _SQL_LINE_COMMENT.sub("", sql)
+    return sql
+
 SYSTEM_PROMPT = f"""Bạn là một trợ lý AI chuyên nghiệp giúp chuyển đổi các câu hỏi liên quan đến dự án, 
 task thành các câu truy vấn SQL để truy xuất dữ liệu từ cơ sở dữ liệu quản lý dự án. Bạn sẽ nhận được một câu hỏi 
 từ người dùng và cần tạo ra một câu truy vấn SQL chính xác, an toàn và hiệu quả để trả lời câu hỏi đó dựa trên schema của cơ sở dữ liệu đã được cung cấp.
@@ -76,6 +113,14 @@ Lưu ý quan trọng:
 - Cố gắng tối ưu câu truy vấn để trả về kết quả nhanh nhất có thể, tránh sử dụng các phép toán phức tạp hoặc subquery không cần thiết
 - Viết câu truy vấn bằng tiếng Việt nếu có thể, nhưng vẫn phải tuân thủ cú pháp SQL chuẩn
 - Nếu câu hỏi không thể trả lời bằng SQL, hãy trả về một câu truy vấn đơn giản trả về một thông báo phù hợp, ví dụ: SELECT 'Câu hỏi không thể trả lời bằng SQL' AS message;
+
+Cú pháp ngày tháng (BẮT BUỘC dùng PostgreSQL, KHÔNG dùng cú pháp MySQL):
+- Đây là PostgreSQL. TUYỆT ĐỐI KHÔNG viết `INTERVAL (biểu_thức) DAY` hay `INTERVAL n DAY` (đó là MySQL và sẽ gây lỗi cú pháp).
+- Khoảng thời gian cố định: dùng literal `INTERVAL '7 days'`, `INTERVAL '1 month'`.
+- Khoảng thời gian theo biểu thức/cột: dùng `make_interval(days => <int>)` hoặc `(<int> * INTERVAL '1 day')`.
+- "Tuần này" (tuần bắt đầu từ Thứ Hai): dùng `date_trunc('week', CURRENT_DATE)` làm đầu tuần và `date_trunc('week', CURRENT_DATE) + INTERVAL '6 days'` làm cuối tuần.
+- "Tháng này": `date_trunc('month', CURRENT_DATE)` đến `date_trunc('month', CURRENT_DATE) + INTERVAL '1 month' - INTERVAL '1 day'`.
+- Lấy số thứ tự ngày trong tuần: `EXTRACT(DOW FROM CURRENT_DATE)` (Chủ Nhật = 0). Ưu tiên `date_trunc` thay vì tự tính bằng EXTRACT.
 """
 
 class Text2SQLAgent:
@@ -84,12 +129,17 @@ class Text2SQLAgent:
         """
         self.db = db
         self.top_k = top_k
+        # Sinh SQL là tác vụ xác định, KHÔNG cần "thinking" của Gemini Flash đời mới
+        # (thinking ngầm sinh hàng nghìn token suy luận ẩn → chậm 5-15s vô ích).
+        # reasoning_effort="none" tắt thinking qua lớp OpenAI-compat của Google.
+        # timeout siết về 20s + max_retries=2 để fail nhanh khi endpoint trả 503.
         self.llm = ChatOpenAI(
-               model=os.getenv("MODEL_NAME"),
-               timeout=45,
-               max_tokens=512,
+            model=os.getenv("MODEL_NAME"),
+            timeout=20,
+            max_retries=2,
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
+            reasoning_effort="none"
         ) if llm is None else llm
 
     def _schema_context(self) -> str:
@@ -126,12 +176,32 @@ class Text2SQLAgent:
         raw = f"{normalized}:{user_id or 'anon'}"
         return f"sql_cache:{hashlib.md5(raw.encode()).hexdigest()}"
 
-    def _should_cache(self, question: str) -> bool:
+    def _is_relative_time_question(self, question: str) -> bool:
         lowered = question.lower()
-        return not any(p in lowered for p in _SKIP_CACHE_PATTERNS)
+        return any(p in lowered for p in _RELATIVE_TIME_PATTERNS)
+
+    def _sql_is_date_safe(self, sql: str) -> bool:
+        """SQL có an toàn để cache lâu dài không (không đóng băng một ngày cụ thể)?
+
+        An toàn = KHÔNG chứa literal ngày hard-code. SQL dùng CURRENT_DATE/now()/
+        date_trunc tự cập nhật theo ngày chạy nên cache lại vẫn đúng; chỉ SQL ghi
+        cứng 'YYYY-MM-DD' mới trả kết quả cũ vào hôm sau.
+        """
+        return _HARDCODED_DATE.search(sql) is None
+
+    def _should_cache_write(self, question: str, sql: str) -> bool:
+        """Có nên GHI chuỗi SQL này vào cache không (quyết định sau khi đã có SQL).
+
+        - Câu thường: luôn cache.
+        - Câu thời-gian-tương-đối: chỉ cache nếu SQL không hard-code ngày.
+        """
+        if not self._is_relative_time_question(question):
+            return True
+        return self._sql_is_date_safe(sql)
 
     def is_safe_sql(self, sql: str) -> bool:
-        normalized = self._clean_sql(sql).strip()
+        # Bóc comment TRƯỚC mọi kiểm tra: comment có thể che ; hoặc mutation keyword.
+        normalized = _strip_sql_comments(self._clean_sql(sql)).strip()
         if not normalized.lower().startswith(("select", "with")):
             return False
         if not normalized.endswith(";"):
@@ -146,25 +216,29 @@ class Text2SQLAgent:
         )
         if _MUTATION_SQL.search(sql_for_check):
             return False
+        # Chặn đọc dữ liệu nhạy cảm / hàm nguy hiểm dù chỉ là SELECT.
+        if _FORBIDDEN_SQL.search(sql_for_check):
+            return False
 
         return True
 
-    async def generate_sql(self, question: str, memory_context: str = "", current_user_id: int | str | None = None) -> str:
+    async def generate_sql(self, question: str, memory_context: str = "", current_user_id: int | str | None = None, user_role: str | None = None) -> str:
         user_id = self._coerce_user_id(current_user_id)
-        cacheable = self._should_cache(question)
+        restricted = (user_role or "").upper() not in ("ADMIN", "MANAGER")
 
-        # Thử đọc cache trước khi gọi LLM
-        if cacheable:
-            try:
-                from core.redis import get_redis
-                redis = await get_redis()
-                cache_key = self._cache_key(question, user_id)
-                cached_sql = await redis.get(cache_key)
-                if cached_sql:
-                    logger.info("SQL cache hit key=%s", cache_key)
-                    return cached_sql
-            except Exception:
-                logger.warning("Redis unavailable, skipping SQL cache read", exc_info=True)
+        # Luôn thử đọc cache — kể cả câu thời-gian-tương-đối ("hôm nay"), vì cache chỉ
+        # lưu chuỗi SQL chứa CURRENT_DATE (tính lúc chạy), không lưu dữ liệu. Cache key
+        # gồm cả "restricted" để user bị giới hạn không nhận lại SQL toàn cục đã cache.
+        try:
+            from core.redis import get_redis
+            redis = await get_redis()
+            cache_key = self._cache_key(question, user_id) + (":r" if restricted else ":f")
+            cached_sql = await redis.get(cache_key)
+            if cached_sql:
+                logger.info("SQL cache hit key=%s", cache_key)
+                return cached_sql
+        except Exception:
+            logger.warning("Redis unavailable, skipping SQL cache read", exc_info=True)
 
         start = time.perf_counter()
         tenant_rule = "- Hệ thống hiện single-company; không thêm điều kiện company_id và không dùng bảng companies."
@@ -174,24 +248,44 @@ class Text2SQLAgent:
             "Nếu người dùng hỏi 'của tôi', 'của mình', hãy lọc bằng id này; không dùng placeholder.\n"
             if user_id is not None else ""
         )
-        response = await self.llm.ainvoke(SYSTEM_PROMPT + tenant_rule + user_context_block + memory_block + f"\n\nCâu hỏi: {question}\n\nHãy tạo câu truy vấn SQL phù hợp để trả lời câu hỏi này, tuân thủ các yêu cầu đã nêu trong prompt.")
+        # Với MEMBER/VIEWER: bắt buộc mọi truy vấn phải scope theo chính user này.
+        # Không có user_id thì không thể scope an toàn → từ chối.
+        restriction_block = ""
+        if restricted:
+            if user_id is None:
+                raise ValueError("Restricted user without id cannot run data queries")
+            restriction_block = (
+                f"\n        QUYỀN TRUY CẬP (BẮT BUỘC): Người dùng chỉ được xem dữ liệu LIÊN QUAN ĐẾN CHÍNH HỌ "
+                f"(users.id = {user_id}). MỌI truy vấn PHẢI lọc theo {user_id}: "
+                f"task phải có assignee_id = {user_id}; worklog/backlog phải có user_id = {user_id}; "
+                f"project phải là project họ tham gia (owner_id = {user_id}, account_manager_id = {user_id}, "
+                f"hoặc có bản ghi trong members/tasks/worklogs/backlogs gắn {user_id}). "
+                f"TUYỆT ĐỐI KHÔNG trả về dữ liệu của người khác hay toàn công ty, kể cả khi được yêu cầu.\n"
+            )
+        response = await self.llm.ainvoke(SYSTEM_PROMPT + tenant_rule + user_context_block + restriction_block + memory_block + f"\n\nCâu hỏi: {question}\n\nHãy tạo câu truy vấn SQL phù hợp để trả lời câu hỏi này, tuân thủ các yêu cầu đã nêu trong prompt.")
         elapsed = time.perf_counter() - start
 
         sql = self._bind_allowed_context_values(self._clean_sql(response.content), current_user_id)
         if not self.is_safe_sql(sql):
             raise ValueError(f"Unsafe SQL generated: {sql}")
+        # Backstop: với user bị giới hạn, SQL phải có chứa id của họ — nếu không, từ chối.
+        if restricted and str(user_id) not in sql:
+            raise ValueError("Restricted query not scoped to current user")
         logger.info("SQL generated in %.3fs: %s", elapsed, sql)
 
-        # Lưu vào cache sau khi validate thành công
-        if cacheable:
+        # Ghi cache sau khi validate. Câu thời-gian-tương-đối chỉ ghi nếu SQL không
+        # hard-code ngày (xem _should_cache_write) — tránh trả kết quả cũ vào hôm sau.
+        if self._should_cache_write(question, sql):
             try:
                 from core.redis import get_redis
                 redis = await get_redis()
-                cache_key = self._cache_key(question, user_id)
+                cache_key = self._cache_key(question, user_id) + (":r" if restricted else ":f")
                 await redis.setex(cache_key, SQL_CACHE_TTL, sql)
                 logger.info("SQL cache set key=%s ttl=%ds", cache_key, SQL_CACHE_TTL)
             except Exception:
                 logger.warning("Redis unavailable, skipping SQL cache write", exc_info=True)
+        else:
+            logger.info("SQL cache skip (relative-time question with hard-coded date)")
 
         return sql
     
@@ -259,15 +353,19 @@ Yêu cầu:
         except Exception:
             logger.warning("Redis unavailable, skipping answer cache write", exc_info=True)
 
-    async def execute(self, question: str, memory_context: str = "", current_user_id: int | str | None = None,):
+    async def execute(self, question: str, memory_context: str = "", current_user_id: int | str | None = None, user_role: str | None = None,):
       """Thực thi câu truy vấn SQL được tạo ra từ câu hỏi của người dùng và trả về kết quả.
       Args:
           question (str): Câu hỏi của người dùng về dự án, task.
+          user_role (str): Vai trò của người dùng; MEMBER/VIEWER chỉ được hỏi dữ liệu của chính mình.
       Returns:
           dict: Kết quả trả về từ việc thực thi câu truy vấn SQL, bao gồm câu hỏi gốc, câu truy vấn SQL và kết quả truy vấn.
       """
       try:
-        sql = await self.generate_sql(question, memory_context=memory_context, current_user_id=current_user_id)
+        sql = await self.generate_sql(
+            question, memory_context=memory_context,
+            current_user_id=current_user_id, user_role=user_role,
+        )
       except ValueError as e:
         print(f"Error generating SQL: {e}")
         return {

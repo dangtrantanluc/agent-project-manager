@@ -1,27 +1,170 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchOverview } from "@/features/dashboard/api";
+import { fetchOverview, type OverviewFilters } from "@/features/dashboard/api";
+import { listProjects } from "@/features/projects/api";
+import { listUsers } from "@/features/users/api";
 import { useAuth } from "@/features/auth/store";
 import { formatDate } from "@/lib/format";
 import { Link } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Building2,
   CalendarDays,
   ClipboardList,
   ListChecks,
+  SlidersHorizontal,
+  X,
 } from "lucide-react";
+
+const PROJECT_STATUSES = [
+  { value: "IN_PROGRESS", label: "Đang thực hiện" },
+  { value: "PLANNED", label: "Lên kế hoạch" },
+  { value: "DONE", label: "Đã hoàn thành" },
+  { value: "PENDING", label: "Tạm dừng" },
+  { value: "CANCELLED", label: "Đã hủy" },
+];
+
+const TIME_RANGES = [
+  { value: 0, label: "Tất cả thời gian" },
+  { value: 7, label: "7 ngày tới" },
+  { value: 30, label: "30 ngày tới" },
+  { value: 90, label: "90 ngày tới" },
+];
 
 export function DashboardPage() {
   const user = useAuth((s) => s.user);
-  const overviewQ = useQuery({ queryKey: ["dashboard-overview"], queryFn: fetchOverview });
+
+  const [projectId, setProjectId] = useState<number | undefined>();
+  const [projectStatus, setProjectStatus] = useState<string | undefined>();
+  const [assigneeId, setAssigneeId] = useState<number | undefined>();
+  const [days, setDays] = useState<number>(0);
+
+  const [filterOpen, setFilterOpen] = useState(false);
+  const filterRef = useRef<HTMLDivElement>(null);
+
+  const filters: OverviewFilters = useMemo(
+    () => ({ projectId, projectStatus, assigneeId, days: days || undefined }),
+    [projectId, projectStatus, assigneeId, days],
+  );
+  const activeCount =
+    (projectId ? 1 : 0) + (projectStatus ? 1 : 0) + (assigneeId ? 1 : 0) + (days ? 1 : 0);
+  const hasFilters = activeCount > 0;
+
+  const clearFilters = () => {
+    setProjectId(undefined);
+    setProjectStatus(undefined);
+    setAssigneeId(undefined);
+    setDays(0);
+  };
+
+  useEffect(() => {
+    if (!filterOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (filterRef.current && !filterRef.current.contains(e.target as Node)) setFilterOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [filterOpen]);
+
+  const projectsQ = useQuery({ queryKey: ["projects-lite"], queryFn: () => listProjects({ pageSize: 500 }) });
+  const usersQ = useQuery({ queryKey: ["users-lite"], queryFn: listUsers });
+
+  const overviewQ = useQuery({
+    queryKey: ["dashboard-overview", filters],
+    queryFn: () => fetchOverview(filters),
+  });
   const overview = overviewQ.data;
   const projectOverview = overview?.projectOverview;
   const progressSummary = overview?.progressSummary;
 
   return (
     <div className="space-y-6 p-6">
-      <div>
-        <h1 className="text-2xl font-bold">Dashboard</h1>
-        <p className="text-sm text-slate-500">Xin chào {user?.fullName}</p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold">Dashboard</h1>
+          <p className="text-sm text-slate-500">Xin chào {user?.fullName}</p>
+        </div>
+
+        <div className="relative" ref={filterRef}>
+          <button
+            type="button"
+            className="btn-ghost relative flex items-center gap-1.5 border border-slate-200 dark:border-slate-700"
+            onClick={() => setFilterOpen((o) => !o)}
+          >
+            <SlidersHorizontal className="h-4 w-4" />
+            <span className="hidden sm:inline">Bộ lọc</span>
+            {activeCount > 0 && (
+              <span className="grid h-5 min-w-[1.25rem] place-items-center rounded-full bg-brand-600 px-1 text-xs font-semibold text-white">
+                {activeCount}
+              </span>
+            )}
+          </button>
+
+          {filterOpen && (
+            <div className="absolute right-0 z-50 mt-2 w-72 rounded-xl border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="text-sm font-semibold">Bộ lọc</h3>
+                {hasFilters && (
+                  <button
+                    type="button"
+                    className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"
+                    onClick={clearFilters}
+                  >
+                    <X className="h-3.5 w-3.5" /> Xóa lọc
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-3">
+                <FilterField label="Dự án">
+                  <select
+                    className="input"
+                    value={projectId ?? ""}
+                    onChange={(e) => setProjectId(e.target.value ? Number(e.target.value) : undefined)}
+                  >
+                    <option value="">Tất cả dự án</option>
+                    {projectsQ.data?.data.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </FilterField>
+
+                <FilterField label="Trạng thái dự án">
+                  <select
+                    className="input"
+                    value={projectStatus ?? ""}
+                    onChange={(e) => setProjectStatus(e.target.value || undefined)}
+                  >
+                    <option value="">Tất cả trạng thái</option>
+                    {PROJECT_STATUSES.map((s) => (
+                      <option key={s.value} value={s.value}>{s.label}</option>
+                    ))}
+                  </select>
+                </FilterField>
+
+                <FilterField label="Người phụ trách">
+                  <select
+                    className="input"
+                    value={assigneeId ?? ""}
+                    onChange={(e) => setAssigneeId(e.target.value ? Number(e.target.value) : undefined)}
+                  >
+                    <option value="">Tất cả thành viên</option>
+                    {usersQ.data?.map((u) => (
+                      <option key={u.id} value={u.id}>{u.fullName}</option>
+                    ))}
+                  </select>
+                </FilterField>
+
+                <FilterField label="Khoảng thời gian">
+                  <select className="input" value={days} onChange={(e) => setDays(Number(e.target.value))}>
+                    {TIME_RANGES.map((r) => (
+                      <option key={r.value} value={r.value}>{r.label}</option>
+                    ))}
+                  </select>
+                </FilterField>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[1.1fr_1.2fr_1.1fr_1.1fr]">
@@ -143,6 +286,15 @@ export function DashboardPage() {
         </DetailCard>
       </div>
 
+    </div>
+  );
+}
+
+function FilterField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="min-w-[10rem] flex-1">
+      <label className="label">{label}</label>
+      {children}
     </div>
   );
 }

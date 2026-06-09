@@ -25,20 +25,26 @@ def start_checkin_scheduler() -> None:
         return
     deadline_hour = int(os.getenv("DEADLINE_NOTIFY_HOUR", "9"))
     deadline_minute = int(os.getenv("DEADLINE_NOTIFY_MINUTE", "0"))
+    deadline_pm_hour = int(os.getenv("DEADLINE_NOTIFY_AFTERNOON_HOUR", "14"))
+    deadline_pm_minute = int(os.getenv("DEADLINE_NOTIFY_AFTERNOON_MINUTE", "0"))
     _scheduler.add_job(
-        run_checkin_slot, CronTrigger(hour=11, minute=50, timezone=_VN_TZ),
+        run_checkin_slot,
+        CronTrigger(day_of_week="mon-fri", hour=11, minute=50, timezone=_VN_TZ),
         id="checkin_lunch", replace_existing=True, args=[CheckinSlot.LUNCH],
     )
     _scheduler.add_job(
-        run_reminder_slot, CronTrigger(hour=12, minute=30, timezone=_VN_TZ),
+        run_reminder_slot,
+        CronTrigger(day_of_week="mon-fri", hour=12, minute=30, timezone=_VN_TZ),
         id="reminder_lunch", replace_existing=True, args=[CheckinSlot.LUNCH],
     )
     _scheduler.add_job(
-        run_checkin_slot, CronTrigger(hour=17, minute=50, timezone=_VN_TZ),
+        run_checkin_slot,
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=50, timezone=_VN_TZ),
         id="checkin_end_day", replace_existing=True, args=[CheckinSlot.END_DAY],
     )
     _scheduler.add_job(
-        run_reminder_slot, CronTrigger(hour=18, minute=30, timezone=_VN_TZ),
+        run_reminder_slot,
+        CronTrigger(day_of_week="mon-fri", hour=18, minute=30, timezone=_VN_TZ),
         id="reminder_end_day", replace_existing=True, args=[CheckinSlot.END_DAY],
     )
     _scheduler.add_job(
@@ -49,6 +55,13 @@ def start_checkin_scheduler() -> None:
         run_deadline_notifications,
         CronTrigger(hour=deadline_hour, minute=deadline_minute, timezone=_VN_TZ),
         id="deadline_notifications", replace_existing=True,
+        kwargs={"slot": "morning"},
+    )
+    _scheduler.add_job(
+        run_deadline_notifications,
+        CronTrigger(hour=deadline_pm_hour, minute=deadline_pm_minute, timezone=_VN_TZ),
+        id="deadline_notifications_afternoon", replace_existing=True,
+        kwargs={"slot": "afternoon"},
     )
     _scheduler.start()
     logger.info("[Scheduler] Check-in scheduler started")
@@ -128,6 +141,7 @@ async def run_reminder_slot(slot: str) -> None:
     async def _run():
         from database import AsyncSessionLocal
         from ai_agent.checkin import repository as repo
+        from ai_agent.notification.inapp_repository import create_notification
         from gapo.gapo_client import GapoClient
 
         gapo = GapoClient()
@@ -140,10 +154,18 @@ async def run_reminder_slot(slot: str) -> None:
             for s in sessions:
                 try:
                     msg = (
-                        f"Nhac nho: Ban chua hoan thanh check-in {label}!\n"
-                        f"Go /checkin hoac tiep tuc chon du an."
+                        f"Nhắc nhở: Bạn chưa hoàn thành check-in {label}!\n"
+                        f"Gõ /checkin hoặc tiếp tục chọn dự án."
                     )
                     await gapo.send_message(s["thread_id"], msg)
+                    await create_notification(
+                        db,
+                        user_id=s["user_id"],
+                        type="checkin_reminder",
+                        title=f"Nhắc nhở check-in {label}",
+                        body="Bạn chưa hoàn thành check-in. Vào để hoàn tất.",
+                        link="/worklogs",
+                    )
                     await repo.increment_reminder(db, s["id"])
                 except Exception as e:
                     logger.error(f"[Scheduler] Reminder error session={s['id']}: {e}")
@@ -156,6 +178,7 @@ async def run_missing_summary() -> None:
         from collections import defaultdict
         from database import AsyncSessionLocal
         from ai_agent.checkin import repository as repo
+        from ai_agent.notification.inapp_repository import create_notification
         from gapo.gapo_client import GapoClient
 
         today = datetime.now(_VN_TZ).strftime("%Y-%m-%d")
@@ -187,16 +210,24 @@ async def run_missing_summary() -> None:
                     for s in sessions
                 )
                 msg = (
-                    f"Bao cao thieu check-in\n"
+                    f"Báo cáo thiếu check-in\n"
                     f"Slot: {slot_label}\n"
-                    f"Ngay: {today}\n"
-                    f"So luong: {len(sessions)} nguoi\n\n"
-                    f"Danh sach:\n{names}"
+                    f"Ngày: {today}\n"
+                    f"Số lượng: {len(sessions)} người\n\n"
+                    f"Danh sách:\n{names}"
                 )
 
                 for admin in admins:
                     try:
                         await gapo.send_message(admin["thread_id"], msg)
+                        await create_notification(
+                            db,
+                            user_id=admin["user_id"],
+                            type="checkin_missing_summary",
+                            title=f"Báo cáo thiếu check-in — {slot_label}",
+                            body=f"{len(sessions)} người chưa check-in ngày {today}.",
+                            link="/settings/agent-audit",
+                        )
                         notified_admins += 1
                     except Exception as e:
                         logger.error(
@@ -267,11 +298,19 @@ def _group_due_deadline_tasks(rows, target_day: date) -> tuple[dict[tuple[int, s
     return dict(due_by_recipient), skipped
 
 
-async def run_deadline_notifications(today: date | None = None) -> None:
+async def run_deadline_notifications(today: date | None = None, slot: str = "morning") -> None:
+    """Gửi nhắc deadline.
+
+    slot="morning" (9h): nhắc cả task đến hạn hôm nay (due_today) và task sắp
+    đến hạn (~2 ngày, upcoming).
+    slot="afternoon" (14h): chỉ nhắc lại task đến hạn HÔM NAY mà CHƯA hoàn thành.
+    Task đã DONE tự động bị loại ở mệnh đề WHERE nên "hoàn thành rồi thì thôi".
+    """
     async def _run():
         from database import AsyncSessionLocal
         from sqlalchemy import text
         from ai_agent.notification.notification_agent import NotificationAgent
+        from ai_agent.notification.inapp_repository import create_notification
         from gapo.gapo_client import GapoClient
 
         target_day = today or datetime.now(_VN_TZ).date()
@@ -295,12 +334,24 @@ async def run_deadline_notifications(today: date | None = None) -> None:
 
             due_by_recipient, skipped = _group_due_deadline_tasks(rows, target_day)
 
+            # Buổi chiều chỉ nhắc lại task đến hạn hôm nay (due_today) chưa xong.
+            # Bỏ qua task "upcoming" vì chúng đã được nhắc buổi sáng.
+            if slot == "afternoon":
+                filtered: dict = {}
+                for recipient, tasks in due_by_recipient.items():
+                    due_today = [t for t in tasks if t["reminder_type"] == "due_today"]
+                    if due_today:
+                        filtered[recipient] = due_today
+                    else:
+                        skipped += len(tasks)
+                due_by_recipient = filtered
+
             sent_batches = 0
             sent_tasks = 0
             for (assignee_id, thread_id), tasks in due_by_recipient.items():
                 reminder_types = sorted({task["reminder_type"] for task in tasks})
                 reminder_key = "+".join(reminder_types)
-                correlation_id = f"deadline_batch:{assignee_id}:{target_day.isoformat()}:{reminder_key}"
+                correlation_id = f"deadline_batch:{assignee_id}:{target_day.isoformat()}:{slot}:{reminder_key}"
                 already_sent = (await db.execute(text("""
                     SELECT 1
                     FROM agent_audit_log
@@ -325,6 +376,7 @@ async def run_deadline_notifications(today: date | None = None) -> None:
                     "assignee_name": assignee_name,
                     "thread_id": thread_id,
                     "notify_date": target_day.isoformat(),
+                    "slot": slot,
                     "task_ids": task_ids,
                     "tasks": [
                         {
@@ -342,6 +394,18 @@ async def run_deadline_notifications(today: date | None = None) -> None:
 
                 try:
                     result = await gapo.send_message(thread_id, msg)
+                    await create_notification(
+                        db,
+                        user_id=assignee_id,
+                        type="task_deadline",
+                        title=(
+                            f"{len(tasks)} công việc sắp đến hạn"
+                            if len(tasks) > 1 else "Công việc sắp đến hạn"
+                        ),
+                        body=tasks[0]["task_name"] if len(tasks) == 1 else None,
+                        link="/tasks",
+                        commit=False,
+                    )
                     await db.execute(text("""
                         INSERT INTO agent_audit_log
                             (tool, args_json, result_json, source, correlation_id, created_at)
@@ -361,6 +425,30 @@ async def run_deadline_notifications(today: date | None = None) -> None:
                         }),
                         "correlation_id": correlation_id,
                     })
+                    # Tạo follow-up PENDING cho từng task -> agent xác minh khi user báo
+                    # "đã xong". task_id NOT NULL nên bắt buộc 1 row/1 task (không gộp batch).
+                    for task in tasks:
+                        per_task_corr = (
+                            f"deadline:{task['task_id']}:"
+                            f"{target_day.isoformat()}:{slot}:{task['reminder_type']}"
+                        )
+                        await db.execute(text("""
+                            INSERT INTO agent_follow_ups
+                                (task_id, user_id, channel, thread_id, question,
+                                 status, correlation_id, asked_at, updated_at)
+                            VALUES
+                                (:task_id, :user_id, CAST(:channel AS "ChannelKind"),
+                                 :thread_id, :question,
+                                 CAST('PENDING' AS "FollowUpStatus"),
+                                 :correlation_id, NOW(), NOW())
+                        """), {
+                            "task_id": task["task_id"],
+                            "user_id": assignee_id,
+                            "channel": "gapo",
+                            "thread_id": str(thread_id),
+                            "question": msg,
+                            "correlation_id": per_task_corr,
+                        })
                     await db.commit()
                     sent_batches += 1
                     sent_tasks += len(tasks)
@@ -385,8 +473,9 @@ async def run_deadline_notifications(today: date | None = None) -> None:
                     )
 
             logger.info(
-                "[Scheduler] run_deadline_notifications today=%s sent_batches=%d sent_tasks=%d skipped=%d",
+                "[Scheduler] run_deadline_notifications today=%s slot=%s sent_batches=%d sent_tasks=%d skipped=%d",
                 target_day,
+                slot,
                 sent_batches,
                 sent_tasks,
                 skipped,

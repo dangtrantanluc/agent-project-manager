@@ -3,67 +3,114 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_db
+from app.core.deps import get_current_user, get_db, is_restricted, project_access_exists_sql
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/overview")
 async def get_overview(
+    project_id: Optional[int] = Query(default=None, alias="projectId"),
+    project_status: Optional[str] = Query(default=None, alias="projectStatus"),
+    assignee_id: Optional[int] = Query(default=None, alias="assigneeId"),
+    days: Optional[int] = Query(default=None, ge=1, le=3650),
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    cid = current_user.get("companyId") or current_user.get("company_id") or 1
+    company_params: dict = {"cid": cid}
+    # Đếm dự án của công ty: MEMBER/VIEWER chỉ tính dự án mình tham gia.
+    company_proj_filter = ""
+    if is_restricted(current_user):
+        company_proj_filter = f" AND {project_access_exists_sql('p.id')}"
+        company_params["access_uid"] = current_user["id"]
     company = (await db.execute(
-        text("""
+        text(f"""
             SELECT c.name, COUNT(p.id) AS project_count
             FROM companies c
-            LEFT JOIN projects p ON p.company_id = c.id
+            LEFT JOIN projects p ON p.company_id = c.id{company_proj_filter}
             WHERE c.id = :cid
             GROUP BY c.id, c.name
         """),
-        {"cid": current_user.get("companyId") or current_user.get("company_id") or 1},
+        company_params,
     )).fetchone()
 
+    # Bộ lọc dùng chung. Mỗi điều kiện chỉ thêm vào khi param có giá trị,
+    # nên dashboard không filter vẫn chạy y như trước.
+    proj_where = "WHERE TRUE"
+    task_where = "WHERE TRUE"
+    params: dict = {}
+    if project_id:
+        proj_where += " AND id = :pid"
+        task_where += " AND t.project_id = :pid"
+        params["pid"] = project_id
+    if project_status:
+        proj_where += " AND status::text = :pstatus"
+        # Task gắn với project có trạng thái tương ứng.
+        task_where += " AND t.project_id IN (SELECT id FROM projects WHERE status::text = :pstatus)"
+        params["pstatus"] = project_status
+    if assignee_id:
+        task_where += " AND t.assignee_id = :aid"
+        params["aid"] = assignee_id
+
+    # MEMBER/VIEWER chỉ thấy dữ liệu thuộc project mình tham gia. MANAGER/ADMIN thấy tất cả.
+    if is_restricted(current_user):
+        proj_where += f" AND {project_access_exists_sql('projects.id')}"
+        task_where += f" AND {project_access_exists_sql('t.project_id')}"
+        params["access_uid"] = current_user["id"]
+
     project_counts = (await db.execute(
-        text("""
+        text(f"""
             SELECT
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE status::text = 'IN_PROGRESS') AS in_progress,
                 COUNT(*) FILTER (WHERE status::text IN ('DONE', 'COMPLETED')) AS done,
                 COUNT(*) FILTER (WHERE status::text IN ('PENDING', 'ON_HOLD', 'CANCELLED')) AS paused
-            FROM projects
+            FROM projects {proj_where}
         """),
+        params,
     )).fetchone()
 
     task_counts = (await db.execute(
-        text("""
+        text(f"""
             SELECT
                 COUNT(*) AS total,
-                COUNT(*) FILTER (WHERE status::text = 'DONE') AS done,
-                COUNT(*) FILTER (WHERE status::text = 'IN_PROGRESS') AS in_progress,
-                COUNT(*) FILTER (WHERE status::text = 'TODO') AS planned
-            FROM tasks
+                COUNT(*) FILTER (WHERE t.status::text = 'DONE') AS done,
+                COUNT(*) FILTER (WHERE t.status::text = 'IN_PROGRESS') AS in_progress,
+                COUNT(*) FILTER (WHERE t.status::text = 'TODO') AS planned
+            FROM tasks t {task_where}
         """),
+        params,
     )).fetchone()
 
+    # Timeline: tái dùng cùng bộ lọc task; milestone lọc theo project khi có projectId.
+    ms_where = "WHERE m.due_date IS NOT NULL AND m.due_date >= CURRENT_DATE AND COALESCE(m.status, '') <> 'DONE'"
+    if project_id:
+        ms_where += " AND m.project_id = :pid"
+    if project_status:
+        ms_where += " AND m.project_id IN (SELECT id FROM projects WHERE status::text = :pstatus)"
+    if is_restricted(current_user):
+        ms_where += f" AND {project_access_exists_sql('m.project_id')}"
+    tl_params = dict(params)
+    if days:
+        # Giới hạn cửa sổ timeline tới N ngày kể từ hôm nay.
+        tl_params["tl_days"] = days
     upcoming = (await db.execute(
-        text("""
+        text(f"""
             SELECT id, item_type, title, due_date FROM (
                 SELECT m.id, 'milestone' AS item_type, m.name AS title, m.due_date
                 FROM milestones m
-                WHERE m.due_date IS NOT NULL
-                  AND m.due_date >= CURRENT_DATE
-                  AND COALESCE(m.status, '') <> 'DONE'
+                {ms_where}
                 UNION ALL
                 SELECT t.id, 'task' AS item_type, t.name AS title, t.deadline AS due_date
                 FROM tasks t
-                WHERE t.deadline IS NOT NULL
-                  AND t.deadline >= CURRENT_DATE
-                  AND t.status::text <> 'DONE'
+                {task_where.replace("WHERE TRUE", "WHERE t.deadline IS NOT NULL AND t.deadline >= CURRENT_DATE AND t.status::text <> 'DONE'")}
             ) timeline
+            {"WHERE due_date <= CURRENT_DATE + (:tl_days || ' day')::interval" if days else ""}
             ORDER BY due_date ASC
             LIMIT 6
         """),
+        tl_params,
     )).fetchall()
 
     total_tasks = int(task_counts[0] or 0)
@@ -103,42 +150,54 @@ async def get_kpis(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # MEMBER/VIEWER chỉ tính KPI trên project mình tham gia; MANAGER/ADMIN tính toàn bộ.
+    restricted = is_restricted(current_user)
+    kparams: dict = {}
+    proj_acc = task_acc = wl_acc = bl_acc = ""
+    if restricted:
+        kparams["access_uid"] = current_user["id"]
+        proj_acc = f" AND {project_access_exists_sql('projects.id')}"
+        task_acc = f" AND {project_access_exists_sql('t.project_id')}"
+        wl_acc = f" AND {project_access_exists_sql('w.project_id')}"
+        bl_acc = f" AND {project_access_exists_sql('backlogs.project_id')}"
+
     active_projects = (await db.execute(
-        text("SELECT COUNT(*) FROM projects WHERE status::text = 'IN_PROGRESS'"),
+        text(f"SELECT COUNT(*) FROM projects WHERE status::text = 'IN_PROGRESS'{proj_acc}"), kparams,
     )).scalar()
     planned_projects = (await db.execute(
-        text("SELECT COUNT(*) FROM projects WHERE status::text = 'PLANNED'"),
+        text(f"SELECT COUNT(*) FROM projects WHERE status::text = 'PLANNED'{proj_acc}"), kparams,
     )).scalar()
     pending_projects = (await db.execute(
-        text("SELECT COUNT(*) FROM projects WHERE status::text IN ('PENDING', 'ON_HOLD')"),
+        text(f"SELECT COUNT(*) FROM projects WHERE status::text IN ('PENDING', 'ON_HOLD'){proj_acc}"), kparams,
     )).scalar()
     completed_projects = (await db.execute(
-        text("SELECT COUNT(*) FROM projects WHERE status::text IN ('DONE', 'COMPLETED')"),
+        text(f"SELECT COUNT(*) FROM projects WHERE status::text IN ('DONE', 'COMPLETED'){proj_acc}"), kparams,
     )).scalar()
     cancelled_projects = (await db.execute(
-        text("SELECT COUNT(*) FROM projects WHERE status::text = 'CANCELLED'"),
+        text(f"SELECT COUNT(*) FROM projects WHERE status::text = 'CANCELLED'{proj_acc}"), kparams,
     )).scalar()
 
     task_status_rows = (await db.execute(
-        text("""
+        text(f"""
             SELECT t.status, COUNT(*) FROM tasks t
+            WHERE TRUE{task_acc}
             GROUP BY t.status
-        """),
+        """), kparams,
     )).fetchall()
     tasks_by_status = {r[0]: r[1] for r in task_status_rows}
 
     month_agg = (await db.execute(
-        text("""
+        text(f"""
             SELECT COALESCE(SUM(w.hours), 0)
             FROM worklogs w
-            WHERE w.work_date >= date_trunc('month', CURRENT_DATE)
-        """),
+            WHERE w.work_date >= date_trunc('month', CURRENT_DATE){wl_acc}
+        """), kparams,
     )).fetchone()
     pending_backlogs = (await db.execute(
-        text("""
+        text(f"""
             SELECT COUNT(*) FROM backlogs
-            WHERE status = 'PENDING'::"BacklogStatus"
-        """),
+            WHERE status = 'PENDING'::"BacklogStatus"{bl_acc}
+        """), kparams,
     )).scalar()
 
     return {"data": {
@@ -165,23 +224,33 @@ async def get_charts(
 ):
     days = 7 if range == "7d" else 90 if range == "90d" else 30
 
+    # MEMBER/VIEWER chỉ thấy giờ công / dự án mình tham gia; MANAGER/ADMIN thấy toàn bộ.
+    restricted = is_restricted(current_user)
+    wl_acc = proj_acc = ""
+    cparams: dict = {"days": days}
+    if restricted:
+        cparams["access_uid"] = current_user["id"]
+        wl_acc = f" AND {project_access_exists_sql('w.project_id')}"
+        proj_acc = f" WHERE {project_access_exists_sql('projects.id')}"
+
     hours_by_day = (await db.execute(
-        text("""
+        text(f"""
             SELECT DATE_TRUNC('day', w.work_date) AS day,
                    SUM(w.hours)::float AS hours
             FROM worklogs w
-            WHERE w.work_date >= CURRENT_DATE - :days * INTERVAL '1 day'
+            WHERE w.work_date >= CURRENT_DATE - :days * INTERVAL '1 day'{wl_acc}
             GROUP BY 1 ORDER BY 1
         """),
-        {"days": days},
+        cparams,
     )).fetchall()
 
     hours_by_project = (await db.execute(
-        text("""
+        text(f"""
             SELECT id, name, total_hours
-            FROM projects
+            FROM projects{proj_acc}
             ORDER BY total_hours DESC LIMIT 10
         """),
+        cparams if restricted else {},
     )).fetchall()
 
     return {"data": {

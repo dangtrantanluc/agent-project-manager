@@ -5,6 +5,8 @@ import { worklogUpdateSchema, type WorklogUpdateInput } from "@/shared/schemas/w
 import { createWorklog, updateWorklog, type Worklog, type WorklogCreateInput } from "@/features/worklogs/api";
 import { listTasks } from "@/features/tasks/api";
 import { Modal } from "@/components/ui/Modal";
+import { DateField } from "@/components/ui/DateField";
+import { TaskCombobox } from "@/components/ui/TaskCombobox";
 import { useState, useEffect } from "react";
 import { z } from "zod";
 import { toast } from "sonner";
@@ -87,23 +89,19 @@ export function WorklogFormModal({
         {!worklog && (
           <div>
             <label className="label">Task (tùy chọn)</label>
-            <select
-              className="input"
-              value={taskId ?? ""}
-              onChange={(e) => setTaskId(e.target.value ? Number(e.target.value) : undefined)}
-            >
-              <option value="">— Không gắn task —</option>
-              {tasksQ.data?.data.map((t) => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
+            <TaskCombobox
+              tasks={tasksQ.data?.data ?? []}
+              value={taskId}
+              onChange={setTaskId}
+              loading={tasksQ.isLoading}
+            />
           </div>
         )}
 
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label">Ngày *</label>
-            <input type="date" className="input" {...form.register("workDate")} />
+            <DateField form={form} name="workDate" />
             {form.formState.errors.workDate && (
               <p className="mt-1 text-xs text-red-600">{form.formState.errors.workDate.message}</p>
             )}

@@ -1,9 +1,10 @@
+from datetime import date
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_db
+from app.core.deps import get_current_user, get_db, is_restricted, project_access_exists_sql
 
 router = APIRouter(prefix="/worklogs", tags=["worklogs"])
 
@@ -19,6 +20,13 @@ _SELECT = """
     LEFT JOIN projects p ON p.id = w.project_id
     LEFT JOIN users   u ON u.id = w.user_id
 """
+
+
+def _parse_date(value):
+    """asyncpg binds DATE columns from `date` objects, not strings."""
+    if isinstance(value, date) or value is None:
+        return value
+    return date.fromisoformat(str(value)[:10])
 
 
 def _row(r) -> dict:
@@ -53,6 +61,11 @@ async def list_worklogs(
 ):
     where = "WHERE TRUE"
     params: dict = {}
+
+    # MEMBER/VIEWER chỉ thấy worklog thuộc project mình tham gia (hoặc của chính mình).
+    if is_restricted(current_user):
+        where += f" AND (w.user_id = :access_uid OR {project_access_exists_sql('w.project_id')})"
+        params["access_uid"] = current_user["id"]
 
     if mine:
         where += " AND w.user_id = :uid"
@@ -100,34 +113,41 @@ async def create_worklog(
     if not body.get("projectId"):
         raise HTTPException(status_code=422, detail="projectId là bắt buộc")
 
-    # Verify project exists
+    # Verify project exists; worklog inherits the project's company.
     proj = (await db.execute(
-        text("SELECT id FROM projects WHERE id = :pid"),
+        text("SELECT id, company_id FROM projects WHERE id = :pid"),
         {"pid": body["projectId"]},
     )).fetchone()
     if not proj:
         raise HTTPException(status_code=404, detail="Dự án không tồn tại")
 
+    # Chỉ MANAGER/ADMIN mới được log giờ thay cho người khác; còn lại ép về chính mình.
+    is_privileged = current_user.get("role") in ("MANAGER", "ADMIN") or current_user.get("isSuperAdmin")
+    target_user_id = body.get("userId") or current_user["id"]
+    if target_user_id != current_user["id"] and not is_privileged:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo worklog cho người khác")
+
     row = (await db.execute(
         text("""
             INSERT INTO worklogs (
                 work_date, description, hours, task_id, project_id,
-                user_id, updated_at
+                user_id, company_id, updated_at
             ) VALUES (
                 :work_date, :description, :hours, :task_id, :project_id,
-                :user_id, NOW()
+                :user_id, :company_id, NOW()
             )
             RETURNING id, work_date, hours, description,
                       task_id, project_id, user_id,
                       created_at, updated_at
         """),
         {
-            "work_date": body["workDate"],
+            "work_date": _parse_date(body["workDate"]),
             "description": body.get("description"),
             "hours": body["hours"],
             "task_id": body.get("taskId"),
             "project_id": body["projectId"],
-            "user_id": body.get("userId", current_user["id"]),
+            "user_id": target_user_id,
+            "company_id": proj[1],
         },
     )).fetchone()
     await db.commit()
@@ -168,7 +188,7 @@ async def update_worklog(
     for js, col in field_map.items():
         if js in body:
             sets.append(f"{col} = :{js}")
-            params[js] = body[js]
+            params[js] = _parse_date(body[js]) if js == "workDate" else body[js]
 
     if len(sets) == 1:
         # Nothing to update, return current record

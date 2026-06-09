@@ -13,9 +13,10 @@ from ai_agent.coversation.conversation import ConversationAgent
 from ai_agent.memory.memory import load_memory
 from ai_agent.planning.planning_agent import PlanningAgent, ProjectPlan
 from ai_agent.report_generator.report_agent import ReportAgent
-from ai_agent.router.router import Agent, PMMultiAgentRouter
+from ai_agent.router.router import PMMultiAgentRouter
 from ai_agent.text_to_sql.text2sql import Text2SQLAgent
 from ai_agent.notification.notification_agent import NotificationAgent
+from ai_agent.task_update.task_verify_agent import TaskVerifyAgent
 
 logger = logging.getLogger(__name__)
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
@@ -24,7 +25,6 @@ DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
 class AgentReply:
     answer: str
     agent: str
-    confidence: float = 0.0
     metadata: dict | None = None
 
 class AgentMessageRouter:
@@ -35,6 +35,7 @@ class AgentMessageRouter:
         self.report_agent = ReportAgent()
         self.planning_agent = PlanningAgent()
         self.notification_agent = NotificationAgent()
+        self.task_verify_agent = TaskVerifyAgent()
 
     async def handle_message(
         self,
@@ -73,37 +74,56 @@ class AgentMessageRouter:
                 selected = await self.intent_router.selected_agents(message)
             route_ms = (time.perf_counter() - t_route) * 1000
 
-            agent_name, confidence = self._pick_agent(selected)
-            agent_name = self._fallback_agent_for_message(message, agent_name, confidence)
+            agent_names = self._fallback_agent_for_message(message, selected)
 
             logger.info(
-                "routed agent=%s confidence=%.2f route_ms=%.0f user_id=%s thread_id=%s",
-                agent_name, confidence, route_ms, user_id, thread_id,
+                "routed agents=%s selected=%s route_ms=%.0f user_id=%s thread_id=%s",
+                agent_names, selected, route_ms, user_id, thread_id,
             )
 
             t_exec = time.perf_counter()
-            answer = await self._run_agent(
-                agent_name,
-                message,
-                user_id,
-                channel,
-                thread_id,
-                metadata,
-                memory_context,
-                user_profile,
+            # Chạy song song mọi agent được chọn; mỗi agent độc lập, lỗi 1 agent
+            # không làm hỏng cả reply (return_exceptions=True).
+            results = await asyncio.gather(
+                *[
+                    self._run_agent(
+                        name,
+                        message,
+                        user_id,
+                        channel,
+                        thread_id,
+                        metadata,
+                        memory_context,
+                        user_profile,
+                    )
+                    for name in agent_names
+                ],
+                return_exceptions=True,
             )
             exec_ms = (time.perf_counter() - t_exec) * 1000
             total_ms = (time.perf_counter() - t_total) * 1000
 
+            answer, ran_agents = self._combine_results(agent_names, results)
+
             logger.info(
-                "request_done agent=%s exec_ms=%.0f total_ms=%.0f user_id=%s thread_id=%s",
-                agent_name, exec_ms, total_ms, user_id, thread_id,
+                "request_done agents=%s ran=%s exec_ms=%.0f total_ms=%.0f user_id=%s thread_id=%s",
+                agent_names, ran_agents, exec_ms, total_ms, user_id, thread_id,
             )
+
+            if not ran_agents:
+                # Tất cả agent đều lỗi → trả thông điệp xin lỗi.
+                return AgentReply(
+                    answer="Xin lỗi, mình đang gặp lỗi khi xử lý tin nhắn này. Bạn thử lại giúp mình nhé.",
+                    agent="error",
+                    metadata={"selected_agents": list(selected), **metadata},
+                )
+
             return AgentReply(
                 answer=answer,
-                agent=agent_name,
-                confidence=confidence,
-                metadata={"selected_agents": self._selected_metadata(selected), **metadata},
+                # agent là chuỗi str (vd "text2sql+report") để JSON-serializable
+                # ở gapo_adapter (audit_context, tools_used).
+                agent="+".join(ran_agents),
+                metadata={"selected_agents": list(selected), **metadata},
             )
         except Exception:
             total_ms = (time.perf_counter() - t_total) * 1000
@@ -114,26 +134,41 @@ class AgentMessageRouter:
             return AgentReply(
                 answer="Xin lỗi, mình đang gặp lỗi khi xử lý tin nhắn này. Bạn thử lại giúp mình nhé.",
                 agent="error",
-                confidence=0.0,
                 metadata=metadata,
             )
 
-    def _pick_agent(self, selected: list[Agent] | list[str]) -> tuple[str, float]:
-        if not selected:
-            return "conversation", 0.0
+    def _fallback_agent_for_message(self, message: str, selected: list[str]) -> list[str]:
+        """Chuẩn hoá danh sách agent sẽ chạy.
 
-        first = selected[0]
-        if isinstance(first, str):
-            return first or "conversation", 0.0
+        Chỉ fallback bằng từ khoá khi LLM trả về đúng ``["conversation"]`` (mặc
+        định/không chắc). Mọi trường hợp khác giữ nguyên danh sách LLM trả về.
+        """
+        agents = [a for a in selected if a] or ["conversation"]
+        if agents == ["conversation"]:
+            # LLM không chắc → cứu intent bằng từ khoá tiếng Việt.
+            keyword_agent = self._keyword_agent(message)
+            return [keyword_agent] if keyword_agent else agents
 
-        return first.name or "conversation", float(first.confidence or 0.0)
+        # >1 agent: loại 'conversation' thừa — agent nghiệp vụ đã tự chào & trả lời
+        # đủ ngữ cảnh (qua user_context/memory_context), thêm conversation chỉ lặp ý.
+        business = [a for a in agents if a != "conversation"]
+        if business:
+            logger.info("Loại 'conversation' thừa, giữ agents=%s", business)
+            return business
+        return agents
 
-    def _fallback_agent_for_message(self, message: str, agent_name: str, confidence: float) -> str:
-        if agent_name != "conversation" or confidence > 0:
-            logger.info("No fallback needed for agent=%s with confidence=%s", agent_name, confidence)
-            return agent_name
-
+    def _keyword_agent(self, message: str) -> str:
         lowered = message.lower()
+        task_update_keywords = (
+            "update rồi",
+            "đã update",
+            "xong rồi",
+            "đã xong",
+            "hoàn thành rồi",
+            "done",
+            "làm xong",
+            "cập nhật rồi",
+        )
         planning_keywords = ("lập kế hoạch", "kế hoạch", "phân chia công việc", "milestone")
         report_keywords = ("báo cáo", "thống kê", "report", "tiến độ tổng thể")
         notification_keywords = ("thông báo", "nhắc nhở", "reminder", "notification")
@@ -149,6 +184,10 @@ class AgentMessageRouter:
             "ai là",
         )
 
+        # task_update kiểm tra TRƯỚC data_keywords: câu "làm xong task X" có cả 'task'
+        # (data) lẫn 'làm xong' (task_update) — phải ưu tiên xác minh hoàn thành.
+        if any(keyword in lowered for keyword in task_update_keywords):
+            return "task_update"
         if any(keyword in lowered for keyword in planning_keywords):
             return "planning"
         if any(keyword in lowered for keyword in report_keywords):
@@ -157,7 +196,37 @@ class AgentMessageRouter:
             return "notification"
         if any(keyword in lowered for keyword in data_keywords):
             return "text2sql"
-        return agent_name
+        return "conversation"
+
+    def _combine_results(
+        self, agent_names: list[str], results: list[Any]
+    ) -> tuple[str, list[str]]:
+        """Gộp output các agent đã chạy thành một câu trả lời.
+
+        Bỏ qua agent lỗi (exception) hoặc trả text rỗng. Một agent → trả thẳng.
+        Nhiều agent → nối các đoạn (mỗi đoạn đã là prose hoàn chỉnh) bằng dòng
+        trống, KHÔNG thêm nhãn và KHÔNG gọi LLM lần nữa.
+        Chỉ trả về nội dung thôi, không kèm thông tin nào khác.
+        """
+        sections: list[tuple[str, str]] = []
+        for name, result in zip(agent_names, results):
+            if isinstance(result, Exception):
+                logger.error("agent=%s failed: %s", name, result)
+                continue
+            text_value = (result or "").strip() if isinstance(result, str) else str(result).strip()
+            if text_value:
+                sections.append((name, text_value))
+
+        ran_agents = [name for name, _ in sections]
+
+        if not sections:
+            return "", ran_agents
+        if len(sections) == 1:
+            return sections[0][1], ran_agents
+
+        # ≥2 agent: mỗi đoạn đã là prose hoàn chỉnh (agent tự summarize bằng LLM),
+        # chỉ nối bằng dòng trống — KHÔNG thêm nhãn, KHÔNG gọi LLM lần nữa.
+        return "\n\n".join(body for _, body in sections), ran_agents
 
     async def _run_agent(
         self,
@@ -180,10 +249,12 @@ class AgentMessageRouter:
             return self._format_conversation(result)
 
         if agent_name == "text2sql":
+            user_role = (user_profile or {}).get("role")
             result = await self.text2sql_agent.execute(
                 message,
                 memory_context=memory_context,
                 current_user_id=user_id,
+                user_role=user_role,
             )
             return self._format_text2sql(result)
 
@@ -207,6 +278,16 @@ class AgentMessageRouter:
                 memory_context=memory_context,
             )
             return self._format_notification(result)
+
+        if agent_name == "task_update":
+            result = await self.task_verify_agent.verify(
+                message=message,
+                user_id=user_id,
+                memory_context=memory_context,
+                thread_id=thread_id,
+                user_profile=user_profile or {},
+            )
+            return self._format_task_update(result)
 
         result = await self.conversation_agent.process_message_async(
             message,
@@ -417,6 +498,11 @@ class AgentMessageRouter:
             return str(result.get("message") or result)
         return str(result)
 
+    def _format_task_update(self, result: Any) -> str:
+        if isinstance(result, dict):
+            return str(result.get("message") or result)
+        return str(result)
+
     def _format_agent_result(self, agent_name: str, result: Any) -> str:
         if agent_name == "conversation":
             return self._format_conversation(result)
@@ -445,11 +531,3 @@ class AgentMessageRouter:
             return [self._jsonable(item) for item in value]
         return value
 
-    def _selected_metadata(self, selected: list[Agent] | list[str]) -> list[dict]:
-        items = []
-        for item in selected:
-            if isinstance(item, str):
-                items.append({"name": item, "confidence": 0.0})
-            else:
-                items.append({"name": item.name, "confidence": item.confidence})
-        return items

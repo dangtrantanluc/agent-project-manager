@@ -1,12 +1,10 @@
 import { NavLink, Outlet, Navigate } from "react-router-dom";
-import { Users, Building2, Coins, Activity } from "lucide-react";
+import { Users, Building2 } from "lucide-react";
 import { useAuth } from "@/features/auth/store";
 
 const tabs = [
   { to: "/settings/users", label: "Thành viên", icon: Users },
   { to: "/settings/company", label: "Công ty", icon: Building2 },
-  { to: "/settings/currencies", label: "Tiền tệ", icon: Coins },
-  { to: "/settings/agent-audit", label: "Agent audit", icon: Activity },
 ];
 
 export function SettingsLayout() {

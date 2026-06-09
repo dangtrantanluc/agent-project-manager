@@ -165,24 +165,31 @@ async def save_memory(
         insert_values = f":company_id, {insert_values}"
         params["company_id"] = resolved_company_id
 
+    # INSERT và đếm số lượt trong CÙNG một câu lệnh: subquery COUNT chạy trên
+    # cùng snapshot với dòng vừa chèn, nên turn_count luôn nhất quán với bản ghi
+    # này — loại bỏ cửa sổ race giữa commit rồi mới COUNT (mỗi lượt đếm có thể
+    # trùng/sót khi 2 lượt cùng conversation chạy song song).
     insert_result = await db.execute(
         text(f"""
-            INSERT INTO agent_memory
-                ({insert_columns})
-            VALUES
-                ({insert_values})
-            RETURNING id
+            WITH inserted AS (
+                INSERT INTO agent_memory
+                    ({insert_columns})
+                VALUES
+                    ({insert_values})
+                RETURNING id, conversation_id
+            )
+            SELECT
+                inserted.id,
+                (SELECT COUNT(*) FROM agent_memory am
+                 WHERE am.conversation_id = inserted.conversation_id) AS turn_count
+            FROM inserted
         """),
         params,
     )
-    memory_id = insert_result.scalar_one()
+    inserted_row = insert_result.fetchone()
+    memory_id = inserted_row[0]
+    turn_count = inserted_row[1] or 0
     await db.commit()
-
-    count_result = await db.execute(
-        text("SELECT COUNT(*) FROM agent_memory WHERE conversation_id = :cid"),
-        {"cid": conversation_id},
-    )
-    turn_count = count_result.scalar() or 0
 
     if turn_count % 4 != 0:
         return

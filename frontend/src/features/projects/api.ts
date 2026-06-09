@@ -14,6 +14,7 @@ export type ProjectListItem = {
   memberCount: number;
   owner: { id: number; fullName: string; avatarUrl: string | null };
   customerName: string | null;
+  description?: string | null;
   currency: { id: number; code: string; symbol: string } | null;
 };
 

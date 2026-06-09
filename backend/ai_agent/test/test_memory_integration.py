@@ -14,7 +14,7 @@ from gapo.gapo_adapter import GapoAdapter
 
 
 class _FakeIntentRouter:
-    def selected_agents(self, message):
+    async def selected_agents(self, message):
         return [message_router.Agent(
             name="conversation",
             description="conversation",
@@ -29,16 +29,17 @@ class _FakeConversationAgent:
         self.user_context = None
         self.timezone_name = None
 
-    async def process_message_async(self, message, user_context=None, timezone_name=None):
+    async def process_message_async(self, message, user_context=None, user_profile=None, timezone_name=None):
         self.user_context = user_context
         self.timezone_name = timezone_name
         return {"message": "ok"}
 
 
 def test_agent_router_loads_memory_context_when_db_and_conversation_id_are_present(monkeypatch):
+    # Memory/profile được nạp trong session riêng (chạy song song với routing),
+    # không dùng tham số db của handle_message — nên mock ở tầng *_new_session.
     async def fake_load_memory(conversation_id, db):
         assert conversation_id == "thread-1"
-        assert db == "db"
         return "summary cũ", [{"user": "dự án A sao rồi?", "bot": "Dự án A đang chạy."}]
 
     monkeypatch.setattr(message_router, "load_memory", fake_load_memory)
@@ -46,6 +47,17 @@ def test_agent_router_loads_memory_context_when_db_and_conversation_id_are_prese
     router = object.__new__(AgentMessageRouter)
     router.intent_router = _FakeIntentRouter()
     router.conversation_agent = _FakeConversationAgent()
+
+    # Dùng phiên bản load memory bám theo _load_memory_context (gọi load_memory đã
+    # mock) nhưng với một db giả, tránh mở kết nối thật.
+    async def fake_load_memory_session(conversation_id):
+        return await router._load_memory_context(conversation_id, db="db")
+    router._load_memory_context_new_session = fake_load_memory_session
+
+    # Tránh mở session DB thật khi nạp user profile (test chỉ quan tâm memory).
+    async def fake_profile(user_id):
+        return {}
+    router._load_user_profile_new_session = fake_profile
 
     reply = asyncio.run(router.handle_message(
         message="deadline của dự án đó?",
@@ -59,7 +71,7 @@ def test_agent_router_loads_memory_context_when_db_and_conversation_id_are_prese
     assert reply.answer == "ok"
     assert reply.metadata["memory_loaded"] is True
     assert router.conversation_agent.timezone_name == "Asia/Ho_Chi_Minh"
-    assert "timezone=Asia/Ho_Chi_Minh" in router.conversation_agent.user_context
+    assert "Timezone: Asia/Ho_Chi_Minh" in router.conversation_agent.user_context
     assert "Tóm tắt trước: summary cũ" in router.conversation_agent.user_context
     assert "User: dự án A sao rồi?" in router.conversation_agent.user_context
 

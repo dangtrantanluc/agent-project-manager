@@ -28,13 +28,22 @@ async def update_me(
     if not sets:
         return current_user
 
-    row = (await db.execute(
+    await db.execute(
         text(f"""
             UPDATE users SET {', '.join(sets)}, updated_at = NOW()
             WHERE id = :uid
-            RETURNING id, email, full_name, avatar_url, role, company_name, lang, timezone, is_admin
         """),
         params,
+    )
+    row = (await db.execute(
+        text("""
+            SELECT u.id, u.email, u.full_name, u.avatar_url, u.role,
+                   c.name AS company_name, u.lang, u.timezone, u.is_admin
+            FROM users u
+            LEFT JOIN companies c ON c.id = u.company_id
+            WHERE u.id = :uid
+        """),
+        {"uid": current_user["id"]},
     )).fetchone()
     await db.commit()
     return {
@@ -53,14 +62,16 @@ async def list_users(
     where = "WHERE TRUE"
     params: dict = {}
     if active is not None:
-        where += " AND active = :active"
+        where += " AND u.active = :active"
         params["active"] = active
 
     rows = (await db.execute(
         text(f"""
-            SELECT id, email, full_name, role, avatar_url, company_name
-            FROM users {where}
-            ORDER BY full_name
+            SELECT u.id, u.email, u.full_name, u.role, u.avatar_url, c.name AS company_name
+            FROM users u
+            LEFT JOIN companies c ON c.id = u.company_id
+            {where}
+            ORDER BY u.full_name
         """),
         params,
     )).fetchall()
@@ -84,15 +95,17 @@ async def list_company_users(
     where = "WHERE TRUE"
     params: dict = {}
     if active is not None:
-        where += " AND active = :active"
+        where += " AND u.active = :active"
         params["active"] = active
 
     rows = (await db.execute(
         text(f"""
-            SELECT id, email, full_name, avatar_url, role, company_name,
-                   lang, timezone, is_admin, active, department, position
-            FROM users {where}
-            ORDER BY full_name
+            SELECT u.id, u.email, u.full_name, u.avatar_url, u.role, c.name AS company_name,
+                   u.lang, u.timezone, u.is_admin, u.active, u.department, u.position
+            FROM users u
+            LEFT JOIN companies c ON c.id = u.company_id
+            {where}
+            ORDER BY u.full_name
         """),
         params,
     )).fetchall()

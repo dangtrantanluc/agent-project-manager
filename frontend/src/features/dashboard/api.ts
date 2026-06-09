@@ -30,7 +30,19 @@ export async function fetchCharts(range: "7d" | "30d" | "90d" = "30d") {
   return data.data;
 }
 
-export async function fetchOverview() {
-  const { data } = await apiClient.get<{ data: DashboardOverview }>("/dashboard/overview");
+export type OverviewFilters = {
+  projectId?: number;
+  projectStatus?: string;
+  assigneeId?: number;
+  days?: number;
+};
+
+export async function fetchOverview(filters: OverviewFilters = {}) {
+  const params: Record<string, string | number> = {};
+  if (filters.projectId) params.projectId = filters.projectId;
+  if (filters.projectStatus) params.projectStatus = filters.projectStatus;
+  if (filters.assigneeId) params.assigneeId = filters.assigneeId;
+  if (filters.days) params.days = filters.days;
+  const { data } = await apiClient.get<{ data: DashboardOverview }>("/dashboard/overview", { params });
   return data.data;
 }

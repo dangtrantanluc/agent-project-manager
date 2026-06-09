@@ -14,3 +14,18 @@ apiClient.interceptors.request.use((config) => {
   }
   return config;
 });
+
+// Token hết hạn / không hợp lệ → xoá auth và đưa về trang đăng nhập.
+// Chỉ xử lý khi đang có token (tránh redirect vòng lặp ngay tại trang login).
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401 && useAuth.getState().accessToken) {
+      useAuth.getState().clear();
+      if (window.location.pathname !== "/login") {
+        window.location.assign("/login");
+      }
+    }
+    return Promise.reject(error);
+  },
+);

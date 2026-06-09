@@ -91,7 +91,7 @@ export function AgentAuditPage() {
         <div>
           <h2 className="text-lg font-semibold">Agent audit log</h2>
           <p className="text-sm text-slate-500">
-            Mọi tool call của PM Agent (overdue, follow-up, blocker, meeting…) — debug + giám sát.
+            Mọi tool call của PM Agent (overdue, follow-up, blocker…) — debug + giám sát.
           </p>
         </div>
         <div className="flex items-center gap-2">

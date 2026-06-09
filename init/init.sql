@@ -1,26 +1,3 @@
--- =============================================================================
--- BB-PM — Database Schema (CONSOLIDATED, source of truth cho backend & AI agent)
--- =============================================================================
--- File schema HỢP NHẤT, chạy được từ đầu trên Postgres rỗng. Thay thế cho chuỗi
--- migration cũ (schema.sql + 002..009) vốn không compose được từ scratch.
---
--- Nội dung = trạng thái cuối của: schema.sql + 003-align-live-backend-schema
---            + 005..009 (status enums). Khớp đúng các cột/bảng mà backend FastAPI
---            đang query (users.is_super_admin, currencies, scopes, backlogs,
---            meetings, agent_audit_log, worklogs.slot/source..., checkin slot...).
---
--- Quy ước: KHÔNG chứa data. Toàn bộ seed (currencies, task_status, company, users,
---          demo) nằm ở seed.sql. Init chỉ chạy khi volume Postgres còn rỗng.
--- =============================================================================
-
---
--- PostgreSQL database dump
---
-
-
--- Dumped from database version 16.13 (Debian 16.13-1.pgdg13+1)
--- Dumped by pg_dump version 16.13 (Debian 16.13-1.pgdg13+1)
-
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
@@ -37,6 +14,13 @@ SET row_security = off;
 --
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+
+
+--
+-- Name: EXTENSION pg_trgm; Type: COMMENT; Schema: -; Owner: -
+--
+
+COMMENT ON EXTENSION pg_trgm IS 'text similarity measurement and index searching based on trigrams';
 
 
 --
@@ -127,17 +111,6 @@ CREATE TYPE public."FollowUpStatus" AS ENUM (
     'PENDING',
     'REPLIED',
     'EXPIRED'
-);
-
-
---
--- Name: MeetingItemStatus; Type: TYPE; Schema: public; Owner: -
---
-
-CREATE TYPE public."MeetingItemStatus" AS ENUM (
-    'DRAFT',
-    'APPROVED',
-    'REJECTED'
 );
 
 
@@ -279,6 +252,7 @@ ALTER SEQUENCE public.agent_follow_ups_id_seq OWNED BY public.agent_follow_ups.i
 
 CREATE TABLE public.agent_memory (
     id integer NOT NULL,
+    company_id integer NOT NULL,
     conversation_id text,
     source public."AgentAuditSource" DEFAULT 'chat'::public."AgentAuditSource" NOT NULL,
     user_text text NOT NULL,
@@ -493,9 +467,9 @@ CREATE TABLE public.companies (
     id integer NOT NULL,
     name text NOT NULL,
     code text,
+    currency_id integer,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at timestamp(3) without time zone NOT NULL,
-    currency_id integer
+    updated_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
 
@@ -580,6 +554,35 @@ CREATE SEQUENCE public.gapo_user_maps_id_seq
 
 
 --
+-- Name: gapo_link_codes; Type: TABLE; Schema: public; Owner: -
+--
+-- Short-lived, single-use codes for self-service Gapo account linking. An admin
+-- issues a code for a user; the employee messages the bot "/link <code>" and the
+-- webhook writes the permanent mapping into gapo_user_maps. See init/gapo_link_codes.sql.
+--
+
+CREATE TABLE public.gapo_link_codes (
+    id integer NOT NULL,
+    code text NOT NULL,
+    user_id integer NOT NULL,
+    expires_at timestamp(3) without time zone NOT NULL,
+    used_at timestamp(3) without time zone,
+    used_by_gapo_user_id bigint,
+    created_by integer,
+    created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+
+CREATE SEQUENCE public.gapo_link_codes_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
 -- Name: gapo_user_maps_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
@@ -587,31 +590,33 @@ ALTER SEQUENCE public.gapo_user_maps_id_seq OWNED BY public.gapo_user_maps.id;
 
 
 --
--- Name: meeting_action_items; Type: TABLE; Schema: public; Owner: -
+-- Name: gapo_link_codes_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
-CREATE TABLE public.meeting_action_items (
-    id integer NOT NULL,
-    meeting_id integer NOT NULL,
+ALTER SEQUENCE public.gapo_link_codes_id_seq OWNED BY public.gapo_link_codes.id;
+
+
+--
+-- Name: notifications; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.notifications (
+    id bigint NOT NULL,
+    user_id integer NOT NULL,
+    type text DEFAULT 'general'::text NOT NULL,
     title text NOT NULL,
-    description text,
-    owner_name text,
-    owner_user_id integer,
-    due_date date,
-    priority public."Priority" DEFAULT 'MEDIUM'::public."Priority" NOT NULL,
-    status public."MeetingItemStatus" DEFAULT 'DRAFT'::public."MeetingItemStatus" NOT NULL,
-    created_task_id integer,
-    created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
+    body text,
+    link text,
+    read_at timestamp(3) without time zone,
+    created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
 
 --
--- Name: meeting_action_items_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+-- Name: notifications_id_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
-CREATE SEQUENCE public.meeting_action_items_id_seq
-    AS integer
+CREATE SEQUENCE public.notifications_id_seq
     START WITH 1
     INCREMENT BY 1
     NO MINVALUE
@@ -620,50 +625,10 @@ CREATE SEQUENCE public.meeting_action_items_id_seq
 
 
 --
--- Name: meeting_action_items_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+-- Name: notifications_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
 --
 
-ALTER SEQUENCE public.meeting_action_items_id_seq OWNED BY public.meeting_action_items.id;
-
-
---
--- Name: meetings; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.meetings (
-    id integer NOT NULL,
-    company_id integer NOT NULL,
-    project_id integer,
-    title text,
-    held_at timestamp with time zone DEFAULT now() NOT NULL,
-    transcript text NOT NULL,
-    summary text,
-    decisions jsonb DEFAULT '[]'::jsonb NOT NULL,
-    participants text[] DEFAULT '{}'::text[] NOT NULL,
-    created_by_id integer,
-    created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
-);
-
-
---
--- Name: meetings_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-CREATE SEQUENCE public.meetings_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: meetings_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
---
-
-ALTER SEQUENCE public.meetings_id_seq OWNED BY public.meetings.id;
+ALTER SEQUENCE public.notifications_id_seq OWNED BY public.notifications.id;
 
 
 --
@@ -760,12 +725,13 @@ CREATE TABLE public.projects (
     scope_count integer DEFAULT 0 NOT NULL,
     milestone_count integer DEFAULT 0 NOT NULL,
     customer_name text,
-    company_id integer DEFAULT 1 NOT NULL,
     owner_id integer NOT NULL,
     account_manager_id integer,
     currency_id integer,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at timestamp(3) without time zone NOT NULL
+    updated_at timestamp(3) without time zone NOT NULL,
+    company_id integer NOT NULL,
+    estimated_total_hours double precision
 );
 
 
@@ -912,12 +878,12 @@ CREATE TABLE public.tasks (
     issues text,
     total_hours double precision DEFAULT 0 NOT NULL,
     project_id integer NOT NULL,
-    company_id integer DEFAULT 1 NOT NULL,
     assignee_id integer,
     milestone_id integer,
     currency_id integer,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
-    updated_at timestamp(3) without time zone NOT NULL
+    updated_at timestamp(3) without time zone NOT NULL,
+    company_id integer NOT NULL
 );
 
 
@@ -950,8 +916,6 @@ CREATE TABLE public.users (
     email text NOT NULL,
     password_hash text NOT NULL,
     full_name text NOT NULL,
-    company_id integer DEFAULT 1 NOT NULL,
-    company_name text DEFAULT 'BBSW Software'::text NOT NULL,
     avatar_url text,
     lang text DEFAULT 'vi_VN'::text NOT NULL,
     timezone text DEFAULT 'Asia/Ho_Chi_Minh'::text NOT NULL,
@@ -963,6 +927,7 @@ CREATE TABLE public.users (
     last_login_at timestamp(3) without time zone,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp(3) without time zone NOT NULL,
+    company_id integer NOT NULL,
     is_super_admin boolean DEFAULT false NOT NULL
 );
 
@@ -998,10 +963,10 @@ CREATE TABLE public.worklogs (
     hours numeric(6,2) NOT NULL,
     task_id integer,
     project_id integer NOT NULL,
-    company_id integer DEFAULT 1 NOT NULL,
     user_id integer NOT NULL,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp(3) without time zone NOT NULL,
+    company_id integer NOT NULL,
     source text,
     raw_message text,
     parsed_json jsonb,
@@ -1101,17 +1066,17 @@ ALTER TABLE ONLY public.gapo_user_maps ALTER COLUMN id SET DEFAULT nextval('publ
 
 
 --
--- Name: meeting_action_items id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: gapo_link_codes id; Type: DEFAULT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meeting_action_items ALTER COLUMN id SET DEFAULT nextval('public.meeting_action_items_id_seq'::regclass);
+ALTER TABLE ONLY public.gapo_link_codes ALTER COLUMN id SET DEFAULT nextval('public.gapo_link_codes_id_seq'::regclass);
 
 
 --
--- Name: meetings id; Type: DEFAULT; Schema: public; Owner: -
+-- Name: notifications id; Type: DEFAULT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meetings ALTER COLUMN id SET DEFAULT nextval('public.meetings_id_seq'::regclass);
+ALTER TABLE ONLY public.notifications ALTER COLUMN id SET DEFAULT nextval('public.notifications_id_seq'::regclass);
 
 
 --
@@ -1258,19 +1223,27 @@ ALTER TABLE ONLY public.gapo_user_maps
 
 
 --
--- Name: meeting_action_items meeting_action_items_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: gapo_link_codes gapo_link_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meeting_action_items
-    ADD CONSTRAINT meeting_action_items_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.gapo_link_codes
+    ADD CONSTRAINT gapo_link_codes_pkey PRIMARY KEY (id);
 
 
 --
--- Name: meetings meetings_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: gapo_link_codes gapo_link_codes_code_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meetings
-    ADD CONSTRAINT meetings_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.gapo_link_codes
+    ADD CONSTRAINT gapo_link_codes_code_key UNIQUE (code);
+
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
 
 
 --
@@ -1374,17 +1347,17 @@ CREATE INDEX agent_follow_ups_user_status_idx ON public.agent_follow_ups USING b
 
 
 --
+-- Name: agent_memory_company_id_created_at_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX agent_memory_company_id_created_at_idx ON public.agent_memory USING btree (company_id, created_at);
+
+
+--
 -- Name: agent_memory_conversation_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX agent_memory_conversation_id_idx ON public.agent_memory USING btree (conversation_id);
-
-
---
--- Name: agent_memory_created_at_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX agent_memory_created_at_idx ON public.agent_memory USING btree (created_at);
 
 
 --
@@ -1486,17 +1459,31 @@ CREATE UNIQUE INDEX gapo_user_maps_user_id_key ON public.gapo_user_maps USING bt
 
 
 --
--- Name: meeting_action_items_meeting_id_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: gapo_link_codes_user_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX meeting_action_items_meeting_id_idx ON public.meeting_action_items USING btree (meeting_id);
+CREATE INDEX gapo_link_codes_user_id_idx ON public.gapo_link_codes USING btree (user_id);
 
 
 --
--- Name: meetings_company_created_at_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: gapo_link_codes_active_uq; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX meetings_company_created_at_idx ON public.meetings USING btree (company_id, created_at);
+CREATE UNIQUE INDEX gapo_link_codes_active_uq ON public.gapo_link_codes USING btree (user_id) WHERE (used_at IS NULL);
+
+
+--
+-- Name: notifications_user_unread_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notifications_user_unread_idx ON public.notifications USING btree (user_id, read_at);
+
+
+--
+-- Name: notifications_user_created_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notifications_user_created_idx ON public.notifications USING btree (user_id, created_at DESC);
 
 
 --
@@ -1766,51 +1753,27 @@ ALTER TABLE ONLY public.gapo_user_maps
 
 
 --
--- Name: meeting_action_items meeting_action_items_created_task_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: gapo_link_codes gapo_link_codes_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meeting_action_items
-    ADD CONSTRAINT meeting_action_items_created_task_id_fkey FOREIGN KEY (created_task_id) REFERENCES public.tasks(id) ON UPDATE CASCADE ON DELETE SET NULL;
-
-
---
--- Name: meeting_action_items meeting_action_items_meeting_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.meeting_action_items
-    ADD CONSTRAINT meeting_action_items_meeting_id_fkey FOREIGN KEY (meeting_id) REFERENCES public.meetings(id) ON UPDATE CASCADE ON DELETE CASCADE;
+ALTER TABLE ONLY public.gapo_link_codes
+    ADD CONSTRAINT gapo_link_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE CASCADE;
 
 
 --
--- Name: meeting_action_items meeting_action_items_owner_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: gapo_link_codes gapo_link_codes_created_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meeting_action_items
-    ADD CONSTRAINT meeting_action_items_owner_user_id_fkey FOREIGN KEY (owner_user_id) REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE SET NULL;
-
-
---
--- Name: meetings meetings_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.meetings
-    ADD CONSTRAINT meetings_company_id_fkey FOREIGN KEY (company_id) REFERENCES public.companies(id) ON UPDATE CASCADE ON DELETE RESTRICT;
+ALTER TABLE ONLY public.gapo_link_codes
+    ADD CONSTRAINT gapo_link_codes_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 
 --
--- Name: meetings meetings_created_by_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: notifications notifications_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.meetings
-    ADD CONSTRAINT meetings_created_by_id_fkey FOREIGN KEY (created_by_id) REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE SET NULL;
-
-
---
--- Name: meetings meetings_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.meetings
-    ADD CONSTRAINT meetings_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON UPDATE CASCADE ON DELETE SET NULL;
+ALTER TABLE ONLY public.notifications
+    ADD CONSTRAINT notifications_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE CASCADE;
 
 
 --
@@ -1843,14 +1806,6 @@ ALTER TABLE ONLY public.milestones
 
 ALTER TABLE ONLY public.projects
     ADD CONSTRAINT projects_account_manager_id_fkey FOREIGN KEY (account_manager_id) REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE SET NULL;
-
-
---
--- Name: projects projects_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.projects
-    ADD CONSTRAINT projects_company_id_fkey FOREIGN KEY (company_id) REFERENCES public.companies(id) ON UPDATE CASCADE ON DELETE RESTRICT;
 
 
 --
@@ -1947,14 +1902,6 @@ ALTER TABLE ONLY public.tasks
 
 ALTER TABLE ONLY public.tasks
     ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON UPDATE CASCADE ON DELETE CASCADE;
-
-
---
--- Name: users users_company_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.users
-    ADD CONSTRAINT users_company_id_fkey FOREIGN KEY (company_id) REFERENCES public.companies(id) ON UPDATE CASCADE ON DELETE RESTRICT;
 
 
 --

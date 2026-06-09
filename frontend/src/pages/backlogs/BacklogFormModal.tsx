@@ -5,6 +5,7 @@ import { backlogCreateSchema, type BacklogCreateInput } from "@bb-pm/shared";
 import { createProjectBacklog, updateBacklog, type Backlog } from "@/features/backlogs/api";
 import { listTasks } from "@/features/tasks/api";
 import { Modal } from "@/components/ui/Modal";
+import { DateField } from "@/components/ui/DateField";
 import { useState, useEffect } from "react";
 
 export function BacklogFormModal({
@@ -87,7 +88,7 @@ export function BacklogFormModal({
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="label">Ngày *</label>
-            <input type="date" className="input" {...form.register("workDate")} />
+            <DateField form={form} name="workDate" />
           </div>
           <div>
             <label className="label">Giờ *</label>

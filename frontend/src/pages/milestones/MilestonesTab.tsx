@@ -9,9 +9,10 @@ import {
   updateMilestone,
   type Milestone,
 } from "@/features/milestones/api";
-import { Plus, Pencil, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { Plus, Pencil, Trash2, Search, X } from "lucide-react";
+import { useMemo, useState } from "react";
 import { Modal } from "@/components/ui/Modal";
+import { DateField } from "@/components/ui/DateField";
 import { formatDate } from "@/lib/format";
 import { useAuth } from "@/features/auth/store";
 
@@ -26,6 +27,19 @@ export function MilestonesTab({ projectId }: { projectId: number }) {
   });
   const [editing, setEditing] = useState<Milestone | null>(null);
   const [creating, setCreating] = useState(false);
+  const [q, setQ] = useState("");
+  const [status, setStatus] = useState("");
+
+  const filtered = useMemo(() => {
+    const kw = q.trim().toLowerCase();
+    return milestones.filter((m) => {
+      if (kw && !m.name.toLowerCase().includes(kw)) return false;
+      if (status && (m.status ?? "") !== status) return false;
+      return true;
+    });
+  }, [milestones, q, status]);
+
+  const hasFilter = q || status;
 
   const del = useMutation({
     mutationFn: deleteMilestone,
@@ -38,7 +52,9 @@ export function MilestonesTab({ projectId }: { projectId: number }) {
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <p className="text-sm text-slate-500">{milestones.length} milestone</p>
+        <p className="text-sm text-slate-500">
+          {filtered.length === milestones.length ? `${milestones.length} milestone` : `${filtered.length} / ${milestones.length} milestone`}
+        </p>
         {canEdit && (
           <button className="btn-primary" onClick={() => setCreating(true)}>
             <Plus className="mr-1 h-4 w-4" /> Tạo milestone
@@ -46,13 +62,43 @@ export function MilestonesTab({ projectId }: { projectId: number }) {
         )}
       </div>
 
+      {milestones.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              className="input w-56 pl-8"
+              placeholder="Tìm tên milestone…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+          </div>
+          <select className="input w-44" value={status} onChange={(e) => setStatus(e.target.value)}>
+            <option value="">Mọi trạng thái</option>
+            <option value="planned">planned</option>
+            <option value="in_progress">in_progress</option>
+            <option value="done">done</option>
+          </select>
+          {hasFilter && (
+            <button
+              className="btn-secondary flex items-center gap-1 text-sm"
+              onClick={() => { setQ(""); setStatus(""); }}
+            >
+              <X className="h-4 w-4" /> Xóa lọc
+            </button>
+          )}
+        </div>
+      )}
+
       {isLoading ? (
         <p className="text-sm text-slate-500">Đang tải…</p>
       ) : milestones.length === 0 ? (
         <div className="card text-center text-sm text-slate-500">Chưa có milestone nào</div>
+      ) : filtered.length === 0 ? (
+        <div className="card text-center text-sm text-slate-500">Không có milestone khớp bộ lọc.</div>
       ) : (
         <ul className="card divide-y divide-slate-100 p-0">
-          {milestones.map((m) => (
+          {filtered.map((m) => (
             <li key={m.id} className="flex items-center justify-between p-4">
               <div className="flex-1">
                 <div className="flex items-center gap-2">
@@ -151,7 +197,7 @@ function MilestoneFormModal({
           </div>
           <div>
             <label className="label">Hạn</label>
-            <input type="date" className="input" {...form.register("dueDate")} />
+            <DateField form={form} name="dueDate" />
           </div>
         </div>
         <div>

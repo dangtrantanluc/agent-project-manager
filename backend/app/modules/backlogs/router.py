@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_current_user, get_db, require_role
+from app.core.deps import get_current_user, get_db, require_role, is_restricted, project_access_exists_sql
 
 router = APIRouter(prefix="/backlogs", tags=["backlogs"])
 
@@ -71,6 +71,10 @@ async def list_backlogs(
 ):
     where = "WHERE TRUE"
     params: dict = {}
+    # MEMBER/VIEWER chỉ thấy backlog thuộc project mình tham gia (hoặc của chính mình).
+    if is_restricted(current_user):
+        where += f" AND (b.user_id = :access_uid OR {project_access_exists_sql('b.project_id')})"
+        params["access_uid"] = current_user["id"]
     if project_id:
         where += " AND b.project_id = :pid"; params["pid"] = project_id
     if task_id:
@@ -101,6 +105,13 @@ async def create_backlog(
     db: AsyncSession = Depends(get_db),
 ):
     target_project_id = project_id or body["projectId"]
+
+    # Chỉ MANAGER/ADMIN mới được tạo backlog thay cho người khác; còn lại ép về chính mình.
+    is_privileged = current_user.get("role") in ("MANAGER", "ADMIN") or current_user.get("isSuperAdmin")
+    target_user_id = body.get("userId") or current_user["id"]
+    if target_user_id != current_user["id"] and not is_privileged:
+        raise HTTPException(status_code=403, detail="Không có quyền tạo backlog cho người khác")
+
     row = (await db.execute(
         text("""
             INSERT INTO backlogs (
@@ -151,11 +162,14 @@ async def update_backlog(
     db: AsyncSession = Depends(get_db),
 ):
     existing = (await db.execute(
-        text("SELECT id, status, project_id, task_id FROM backlogs WHERE id = :bid"),
+        text("SELECT id, status, project_id, task_id, user_id FROM backlogs WHERE id = :bid"),
         {"bid": backlog_id},
     )).fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Backlog không tồn tại")
+    is_privileged = current_user.get("role") in ("MANAGER", "ADMIN") or current_user.get("isSuperAdmin")
+    if existing[4] != current_user["id"] and not is_privileged:
+        raise HTTPException(status_code=403, detail="Không có quyền sửa backlog này")
     if existing[1] == "APPROVED":
         raise HTTPException(status_code=400, detail="Không thể sửa backlog đã duyệt")
 
@@ -186,11 +200,14 @@ async def delete_backlog(
     db: AsyncSession = Depends(get_db),
 ):
     existing = (await db.execute(
-        text("SELECT project_id, task_id, status FROM backlogs WHERE id = :bid"),
+        text("SELECT project_id, task_id, status, user_id FROM backlogs WHERE id = :bid"),
         {"bid": backlog_id},
     )).fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Backlog không tồn tại")
+    is_privileged = current_user.get("role") in ("MANAGER", "ADMIN") or current_user.get("isSuperAdmin")
+    if existing[3] != current_user["id"] and not is_privileged:
+        raise HTTPException(status_code=403, detail="Không có quyền xóa backlog này")
 
     await db.execute(text("DELETE FROM backlogs WHERE id = :bid"), {"bid": backlog_id})
     if existing[2] == "APPROVED":

@@ -1,5 +1,4 @@
 import json
-import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
@@ -10,9 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_agent_user, get_db
 from ai_agent.checkin import repository as checkin_repo
 from ai_agent.router.message_router import AgentMessageRouter
+from ai_agent.text_to_sql.text2sql import Text2SQLAgent
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 _message_router: AgentMessageRouter | None = None
+_sql_agent: Text2SQLAgent | None = None
 
 def _get_message_router() -> AgentMessageRouter:
     global _message_router
@@ -20,8 +21,11 @@ def _get_message_router() -> AgentMessageRouter:
         _message_router = AgentMessageRouter()
     return _message_router
 
-_SELECT_ONLY = re.compile(r"^\s*select\b", re.IGNORECASE)
-_MUTATION = re.compile(r"\b(insert|update|delete|drop|alter|truncate|create)\b", re.IGNORECASE)
+def _get_sql_agent() -> Text2SQLAgent:
+    global _sql_agent
+    if _sql_agent is None:
+        _sql_agent = Text2SQLAgent()
+    return _sql_agent
 
 def _iso(value):
     return value.isoformat() if value else None
@@ -107,10 +111,11 @@ async def user_by_channel(
 ):
     row = (await db.execute(
         text("""
-            SELECT u.id, u.email, u.full_name, u.role, u.company_name, u.is_admin,
+            SELECT u.id, u.email, u.full_name, u.role, c.name AS company_name, u.is_admin,
                    ci.external_id, ci.thread_id, ci.external_name
             FROM channel_identities ci
             JOIN users u ON u.id = ci.user_id
+            LEFT JOIN companies c ON c.id = u.company_id
             WHERE ci.channel = CAST(:channel AS "ChannelKind")
               AND ci.external_id = :external_id
               AND (CAST(:thread_id AS text) IS NULL OR ci.thread_id = CAST(:thread_id AS text) OR ci.thread_id IS NULL)
@@ -122,10 +127,11 @@ async def user_by_channel(
     if not row and channel == "gapo":
         row = (await db.execute(
             text("""
-                SELECT u.id, u.email, u.full_name, u.role, u.company_name, u.is_admin,
+                SELECT u.id, u.email, u.full_name, u.role, c.name AS company_name, u.is_admin,
                        gum.gapo_user_id::text, gum.gapo_thread_id::text, gum.gapo_full_name
                 FROM gapo_user_maps gum
                 JOIN users u ON u.id = gum.user_id
+                LEFT JOIN companies c ON c.id = u.company_id
                 WHERE gum.gapo_user_id::text = :external_id
                 LIMIT 1
             """),
@@ -712,8 +718,11 @@ async def patch_follow_up(
 async def agent_users(agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(
         text("""
-            SELECT id, email, full_name, role, avatar_url, company_name, department, position
-            FROM users WHERE active = true ORDER BY full_name
+            SELECT u.id, u.email, u.full_name, u.role, u.avatar_url, c.name AS company_name,
+                   u.department, u.position
+            FROM users u
+            LEFT JOIN companies c ON c.id = u.company_id
+            WHERE u.active = true ORDER BY u.full_name
         """),
         {},
     )).fetchall()
@@ -781,7 +790,7 @@ async def report_schema(agent_user: dict = Depends(get_agent_user)):
         "schema": (
             "Tables: projects(id,name,status,owner_id,start_date,end_date,total_hours), "
             "tasks(id,name,status,priority,deadline,project_id,assignee_id,updated_at), "
-            "users(id,full_name,email,role,company_name,department,position), "
+            "users(id,full_name,email,role,department,position), "
             "members(project_id,user_id,role), backlogs(id,status,work_date,description,hours,task_id,project_id,user_id), "
             "agent_memory(conversation_id,summary,user_text,reply_text,created_at). "
             "The app is single-company; do not add company_id filters."
@@ -791,10 +800,19 @@ async def report_schema(agent_user: dict = Depends(get_agent_user)):
 @router.post("/report/query")
 async def report_query(body: dict, agent_user: dict = Depends(get_agent_user), db: AsyncSession = Depends(get_db)):
     sql = str(body.get("sql") or "").strip()
-    if not _SELECT_ONLY.match(sql) or _MUTATION.search(sql) or ";" in sql.rstrip(";"):
-        raise HTTPException(status_code=400, detail="Only a single SELECT statement is allowed")
-    rows = (await db.execute(text(sql))).mappings().fetchall()
-    data = [dict(r) for r in rows]
+    # Dùng chung lớp an toàn của Text2SQLAgent (strip comment, chặn mutation,
+    # multi-statement, placeholder chưa bind, và cột/hàm nhạy cảm như password_hash).
+    # is_safe_sql yêu cầu kết thúc bằng ';' nên thêm vào nếu thiếu.
+    agent = _get_sql_agent()
+    sql_checked = sql if sql.rstrip().endswith(";") else sql + ";"
+    if not agent.is_safe_sql(sql_checked):
+        raise HTTPException(
+            status_code=400,
+            detail="Chỉ cho phép một câu SELECT an toàn (không mutation, không cột nhạy cảm).",
+        )
+    # Chạy qua pool read-only của agent (DB_AGENT_USER) thay vì session superuser,
+    # để DB từ chối mọi thao tác ghi / cột bị thu hồi ngay cả khi regex bị qua mặt.
+    data = await agent.execute_sql(agent._clean_sql(sql_checked))
     return {"rows": data, "rowCount": len(data)}
 
 @router.post("/audit", status_code=201)

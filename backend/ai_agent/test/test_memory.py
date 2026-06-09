@@ -8,6 +8,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+import ai_agent.memory.memory as memory
 from ai_agent.memory.memory import load_memory, save_memory
 
 
@@ -18,6 +19,9 @@ class _Result:
 
     def fetchall(self):
         return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
 
     def scalar(self):
         return self.scalar_value
@@ -75,7 +79,11 @@ class _FakeMemorySession:
                 "summary": "",
                 "created_at": datetime(2026, 5, 27, 12, 0, 0) + timedelta(seconds=row_id),
             })
-            return _Result(scalar_value=row_id)
+            # CTE mới trả về (id, turn_count) qua fetchone().
+            turn_count = sum(
+                1 for row in self.rows if row["conversation_id"] == params["conv_id"]
+            )
+            return _Result(rows=[(row_id, turn_count)])
 
         if "select count(*)" in sql:
             count = sum(1 for row in self.rows if row["conversation_id"] == params["cid"])
@@ -94,17 +102,29 @@ class _FakeMemorySession:
         self.commits += 1
 
 
-class _FakeLLM:
+class _FakeOpenAIClient:
+    """Mô phỏng openai.AsyncOpenAI: client.chat.completions.create(...) trả về
+    object có .choices[0].message.content — đúng interface save_memory đang dùng.
+    """
+
     def __init__(self, content="rolling summary", fail=False):
         self.content = content
         self.fail = fail
-        self.calls = []
+        self.calls = []  # mỗi phần tử là list messages truyền vào create()
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    async def ainvoke(self, messages):
+    async def _create(self, *, model, messages, temperature=0, **kwargs):
         self.calls.append(messages)
         if self.fail:
             raise RuntimeError("llm failed")
-        return SimpleNamespace(content=self.content)
+        message = SimpleNamespace(content=self.content)
+        choice = SimpleNamespace(message=message)
+        return SimpleNamespace(choices=[choice])
+
+
+def _patch_openai(monkeypatch, client):
+    """Trỏ memory.AsyncOpenAI(...) về fake client (bỏ qua api_key/base_url)."""
+    monkeypatch.setattr(memory, "AsyncOpenAI", lambda *a, **k: client)
 
 
 def _row(row_id, summary=""):
@@ -134,46 +154,51 @@ def test_load_memory_uses_latest_non_empty_summary_and_five_recent_turns():
     assert [turn["user"] for turn in turns] == ["user 2", "user 3", "user 4", "user 5", "user 6"]
 
 
-def test_save_memory_inserts_raw_turns_before_summary_threshold():
+def test_save_memory_inserts_raw_turns_before_summary_threshold(monkeypatch):
     db = _FakeMemorySession()
-    llm = _FakeLLM()
+    client = _FakeOpenAIClient()
+    _patch_openai(monkeypatch, client)
 
     for index in range(1, 4):
-        asyncio.run(save_memory("c1", f"user {index}", f"bot {index}", ["conversation"], f"corr-{index}", db, llm))
+        asyncio.run(save_memory("c1", f"user {index}", f"bot {index}", ["conversation"], f"corr-{index}", db))
 
     assert len(db.rows) == 3
     assert all(row["summary"] == "" for row in db.rows)
-    assert llm.calls == []
+    assert client.calls == []
     assert db.updates == []
 
 
-def test_save_memory_updates_inserted_fourth_turn_with_rolling_summary():
+def test_save_memory_updates_inserted_fourth_turn_with_rolling_summary(monkeypatch):
     db = _FakeMemorySession([_row(1), _row(2), _row(3, "previous summary")])
-    llm = _FakeLLM("new summary")
+    client = _FakeOpenAIClient("new summary")
+    _patch_openai(monkeypatch, client)
 
-    asyncio.run(save_memory("c1", "user 4", "bot 4", ["text2sql"], "corr-4", db, llm))
+    asyncio.run(save_memory("c1", "user 4", "bot 4", ["text2sql"], "corr-4", db))
 
     assert len(db.rows) == 4
     assert db.rows[-1]["summary"] == "new summary"
     assert db.updates == [{"id": 4, "summary": "new summary"}]
-    assert len(llm.calls) == 1
-    assert "Tóm tắt trước: previous summary" in llm.calls[0][1].content
+    assert len(client.calls) == 1
+    # messages = [system, user]; ctx (tóm tắt trước + các lượt) nằm ở user message.
+    assert "Tóm tắt trước: previous summary" in client.calls[0][1]["content"]
 
 
-def test_save_memory_keeps_raw_turn_when_summary_llm_fails():
+def test_save_memory_keeps_raw_turn_when_summary_llm_fails(monkeypatch):
     db = _FakeMemorySession([_row(1), _row(2), _row(3)])
-    llm = _FakeLLM(fail=True)
+    client = _FakeOpenAIClient(fail=True)
+    _patch_openai(monkeypatch, client)
 
-    asyncio.run(save_memory("c1", "user 4", "bot 4", ["text2sql"], "corr-4", db, llm))
+    asyncio.run(save_memory("c1", "user 4", "bot 4", ["text2sql"], "corr-4", db))
 
     assert len(db.rows) == 4
     assert db.rows[-1]["summary"] == ""
     assert db.updates == []
 
 
-def test_save_memory_includes_company_id_when_live_schema_requires_it():
+def test_save_memory_includes_company_id_when_live_schema_requires_it(monkeypatch):
     db = _FakeMemorySession(columns={("agent_memory", "company_id")})
-    llm = _FakeLLM()
+    client = _FakeOpenAIClient()
+    _patch_openai(monkeypatch, client)
 
     asyncio.run(save_memory(
         "c1",
@@ -182,7 +207,6 @@ def test_save_memory_includes_company_id_when_live_schema_requires_it():
         ["conversation"],
         "corr-1",
         db,
-        llm,
         company_id=7,
     ))
 

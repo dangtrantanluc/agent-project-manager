@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Plus, Pencil, Trash2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Plus, Pencil, Trash2, Search, X } from "lucide-react";
 import { deleteWorklog, listWorklogs, type Worklog } from "@/features/worklogs/api";
 import { formatDate, formatHours } from "@/lib/format";
 import { useAuth } from "@/features/auth/store";
@@ -20,6 +20,33 @@ export function WorklogsTab({ projectId }: { projectId: number }) {
     queryFn: () => listWorklogs({ projectId, limit: 500 }),
   });
 
+  // Lọc client-side trên worklog đã tải (tối đa 500).
+  const [q, setQ] = useState("");
+  const [userId, setUserId] = useState<"" | number>("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
+  const allLogs = listQ.data?.data ?? [];
+
+  const people = useMemo(() => {
+    const m = new Map<number, string>();
+    allLogs.forEach((w) => m.set(w.user.id, w.user.fullName));
+    return [...m].map(([id, name]) => ({ id, name }));
+  }, [allLogs]);
+
+  const logs = useMemo(() => {
+    const kw = q.trim().toLowerCase();
+    return allLogs.filter((w) => {
+      if (kw && !(w.task?.name?.toLowerCase().includes(kw) || w.description?.toLowerCase().includes(kw))) return false;
+      if (userId !== "" && w.user.id !== userId) return false;
+      if (from && w.workDate.slice(0, 10) < from) return false;
+      if (to && w.workDate.slice(0, 10) > to) return false;
+      return true;
+    });
+  }, [allLogs, q, userId, from, to]);
+
+  const hasFilter = q || userId !== "" || from || to;
+
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["worklogs"] });
     qc.invalidateQueries({ queryKey: ["project", projectId] });
@@ -32,20 +59,58 @@ export function WorklogsTab({ projectId }: { projectId: number }) {
     onError: (e: any) => toast.error(e.response?.data?.error?.message ?? "Thất bại"),
   });
 
-  const totalHours = (listQ.data?.data ?? []).reduce((s, w) => s + Number(w.hours), 0);
+  const totalHours = logs.reduce((s, w) => s + Number(w.hours), 0);
 
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="text-sm text-slate-500">
-            {listQ.data?.meta.total ?? 0} worklog
+            {logs.length === allLogs.length ? `${allLogs.length} worklog` : `${logs.length} / ${allLogs.length} worklog`}
             {totalHours > 0 && ` · ${formatHours(totalHours)} tổng`}
           </span>
         </div>
         <button className="btn-primary" onClick={() => setCreating(true)}>
           <Plus className="mr-1 h-4 w-4" /> Log giờ
         </button>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            className="input w-56 pl-8"
+            placeholder="Tìm task / mô tả…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+        {people.length > 1 && (
+          <select
+            className="input w-44"
+            value={userId}
+            onChange={(e) => setUserId(e.target.value === "" ? "" : Number(e.target.value))}
+          >
+            <option value="">Mọi người log</option>
+            {people.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        )}
+        <div className="flex items-center gap-1 text-sm text-slate-500">
+          <span>Ngày</span>
+          <input type="date" className="input w-36" value={from} onChange={(e) => setFrom(e.target.value)} title="Từ ngày" />
+          <span>→</span>
+          <input type="date" className="input w-36" value={to} onChange={(e) => setTo(e.target.value)} title="Đến ngày" />
+        </div>
+        {hasFilter && (
+          <button
+            className="btn-secondary flex items-center gap-1 text-sm"
+            onClick={() => { setQ(""); setUserId(""); setFrom(""); setTo(""); }}
+          >
+            <X className="h-4 w-4" /> Xóa lọc
+          </button>
+        )}
       </div>
 
       <div className="card overflow-x-auto p-0">
@@ -66,7 +131,7 @@ export function WorklogsTab({ projectId }: { projectId: number }) {
                 <td colSpan={6} className="p-6 text-center text-sm text-slate-500">Đang tải…</td>
               </tr>
             )}
-            {listQ.data?.data.map((w) => {
+            {logs.map((w) => {
               const isOwner = w.userId === user.id;
               const canEdit = isAdmin || isOwner;
               const canDelete = isAdmin || isOwner;
@@ -106,10 +171,10 @@ export function WorklogsTab({ projectId }: { projectId: number }) {
                 </tr>
               );
             })}
-            {!listQ.isLoading && listQ.data?.data.length === 0 && (
+            {!listQ.isLoading && logs.length === 0 && (
               <tr>
                 <td colSpan={6} className="p-6 text-center text-sm text-slate-500">
-                  Chưa có worklog nào.
+                  {allLogs.length === 0 ? "Chưa có worklog nào." : "Không có worklog khớp bộ lọc."}
                 </td>
               </tr>
             )}

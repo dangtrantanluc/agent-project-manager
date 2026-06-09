@@ -33,6 +33,12 @@ def _parse_json_col(value) -> dict | None:
     """Safely parse a json column value that may come as str or dict."""
     if value is None:
         return None
+    if isinstance(value, dict):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
 
 
 async def _has_column(db: AsyncSession, table_name: str, column_name: str) -> bool:
@@ -50,12 +56,6 @@ async def _has_column(db: AsyncSession, table_name: str, column_name: str) -> bo
     """), {"table_name": table_name, "column_name": column_name})).scalar()
     _column_cache[key] = bool(exists)
     return _column_cache[key]
-    if isinstance(value, dict):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return None
 
 
 # ── User / session bootstrap ──────────────────────────────────────────────────
@@ -441,11 +441,26 @@ async def list_task_candidates(
 async def validate_project_access(
     db: AsyncSession, *, user_id: int, project_id: int
 ) -> bool:
+    # User chỉ check-in được vào dự án mình là owner / member / có task được giao
+    # (chống IDOR: trước đây hàm bỏ qua user_id nên mọi user truy cập mọi dự án).
+    # Điều kiện này khớp với menu chọn dự án (get_user_projects) để không lệch.
     row = (await db.execute(text("""
         SELECT 1 FROM projects p
         WHERE p.id = :pid AND p.status::text <> 'DONE'
+          AND (
+              p.owner_id = :uid
+              OR EXISTS (
+                  SELECT 1 FROM members m
+                  WHERE m.project_id = p.id AND m.user_id = :uid
+              )
+              OR EXISTS (
+                  SELECT 1 FROM tasks t
+                  WHERE t.project_id = p.id AND t.assignee_id = :uid
+                    AND t.status::text <> 'DONE'
+              )
+          )
         LIMIT 1
-    """), {"pid": project_id})).fetchone()
+    """), {"pid": project_id, "uid": user_id})).fetchone()
     return row is not None
 
 

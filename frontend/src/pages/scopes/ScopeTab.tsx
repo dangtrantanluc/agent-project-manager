@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -29,7 +29,7 @@ import {
 import { Modal } from "@/components/ui/Modal";
 import { formatHours } from "@/lib/format";
 import { useAuth } from "@/features/auth/store";
-import { GripVertical, Plus, Pencil, Trash2 } from "lucide-react";
+import { GripVertical, Plus, Pencil, Trash2, Search, X } from "lucide-react";
 
 export function ScopeTab({ projectId }: { projectId: number }) {
   const qc = useQueryClient();
@@ -42,6 +42,17 @@ export function ScopeTab({ projectId }: { projectId: number }) {
   });
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<Scope | null>(null);
+  const [q, setQ] = useState("");
+
+  // Khi đang lọc, tắt kéo-thả sắp xếp (reorder chỉ đúng trên toàn bộ danh sách).
+  const filtering = q.trim() !== "";
+  const filtered = useMemo(() => {
+    const kw = q.trim().toLowerCase();
+    if (!kw) return scopes;
+    return scopes.filter(
+      (s) => s.name.toLowerCase().includes(kw) || (s.notes?.toLowerCase().includes(kw) ?? false),
+    );
+  }, [scopes, q]);
 
   const reorder = useMutation({
     mutationFn: (ids: number[]) => reorderScopes(projectId, ids),
@@ -87,7 +98,7 @@ export function ScopeTab({ projectId }: { projectId: number }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex gap-4 text-sm text-slate-500">
-          <span>{scopes.length} scope item</span>
+          <span>{filtering ? `${filtered.length} / ${scopes.length}` : scopes.length} scope item</span>
           <span>Tổng giờ ước tính: <b className="text-slate-700">{formatHours(totalEstimatedHours)}</b></span>
         </div>
         {canEdit && (
@@ -97,10 +108,46 @@ export function ScopeTab({ projectId }: { projectId: number }) {
         )}
       </div>
 
+      {scopes.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              className="input w-56 pl-8"
+              placeholder="Tìm tên / ghi chú…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+            />
+          </div>
+          {filtering && (
+            <>
+              <span className="text-xs text-slate-400">Đang lọc — tắt kéo-thả sắp xếp</span>
+              <button className="btn-secondary flex items-center gap-1 text-sm" onClick={() => setQ("")}>
+                <X className="h-4 w-4" /> Xóa lọc
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       {isLoading ? (
         <p className="text-sm text-slate-500">Đang tải…</p>
       ) : scopes.length === 0 ? (
         <div className="card text-center text-sm text-slate-500">Chưa có mục scope</div>
+      ) : filtered.length === 0 ? (
+        <div className="card text-center text-sm text-slate-500">Không có mục scope khớp bộ lọc.</div>
+      ) : filtering ? (
+        <ul className="card divide-y divide-slate-100 p-0">
+          {filtered.map((s) => (
+            <StaticScopeRow
+              key={s.id}
+              scope={s}
+              canEdit={!!canEdit}
+              onEdit={() => setEditing(s)}
+              onDelete={() => confirm(`Xóa "${s.name}"?`) && del.mutate(s.id)}
+            />
+          ))}
+        </ul>
       ) : (
         <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
           <SortableContext items={scopes.map((s) => s.id)} strategy={verticalListSortingStrategy}>
@@ -127,6 +174,42 @@ export function ScopeTab({ projectId }: { projectId: number }) {
         scope={editing}
       />
     </div>
+  );
+}
+
+function StaticScopeRow({
+  scope,
+  canEdit,
+  onEdit,
+  onDelete,
+}: {
+  scope: Scope;
+  canEdit: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <li className="flex items-center gap-3 p-4">
+      <div className="flex-1">
+        <p className="font-medium">{scope.name}</p>
+        {scope.notes && <p className="mt-0.5 text-xs text-slate-500">{scope.notes}</p>}
+        {scope.task && <p className="mt-0.5 text-xs text-slate-400">→ Task: {scope.task.name}</p>}
+      </div>
+      <div className="w-24 text-right text-sm">
+        <p className="text-slate-500">Giờ</p>
+        <p className="font-medium">{formatHours(Number(scope.estimatedHours ?? 0))}</p>
+      </div>
+      {canEdit && (
+        <div className="flex gap-1">
+          <button className="rounded p-1 hover:bg-slate-100" onClick={onEdit}>
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
+          <button className="rounded p-1 text-red-600 hover:bg-red-50" onClick={onDelete}>
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+    </li>
   );
 }
 

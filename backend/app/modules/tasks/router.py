@@ -1,11 +1,25 @@
+from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_agent_user, get_current_user, get_db, require_role
+from app.core.deps import get_agent_user, get_current_user, get_db, require_role, is_restricted, project_access_exists_sql
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+def _parse_date(value: object) -> Optional[date]:
+    """Chuyển chuỗi ISO ('YYYY-MM-DD' hoặc datetime đầy đủ) thành date object.
+    asyncpg yêu cầu bind date object cho cột DATE, không nhận chuỗi (DataError).
+    Trả None cho giá trị rỗng để clear cột."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
 
 _VALID_TRANSITIONS = {
     "TODO": {"IN_PROGRESS", "CANCELLED"},
@@ -27,9 +41,26 @@ _SELECT_TASK = """
            t.description, t.result, t.issues,
            t.total_hours,
            t.project_id, t.assignee_id, t.milestone_id, t.currency_id,
-           t.created_at, t.updated_at
+           t.created_at, t.updated_at,
+           u.full_name AS assignee_full_name, u.avatar_url AS assignee_avatar_url,
+           m.name AS milestone_name
     FROM tasks t
+    LEFT JOIN users u ON u.id = t.assignee_id
+    LEFT JOIN milestones m ON m.id = t.milestone_id
 """
+
+
+def _is_privileged(current_user: dict) -> bool:
+    return current_user.get("role") in ("MANAGER", "ADMIN") or current_user.get("isSuperAdmin")
+
+
+async def _ensure_can_modify_task(db: AsyncSession, current_user: dict, assignee_id) -> None:
+    """MANAGER/ADMIN sửa được mọi task; MEMBER/VIEWER chỉ sửa task được assign cho mình."""
+    if _is_privileged(current_user):
+        return
+    if assignee_id is not None and assignee_id == current_user["id"]:
+        return
+    raise HTTPException(status_code=403, detail="Không có quyền thao tác task này")
 
 
 def _row_to_dict(r) -> dict:
@@ -42,7 +73,26 @@ def _row_to_dict(r) -> dict:
         "projectId": r[10], "assigneeId": r[11],
         "milestoneId": r[12], "currencyId": r[13],
         "createdAt": r[14].isoformat(), "updatedAt": r[15].isoformat(),
+        # assignee nested object is only present on rows from _SELECT_TASK
+        # (which LEFT JOINs users). RETURNING-based rows omit it.
+        "assignee": (
+            {"id": r[11], "fullName": r[16], "avatarUrl": r[17]}
+            if len(r) > 16 and r[11] is not None else None
+        ),
+        "milestone": (
+            {"id": r[12], "name": r[18]}
+            if len(r) > 18 and r[12] is not None else None
+        ),
     }
+
+
+async def _fetch_task_dict(task_id: int, db: AsyncSession) -> dict:
+    """Re-fetch a task via _SELECT_TASK so the response includes the nested
+    assignee object (RETURNING rows from INSERT/UPDATE don't join users)."""
+    row = (await db.execute(
+        text(f"{_SELECT_TASK} WHERE t.id = :tid"), {"tid": task_id},
+    )).fetchone()
+    return _row_to_dict(row)
 
 
 async def _recompute_milestone(milestone_id: int, db: AsyncSession):
@@ -79,6 +129,10 @@ async def list_tasks(
 ):
     where = "WHERE TRUE"
     params: dict = {}
+    # MEMBER/VIEWER chỉ thấy task thuộc project mình tham gia.
+    if is_restricted(current_user):
+        where += f" AND {project_access_exists_sql('t.project_id')}"
+        params["access_uid"] = current_user["id"]
     if project_id:
         where += " AND t.project_id = :pid"; params["pid"] = project_id
     if status:
@@ -112,6 +166,9 @@ async def create_task(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if not _is_privileged(current_user):
+        raise HTTPException(status_code=403, detail="Chỉ quản lý mới được tạo task")
+
     target_project_id = project_id or body["projectId"]
     project_row = (await db.execute(
         text("SELECT company_id FROM projects WHERE id = :pid"),
@@ -138,7 +195,7 @@ async def create_task(
         """),
         {
             "name": body["name"], "status": _normalize_task_status(body.get("status")) if body.get("status") else None, "priority": body.get("priority"),
-            "deadline": body.get("deadline"), "end_at": body.get("endAt"),
+            "deadline": _parse_date(body.get("deadline")), "end_at": _parse_date(body.get("endAt")),
             "description": body.get("description"),
             "project_id": target_project_id,
             "assignee_id": body.get("assigneeId"),
@@ -156,7 +213,7 @@ async def create_task(
         )
 
     await db.commit()
-    return _row_to_dict(row)
+    return await _fetch_task_dict(row[0], db)
 
 
 @router.get("/overdue")
@@ -235,9 +292,14 @@ async def get_task(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    where = "WHERE t.id = :tid"
+    params: dict = {"tid": task_id}
+    if is_restricted(current_user):
+        where += f" AND {project_access_exists_sql('t.project_id')}"
+        params["access_uid"] = current_user["id"]
     row = (await db.execute(
-        text(f"{_SELECT_TASK} WHERE t.id = :tid"),
-        {"tid": task_id},
+        text(f"{_SELECT_TASK} {where}"),
+        params,
     )).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Task không tồn tại")
@@ -257,16 +319,22 @@ async def update_task(
     )).fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Task không tồn tại")
+    await _ensure_can_modify_task(db, current_user, existing[2])
+    # MEMBER không được tự đổi người phụ trách (assignee) — chỉ MANAGER/ADMIN.
+    if "assigneeId" in body and not _is_privileged(current_user):
+        raise HTTPException(status_code=403, detail="Không có quyền đổi người phụ trách")
 
     field_map = {
         "name": "name", "description": "description", "result": "result", "issues": "issues",
         "deadline": "deadline", "endAt": "end_at",
         "assigneeId": "assignee_id", "milestoneId": "milestone_id", "currencyId": "currency_id",
     }
+    _date_fields = {"deadline", "endAt"}
     sets, params = ["updated_at = NOW()"], {"tid": task_id}
     for js, col in field_map.items():
         if js in body:
-            sets.append(f"{col} = :{js}"); params[js] = body[js]
+            sets.append(f"{col} = :{js}")
+            params[js] = _parse_date(body[js]) if js in _date_fields else body[js]
     if "status" in body:
         sets.append('status = CAST(:status AS "TaskStatus")'); params["status"] = _normalize_task_status(body["status"])
     if "priority" in body:
@@ -287,7 +355,7 @@ async def update_task(
         await _recompute_milestone(row[12], db)
 
     await db.commit()
-    return _row_to_dict(row)
+    return await _fetch_task_dict(row[0], db)
 
 
 @router.delete("/{task_id}", status_code=204)
@@ -323,11 +391,12 @@ async def transition_task(
     db: AsyncSession = Depends(get_db),
 ):
     row = (await db.execute(
-        text("SELECT status, milestone_id FROM tasks WHERE id = :tid"),
+        text("SELECT status, milestone_id, assignee_id FROM tasks WHERE id = :tid"),
         {"tid": task_id},
     )).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Task không tồn tại")
+    await _ensure_can_modify_task(db, current_user, row[2])
 
     new_status = _normalize_task_status(body.get("status", ""))
     allowed = _VALID_TRANSITIONS.get(row[0], set())
@@ -350,7 +419,7 @@ async def transition_task(
         await _recompute_milestone(row[1], db)
 
     await db.commit()
-    return _row_to_dict(updated)
+    return await _fetch_task_dict(updated[0], db)
 
 
 @router.get("/{task_id}/blockers")
@@ -388,11 +457,12 @@ async def create_blocker(
     db: AsyncSession = Depends(get_db),
 ):
     task = (await db.execute(
-        text("SELECT id FROM tasks WHERE id = :tid"),
+        text("SELECT id, assignee_id FROM tasks WHERE id = :tid"),
         {"tid": task_id},
     )).fetchone()
     if not task:
         raise HTTPException(status_code=404, detail="Task không tồn tại")
+    await _ensure_can_modify_task(db, current_user, task[1])
 
     row = (await db.execute(
         text("""

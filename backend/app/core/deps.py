@@ -95,6 +95,34 @@ async def _load_agent_user(db: AsyncSession) -> dict[str, Any]:
     }
 
 
+_FULL_ACCESS_ROLES = {"ADMIN", "MANAGER"}
+
+# SQL fragment: project `p` mà :access_uid được tham gia. Dùng để giới hạn dữ liệu
+# (tasks/worklogs/backlogs/...) cho MEMBER/VIEWER. Tham chiếu alias bảng truyền vào
+# để có thể dùng trong nhiều ngữ cảnh (vd lọc theo t.project_id hay w.project_id).
+def project_access_exists_sql(project_id_expr: str) -> str:
+    """Trả về điều kiện EXISTS(...) kiểm tra :access_uid có quyền xem project_id_expr."""
+    return f"""EXISTS (
+        SELECT 1 FROM projects _ap
+        WHERE _ap.id = {project_id_expr}
+          AND (
+            _ap.owner_id = :access_uid
+            OR _ap.account_manager_id = :access_uid
+            OR EXISTS (SELECT 1 FROM members _m WHERE _m.project_id = _ap.id AND _m.user_id = :access_uid)
+            OR EXISTS (SELECT 1 FROM tasks _t WHERE _t.project_id = _ap.id AND _t.assignee_id = :access_uid)
+            OR EXISTS (SELECT 1 FROM worklogs _w WHERE _w.project_id = _ap.id AND _w.user_id = :access_uid)
+            OR EXISTS (SELECT 1 FROM backlogs _b WHERE _b.project_id = _ap.id AND _b.user_id = :access_uid)
+          )
+    )"""
+
+
+def is_restricted(current_user: dict) -> bool:
+    """True nếu user chỉ được thấy dữ liệu thuộc project mình tham gia."""
+    if current_user.get("isSuperAdmin"):
+        return False
+    return current_user.get("role") not in _FULL_ACCESS_ROLES
+
+
 _ROLE_ORDER = {"VIEWER": 0, "MEMBER": 1, "MANAGER": 2, "ADMIN": 3}
 
 

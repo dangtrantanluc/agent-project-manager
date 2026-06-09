@@ -1,16 +1,16 @@
 import asyncio
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
@@ -23,6 +23,27 @@ load_dotenv()
 SQL_SCHEMA = BACKEND_ROOT.parent / "init" / "init.sql"
 schema = SQL_SCHEMA.read_text() if SQL_SCHEMA.exists() else ""
 
+
+class ReportQuery(BaseModel):
+    name: str = Field(description="Tên ngắn gọn cho câu truy vấn")
+    sql: str = Field(description="Câu SQL chỉ dùng SELECT/WITH, không markdown")
+
+
+class ReportPlan(BaseModel):
+    need_clarification: bool = False
+    clarification_question: str = ""
+    queries: List[ReportQuery] = Field(default_factory=list)
+
+
+class TemplateSelection(BaseModel):
+    template_id: Optional[str] = Field(
+        None, description="id template phù hợp nhất, hoặc null nếu không khớp"
+    )
+    params: Dict[str, str] = Field(
+        default_factory=dict, description="Tham số trích từ yêu cầu, dạng {tên: giá trị}"
+    )
+
+
 REPORT_SYSTEM_PROMPT = f"""
 Bạn là Report SQL Planner.
 
@@ -30,15 +51,6 @@ Schema compact:
 {SCHEMA_COMPACT}
 
 Tạo tối đa 2 SQL query.
-
-Output JSON:
-{{
-  "need_clarification": false,
-  "clarification_question": "",
-  "queries": [
-    {{"name": "string", "sql": "SELECT ...;"}}
-  ]
-}}
 
 Rule:
 - Chỉ SELECT/WITH
@@ -69,12 +81,6 @@ cầu và trích xuất tham số. Nếu KHÔNG có template nào phù hợp, tr
 Danh sách template:
 {report_templates.render_catalog()}
 
-Output JSON DUY NHẤT, không markdown, không giải thích:
-{{
-  "template_id": "<id template>" hoặc null,
-  "params": {{ "ten_tham_so": "giá trị" }}
-}}
-
 Quy tắc:
 - Chỉ chọn template khi yêu cầu khớp rõ ràng; nếu mơ hồ/khác loại, để template_id = null.
 - Điền đủ tham số bắt buộc; tham số chuỗi chỉ lấy từ khoá ngắn gọn (vd 'CRM', 'Lan').
@@ -89,8 +95,15 @@ class ReportAgent:
             timeout=60,
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
+            reasoning_effort="none",
         ) if llm is None else llm
         self.sql_agent = sql_agent or Text2SQLAgent(llm=self.llm)
+        # Structured output (function_calling) cho 2 schema lập kế hoạch báo cáo —
+        # bỏ parse JSON thủ công, LLM trả thẳng object đã validate.
+        self.plan_llm = self.llm.with_structured_output(ReportPlan, method="function_calling")
+        self.template_llm = self.llm.with_structured_output(
+            TemplateSelection, method="function_calling"
+        )
 
     
     async def benmark_time(self, name:str, func, *args, **kwargs):
@@ -100,15 +113,19 @@ class ReportAgent:
         print(f"{name} took {end - start:.2f} seconds")
         return result
     
-    async def generate_report_plan(self, request: str, memory_context: str = "") -> dict:
-      """Tạo kế hoạch báo cáo: gồm loại báo cáo, tiêu đề, tóm tắt ý định, danh sách câu truy vấn SQL cần chạy và hướng dẫn tổng hợp kết quả cuối cùng."""
+    async def generate_report_plan(self, request: str, memory_context: str = "") -> dict[str, Any]:
+      """Tạo kế hoạch báo cáo freeform: danh sách câu truy vấn SQL cần chạy.
+
+      Trả về dict {"need_clarification", "clarification_question", "queries"} đã
+      validate qua structured output (ReportPlan).
+      """
       memory_block = f"\nNgữ cảnh hội thoại trước đó:\n{memory_context}\n" if memory_context else ""
-      prompt = f"{REPORT_SYSTEM_PROMPT}{memory_block}\nYêu cầu báo cáo: {request}\nOutput JSON:"
-      benchmark_result = await self.benmark_time("generate_report_plan", self.llm.ainvoke, [
+      prompt = f"{REPORT_SYSTEM_PROMPT}{memory_block}\nYêu cầu báo cáo: {request}"
+      plan: ReportPlan = await self.benmark_time("generate_report_plan", self.plan_llm.ainvoke, [
           SystemMessage(content=prompt),
           HumanMessage(content="Tạo kế hoạch báo cáo"),
       ])
-      return benchmark_result.content
+      return plan.model_dump()
 
     async def select_template(self, request: str, memory_context: str = "") -> dict[str, Any]:
         """LLM call NHỎ: chọn template báo cáo + trích tham số bị mask.
@@ -117,12 +134,14 @@ class ReportAgent:
         nào, template_id = None để gọi đường fallback freeform.
         """
         memory_block = f"\nNgữ cảnh hội thoại trước đó:\n{memory_context}\n" if memory_context else ""
-        prompt = f"{REPORT_TEMPLATE_PROMPT}{memory_block}\nYêu cầu báo cáo: {request}\nOutput JSON:"
-        result = await self.benmark_time("select_template", self.llm.ainvoke, [
-            SystemMessage(content=prompt),
-            HumanMessage(content="Chọn template báo cáo"),
-        ])
-        return self._parse_report_plan(result.content)
+        prompt = f"{REPORT_TEMPLATE_PROMPT}{memory_block}\nYêu cầu báo cáo: {request}"
+        selection: TemplateSelection = await self.benmark_time(
+            "select_template", self.template_llm.ainvoke, [
+                SystemMessage(content=prompt),
+                HumanMessage(content="Chọn template báo cáo"),
+            ]
+        )
+        return selection.model_dump()
 
     async def _plan_queries(self, request: str, memory_context: str = "") -> dict[str, Any]:
         """Tạo plan query theo hybrid: template-first, fallback freeform.
@@ -147,8 +166,7 @@ class ReportAgent:
             except (KeyError, ValueError) as exc:  # thiếu tham số -> fallback freeform
                 print(f"template build failed ({template_id}), fallback freeform: {exc}")
 
-        raw_plan = await self.generate_report_plan(request, memory_context=memory_context)
-        plan = self._parse_report_plan(raw_plan)
+        plan = await self.generate_report_plan(request, memory_context=memory_context)
         plan["_source"] = "freeform"
         return plan
 
@@ -215,27 +233,6 @@ class ReportAgent:
             HumanMessage(content=prompt),
         ])
         return response.content.strip()
-
-    def _parse_report_plan(self, raw_plan: str | dict[str, Any]) -> dict[str, Any]:
-        if isinstance(raw_plan, dict):
-            return raw_plan
-
-        text = raw_plan.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-            text = re.sub(r"```$", "", text).strip()
-
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            if not match:
-                raise ValueError(f"Report plan is not valid JSON: {raw_plan}")
-            parsed = json.loads(match.group(0))
-
-        if not isinstance(parsed, dict):
-            raise ValueError("Report plan must be a JSON object")
-        return parsed
 
 async def main():
     agent = ReportAgent()

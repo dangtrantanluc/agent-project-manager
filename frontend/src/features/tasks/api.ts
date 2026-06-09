@@ -7,6 +7,7 @@ export type TaskListItem = {
   status: TaskStatus;
   priority: string;
   deadline: string | null;
+  endAt: string | null;
   description: string | null;
   totalHours: number;
   assignee: { id: number; fullName: string; avatarUrl: string | null } | null;

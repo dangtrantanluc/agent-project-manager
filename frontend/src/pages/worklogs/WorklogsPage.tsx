@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Plus, Pencil, Trash2 } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Plus, Pencil, Trash2, Search, X } from "lucide-react";
 import { Link } from "react-router-dom";
 import { deleteWorklog, listWorklogs, type Worklog } from "@/features/worklogs/api";
 import { listProjects } from "@/features/projects/api";
@@ -41,8 +41,33 @@ export function WorklogsPage() {
     onError: (e: any) => toast.error(e.response?.data?.error?.message ?? "Thất bại"),
   });
 
-  const items = listQ.data?.data ?? [];
+  // Lọc client-side trên worklog đã tải (tối đa 500).
+  const [q, setQ] = useState("");
+  const [projectFilter, setProjectFilter] = useState<"" | number>("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
+  const all = listQ.data?.data ?? [];
+
+  const projectOptions = useMemo(() => {
+    const m = new Map<number, string>();
+    all.forEach((w) => m.set(w.project.id, w.project.name));
+    return [...m].map(([id, name]) => ({ id, name }));
+  }, [all]);
+
+  const items = useMemo(() => {
+    const kw = q.trim().toLowerCase();
+    return all.filter((w) => {
+      if (kw && !(w.task?.name?.toLowerCase().includes(kw) || w.description?.toLowerCase().includes(kw))) return false;
+      if (projectFilter !== "" && w.project.id !== projectFilter) return false;
+      if (from && w.workDate.slice(0, 10) < from) return false;
+      if (to && w.workDate.slice(0, 10) > to) return false;
+      return true;
+    });
+  }, [all, q, projectFilter, from, to]);
+
   const totalHours = items.reduce((s, w) => s + Number(w.hours), 0);
+  const hasFilter = q || projectFilter !== "" || from || to;
 
   const handleStartCreate = () => {
     setCreateProjectId(undefined);
@@ -77,8 +102,46 @@ export function WorklogsPage() {
         )}
       </div>
 
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative">
+          <Search className="absolute left-2 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            className="input w-56 pl-8"
+            placeholder="Tìm task / mô tả…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
+        </div>
+        {projectOptions.length > 1 && (
+          <select
+            className="input w-52"
+            value={projectFilter}
+            onChange={(e) => setProjectFilter(e.target.value === "" ? "" : Number(e.target.value))}
+          >
+            <option value="">Mọi dự án</option>
+            {projectOptions.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        )}
+        <div className="flex items-center gap-1 text-sm text-slate-500">
+          <span>Ngày</span>
+          <input type="date" className="input w-36" value={from} onChange={(e) => setFrom(e.target.value)} title="Từ ngày" />
+          <span>→</span>
+          <input type="date" className="input w-36" value={to} onChange={(e) => setTo(e.target.value)} title="Đến ngày" />
+        </div>
+        {hasFilter && (
+          <button
+            className="btn-secondary flex items-center gap-1 text-sm"
+            onClick={() => { setQ(""); setProjectFilter(""); setFrom(""); setTo(""); }}
+          >
+            <X className="h-4 w-4" /> Xóa lọc
+          </button>
+        )}
+      </div>
+
       <div className="grid gap-4 md:grid-cols-2">
-        <Kpi label="Số worklog" value={listQ.data?.meta.total ?? 0} />
+        <Kpi label="Số worklog" value={items.length} />
         <Kpi label="Tổng giờ" value={formatHours(totalHours)} />
       </div>
 
@@ -154,7 +217,7 @@ export function WorklogsPage() {
             {!listQ.isLoading && items.length === 0 && (
               <tr>
                 <td colSpan={mode === "all" ? 7 : 6} className="p-6 text-center text-slate-500">
-                  Trống
+                  {all.length === 0 ? "Trống" : "Không có worklog khớp bộ lọc."}
                 </td>
               </tr>
             )}
