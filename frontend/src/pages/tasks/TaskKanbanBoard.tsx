@@ -15,7 +15,7 @@ import { listTasks, updateTask, deleteTask, type TaskListItem } from "@/features
 import type { TaskStatus } from "@bb-pm/shared";
 import { Badge } from "@/components/ui/Badge";
 import { StatusSelect } from "@/components/ui/StatusSelect";
-import { statusColors, statusLabels, priorityColors, formatDate } from "@/lib/format";
+import { statusColors, statusLabels, priorityColors, formatDate, deadlineState, deadlineTextClass, deadlineRowClass } from "@/lib/format";
 import { Pencil, Trash2, Plus, Upload, List, LayoutGrid, Search, X } from "lucide-react";
 import { TaskFormModal } from "./TaskFormModal";
 import { ImportTasksModal } from "@/pages/projects/ImportTasksModal";
@@ -368,10 +368,16 @@ function TaskListView({
           </tr>
         </thead>
         <tbody>
-          {tasks.map((t) => (
+          {tasks.map((t) => {
+            const rowDs = deadlineState(t.deadline, t.status);
+            // Hàng quá hạn/sắp đến hạn -> tô nền; còn lại giữ hover xám mặc định.
+            const rowClass = rowDs === "normal"
+              ? "hover:bg-slate-50 dark:hover:bg-slate-900/50"
+              : deadlineRowClass[rowDs];
+            return (
             <tr
               key={t.id}
-              className="group border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-900/50"
+              className={`group border-t border-slate-100 dark:border-slate-800 ${rowClass}`}
             >
               <td className="px-3 py-2 font-medium text-slate-900 dark:text-slate-100">{t.name}</td>
               <td className="px-3 py-2">
@@ -386,7 +392,18 @@ function TaskListView({
               </td>
               <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{t.assignee?.fullName ?? "—"}</td>
               <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{t.milestone?.name ?? "—"}</td>
-              <td className="whitespace-nowrap px-3 py-2 text-slate-500">{t.deadline ? formatDate(t.deadline) : "—"}</td>
+              {(() => {
+                const ds = deadlineState(t.deadline, t.status);
+                return (
+                  <td
+                    className={`whitespace-nowrap px-3 py-2 ${deadlineTextClass[ds] || "text-slate-500"}`}
+                    title={ds === "overdue" ? "Quá hạn" : ds === "due-soon" ? "Sắp đến hạn" : undefined}
+                  >
+                    {ds === "overdue" && "⚠ "}
+                    {t.deadline ? formatDate(t.deadline) : "—"}
+                  </td>
+                );
+              })()}
               {canEdit && (
                 <td className="px-3 py-2 text-right">
                   <div className="flex justify-end opacity-0 group-hover:opacity-100">
@@ -400,7 +417,8 @@ function TaskListView({
                 </td>
               )}
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -495,7 +513,14 @@ function TaskCard({
         <span>{task.assignee?.fullName ?? "—"}</span>
         <Badge className={priorityColors[task.priority]}>{task.priority}</Badge>
       </div>
-      {task.deadline && <p className="mt-1 text-xs text-slate-400">📅 {formatDate(task.deadline)}</p>}
+      {task.deadline && (() => {
+        const ds = deadlineState(task.deadline, task.status);
+        return (
+          <p className={`mt-1 text-xs ${deadlineTextClass[ds] || "text-slate-400"}`}>
+            {ds === "overdue" ? "⚠" : "📅"} {formatDate(task.deadline)}
+          </p>
+        );
+      })()}
       {task.milestone && <p className="mt-0.5 text-xs text-slate-400">🏁 {task.milestone.name}</p>}
     </div>
   );

@@ -17,6 +17,9 @@ load_dotenv()
 
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
 
+# Số lần thử lại tối đa khi LLM lỗi/timeout trước khi trả câu xin lỗi.
+DEFAULT_MAX_RETRIES = 3
+
 def _tone_context(timezone_name: str | None = None) -> str:
     try:
         now = datetime.now(ZoneInfo(timezone_name or DEFAULT_TIMEZONE))
@@ -48,7 +51,7 @@ class ConversationAgent:
             base_url=os.getenv("BASE_URL"),
         ) if llm is None else llm
         # Đặt các tham số
-        self.max_retries = 3
+        self.max_retries = DEFAULT_MAX_RETRIES
         # Tạo prompt cho cuộc trò chuyện
         self.conversation_prompt = ChatPromptTemplate.from_messages([
             (

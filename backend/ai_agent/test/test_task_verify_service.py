@@ -1,4 +1,4 @@
-"""Test TaskVerifyAgent: xác minh claim "đã hoàn thành" mà KHÔNG tự đổi tasks.status.
+"""Test TaskVerifyService: xác minh claim "đã hoàn thành" mà KHÔNG tự đổi tasks.status.
 
 Bất biến quan trọng được test:
   - task chưa DONE -> nhắc user tự cập nhật, KHÔNG có UPDATE tasks.
@@ -6,9 +6,8 @@ Bất biến quan trọng được test:
   - không có ngữ cảnh -> hỏi lại user task nào, không ghi follow-up.
   - không phải assignee -> không ghi gì.
 
-Không gọi LLM/mạng: dùng _FakeSession trả kết quả theo SQL substring.
-ConversationAgent() được khởi tạo trong TaskVerifyAgent chỉ để dùng _first_name
-(không phát request).
+Không gọi LLM/mạng: dùng _FakeSession trả kết quả theo SQL substring, và
+_FakeLLM để ép tất định (TaskVerifyService(llm=...)).
 """
 import asyncio
 import sys
@@ -18,7 +17,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from ai_agent.task_update.task_verify_agent import TaskVerifyAgent
+from ai_agent.task_update.task_verify_service import TaskFacts, TaskVerifyService
 
 
 class _Result:
@@ -54,8 +53,28 @@ class _FakeSession:
 PROFILE = {"full_name": "Trần Tấn Lực"}
 
 
+class _FakeMessage:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeLLM:
+    """LLM giả: trả content cố định, hoặc raise nếu fail=True."""
+
+    def __init__(self, content="", fail=False):
+        self._content = content
+        self._fail = fail
+
+    def invoke(self, prompt):
+        if self._fail:
+            raise RuntimeError("LLM down")
+        return _FakeMessage(self._content)
+
+
 def _agent():
-    return TaskVerifyAgent()
+    # Dùng FakeLLM(fail=True) để ép fallback tất định — KHÔNG gọi LLM/mạng thật.
+    # (Truyền llm=None sẽ khiến __init__ tự tạo ChatOpenAI từ env, mất tất định.)
+    return TaskVerifyService(llm=_FakeLLM(fail=True))
 
 
 def test_pending_followup_not_done_returns_nudge():
@@ -124,3 +143,48 @@ def test_audit_fallback_resolves_single_task():
     assert "Cần làm" in out["message"]
     # Resolve qua audit -> không có follow-up row để cập nhật
     assert not any("update agent_follow_ups" in s for s, _ in db.statements)
+
+
+def test_narrate_prompt_forbids_praise_when_not_done():
+    # Prompt narrate cho ca CHƯA done phải chứa ràng buộc cấm khen + nêu rõ chưa xong.
+    agent = TaskVerifyService(llm=_FakeLLM(fail=True))
+    facts = TaskFacts(
+        task_id=5, follow_up_id=99, task_name="[1.4] Tỷ giá hối đoái tự động",
+        status="IN_PROGRESS", is_assignee=True,
+    )
+    prompt = agent._narrate_prompt(facts, PROFILE)
+    assert "CHƯA Hoàn thành" in prompt
+    assert "KHÔNG khen" in prompt
+    assert "Đang làm" in prompt  # nhãn trạng thái thực tế được nhúng
+
+
+def test_llm_error_falls_back_to_deterministic():
+    # LLM raise -> narrate phải trả câu fallback tất định (chứa "vẫn"/"Đang làm").
+    db = _FakeSession({
+        "from agent_follow_ups": [(99, 5)],
+        "from tasks": [(5, "[1.4] Tỷ giá hối đoái tự động", "IN_PROGRESS")],
+    })
+    agent = TaskVerifyService(llm=_FakeLLM(fail=True))
+    out = asyncio.run(agent.verify(
+        message="tôi update rồi", user_id="10", thread_id="t1",
+        user_profile=PROFILE, db=db,
+    ))
+    assert "vẫn" in out["message"] and "Đang làm" in out["message"]
+    assert "Hoàn thành. Cảm ơn" not in out["message"]  # không khen nhầm
+
+
+def test_llm_narration_used_when_available():
+    # LLM ok -> dùng output của LLM (không phải template).
+    db = _FakeSession({
+        "from agent_follow_ups": [(99, 5)],
+        "from tasks": [(5, "Task X", "IN_PROGRESS")],
+    })
+    agent = TaskVerifyService(llm=_FakeLLM(content="Câu do LLM sinh."))
+    out = asyncio.run(agent.verify(
+        message="tôi update rồi", user_id="10", thread_id="t1",
+        user_profile=PROFILE, db=db,
+    ))
+    assert out["message"] == "Câu do LLM sinh."
+    # Vẫn mark follow-up REPLIED, KHÔNG update tasks
+    assert any("update agent_follow_ups" in s for s, _ in db.statements)
+    assert not any("update tasks" in s for s, _ in db.statements)

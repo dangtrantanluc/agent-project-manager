@@ -286,6 +286,53 @@ async def tasks_hygiene(
     return {"noAssignee": no_assignee, "noDeadline": no_deadline, "overdue": overdue, "stale": stale}
 
 
+@router.get("/candidates")
+async def task_candidates(
+    project_id: int = Query(alias="projectId"),
+    q: Optional[str] = Query(default=None),
+    limit: int = Query(default=8, ge=1, le=20),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Task gợi ý để log worklog: ưu tiên task của chính user -> deadline gần ->
+    vừa cập nhật, loại task DONE. Dùng cho quick-add trên web (giảm friction tìm
+    task). Cùng logic với menu check-in Gapo (list_task_candidates).
+
+    ĐẶT TRƯỚC route /{task_id} để FastAPI không match "candidates" thành id.
+    """
+    uid = current_user["id"]
+    # MEMBER/VIEWER chỉ xem được dự án mình có quyền (chống IDOR), giống GET /tasks.
+    if is_restricted(current_user):
+        ok = (await db.execute(
+            text(f"SELECT 1 WHERE {project_access_exists_sql(':pid')}"),
+            {"pid": project_id, "access_uid": uid},
+        )).fetchone()
+        if not ok:
+            raise HTTPException(status_code=403, detail="Không có quyền truy cập dự án này")
+
+    params: dict = {"pid": project_id, "uid": uid, "lim": limit}
+    q_clause = ""
+    if q:
+        q_clause = "AND name ILIKE :q"
+        params["q"] = f"%{q}%"
+    rows = (await db.execute(text(f"""
+        SELECT id, name, status::text, deadline, assignee_id
+        FROM tasks
+        WHERE project_id = :pid AND status::text <> 'DONE' {q_clause}
+        ORDER BY
+          CASE WHEN assignee_id = :uid THEN 0 ELSE 1 END,
+          deadline ASC NULLS LAST,
+          updated_at DESC
+        LIMIT :lim
+    """), params)).fetchall()
+    return {"data": [
+        {"id": r[0], "name": r[1], "status": r[2],
+         "deadline": r[3].isoformat() if r[3] else None,
+         "assigneeId": r[4], "mine": r[4] == uid}
+        for r in rows
+    ]}
+
+
 @router.get("/{task_id}")
 async def get_task(
     task_id: int,

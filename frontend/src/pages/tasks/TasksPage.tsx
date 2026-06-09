@@ -6,7 +6,7 @@ import { listTasks, updateTask, type TaskListItem } from "@/features/tasks/api";
 import { useAuth } from "@/features/auth/store";
 import { Badge } from "@/components/ui/Badge";
 import { StatusSelect } from "@/components/ui/StatusSelect";
-import { formatDate, priorityColors, statusColors, statusLabels } from "@/lib/format";
+import { formatDate, priorityColors, statusColors, statusLabels, deadlineState, deadlineTextClass, deadlineRowClass } from "@/lib/format";
 import type { TaskStatus } from "@bb-pm/shared";
 import { TaskFormModal } from "./TaskFormModal";
 
@@ -136,10 +136,15 @@ export function TasksPage() {
             </tr>
           </thead>
           <tbody>
-            {tasks.map((t) => (
+            {tasks.map((t) => {
+              const rowDs = deadlineState(t.deadline, t.status);
+              const rowClass = rowDs === "normal"
+                ? "hover:bg-slate-50 dark:hover:bg-slate-800/50"
+                : deadlineRowClass[rowDs];
+              return (
               <tr
                 key={t.id}
-                className="cursor-pointer border-b border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50"
+                className={`cursor-pointer border-b border-slate-100 dark:border-slate-800 ${rowClass}`}
                 onClick={() => setEditing(t)}
               >
                 <td className="p-3 font-medium">{t.name}</td>
@@ -161,9 +166,21 @@ export function TasksPage() {
                 </td>
                 <td className="p-3"><Badge className={priorityColors[t.priority]}>{t.priority}</Badge></td>
                 <td className="p-3 text-slate-500">{t.assignee?.fullName ?? "—"}</td>
-                <td className="p-3 text-slate-500">{formatDate(t.deadline)}</td>
+                {(() => {
+                  const ds = deadlineState(t.deadline, t.status);
+                  return (
+                    <td
+                      className={`p-3 ${deadlineTextClass[ds] || "text-slate-500"}`}
+                      title={ds === "overdue" ? "Quá hạn" : ds === "due-soon" ? "Sắp đến hạn" : undefined}
+                    >
+                      {ds === "overdue" && "⚠ "}
+                      {formatDate(t.deadline)}
+                    </td>
+                  );
+                })()}
               </tr>
-            ))}
+              );
+            })}
             {tasks.length === 0 && (
               <tr><td colSpan={6} className="p-6 text-center text-sm text-slate-500">Không có task nào.</td></tr>
             )}

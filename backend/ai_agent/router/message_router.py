@@ -16,10 +16,21 @@ from ai_agent.report_generator.report_agent import ReportAgent
 from ai_agent.router.router import PMMultiAgentRouter
 from ai_agent.text_to_sql.text2sql import Text2SQLAgent
 from ai_agent.notification.notification_agent import NotificationAgent
-from ai_agent.task_update.task_verify_agent import TaskVerifyAgent
+from ai_agent.task_update.task_verify_service import TaskVerifyService
 
 logger = logging.getLogger(__name__)
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
+
+# Số dòng tối đa hiển thị khi liệt kê kết quả truy vấn thô (text2sql không tự
+# diễn giải được); dư ra thì gộp thành dòng "... và N dòng khác".
+MAX_DISPLAYED_ROWS = 10
+
+# Câu user KHẲNG ĐỊNH đã hoàn thành/cập nhật một task đã được nhắc trước đó.
+# Dùng cả ở _keyword_agent (fallback) lẫn _fallback_agent_for_message (ép verify).
+TASK_UPDATE_KEYWORDS = (
+    "update rồi", "đã update", "xong rồi", "đã xong",
+    "hoàn thành rồi", "done", "làm xong", "cập nhật rồi",
+)
 
 @dataclass
 class AgentReply:
@@ -35,7 +46,7 @@ class AgentMessageRouter:
         self.report_agent = ReportAgent()
         self.planning_agent = PlanningAgent()
         self.notification_agent = NotificationAgent()
-        self.task_verify_agent = TaskVerifyAgent()
+        self.task_verify_service = TaskVerifyService()
 
     async def handle_message(
         self,
@@ -144,6 +155,17 @@ class AgentMessageRouter:
         định/không chắc). Mọi trường hợp khác giữ nguyên danh sách LLM trả về.
         """
         agents = [a for a in selected if a] or ["conversation"]
+
+        # Câu xác nhận hoàn thành ("xong rồi"/"done"...) PHẢI vào verify bất kể LLM
+        # phân vào đâu — đây là root-cause fix (LLM hay phân nhầm sang notification/
+        # conversation rồi tự "khen" mà chưa kiểm DB). Trả độc quyền ["task_update"]:
+        # câu này chỉ có một ý định, chạy thêm agent khác chỉ gộp 2 đoạn mâu thuẫn.
+        # Verify tự kiểm có follow-up không; không có thì hỏi lại, vô hại.
+        # (Edge: "làm xong báo cáo giúp tôi" cũng rơi vào đây — hiếm, chấp nhận.)
+        lowered = message.lower()
+        if any(kw in lowered for kw in TASK_UPDATE_KEYWORDS):
+            return ["task_update"]
+
         if agents == ["conversation"]:
             # LLM không chắc → cứu intent bằng từ khoá tiếng Việt.
             keyword_agent = self._keyword_agent(message)
@@ -159,16 +181,7 @@ class AgentMessageRouter:
 
     def _keyword_agent(self, message: str) -> str:
         lowered = message.lower()
-        task_update_keywords = (
-            "update rồi",
-            "đã update",
-            "xong rồi",
-            "đã xong",
-            "hoàn thành rồi",
-            "done",
-            "làm xong",
-            "cập nhật rồi",
-        )
+        task_update_keywords = TASK_UPDATE_KEYWORDS
         planning_keywords = ("lập kế hoạch", "kế hoạch", "phân chia công việc", "milestone")
         report_keywords = ("báo cáo", "thống kê", "report", "tiến độ tổng thể")
         notification_keywords = ("thông báo", "nhắc nhở", "reminder", "notification")
@@ -246,7 +259,7 @@ class AgentMessageRouter:
                 user_profile=user_profile or {},
                 timezone_name=self._timezone_name(metadata),
             )
-            return self._format_conversation(result)
+            return self._extract_message(result)
 
         if agent_name == "text2sql":
             user_role = (user_profile or {}).get("role")
@@ -277,17 +290,17 @@ class AgentMessageRouter:
                 message=message,
                 memory_context=memory_context,
             )
-            return self._format_notification(result)
+            return self._extract_message(result)
 
         if agent_name == "task_update":
-            result = await self.task_verify_agent.verify(
+            result = await self.task_verify_service.verify(
                 message=message,
                 user_id=user_id,
                 memory_context=memory_context,
                 thread_id=thread_id,
                 user_profile=user_profile or {},
             )
-            return self._format_task_update(result)
+            return self._extract_message(result)
 
         result = await self.conversation_agent.process_message_async(
             message,
@@ -295,7 +308,7 @@ class AgentMessageRouter:
             user_profile=user_profile or {},
             timezone_name=self._timezone_name(metadata),
         )
-        return self._format_conversation(result)
+        return self._extract_message(result)
 
     async def _load_memory_context_new_session(self, conversation_id: str) -> str:
         t = time.perf_counter()
@@ -434,9 +447,17 @@ class AgentMessageRouter:
             return str(metadata["timezone"])
         return DEFAULT_TIMEZONE
 
-    def _format_conversation(self, result: Any) -> str:
+    def _extract_message(self, result: Any) -> str:
+        """Bóc text gửi được từ result kiểu prose-đơn (conversation/notification/
+        task_update): dict thì lấy 'message'/'answer', còn lại ép str.
+
+        Object có thuộc tính ``message`` (vd dataclass của NotificationAgent) cũng
+        được hỗ trợ để không phải đối tượng nào cũng phải là dict.
+        """
         if isinstance(result, dict):
             return str(result.get("message") or result.get("answer") or result)
+        if hasattr(result, "message"):
+            return str(result.message)
         return str(result)
 
     def _format_text2sql(self, result: dict) -> str:
@@ -454,15 +475,15 @@ class AgentMessageRouter:
             return "Mình chưa tìm thấy dữ liệu phù hợp."
 
         lines = ["Kết quả truy vấn:"]
-        for index, row in enumerate(rows[:10], start=1):
+        for index, row in enumerate(rows[:MAX_DISPLAYED_ROWS], start=1):
             if isinstance(row, dict):
                 values = ", ".join(f"{key}: {value}" for key, value in row.items())
                 lines.append(f"{index}. {values}")
             else:
                 lines.append(f"{index}. {row}")
 
-        if len(rows) > 10:
-            lines.append(f"... và {len(rows) - 10} dòng khác.")
+        if len(rows) > MAX_DISPLAYED_ROWS:
+            lines.append(f"... và {len(rows) - MAX_DISPLAYED_ROWS} dòng khác.")
         return "\n".join(lines)
 
     def _format_report(self, result: Any) -> str:
@@ -489,33 +510,6 @@ class AgentMessageRouter:
             return json.dumps(result.model_dump(), ensure_ascii=False, indent=2)
         if hasattr(result, "dict"):
             return json.dumps(result.dict(), ensure_ascii=False, indent=2)
-        return str(result)
-
-    def _format_notification(self, result: Any) -> str:
-        if hasattr(result, "message"):
-            return str(result.message)
-        if isinstance(result, dict):
-            return str(result.get("message") or result)
-        return str(result)
-
-    def _format_task_update(self, result: Any) -> str:
-        if isinstance(result, dict):
-            return str(result.get("message") or result)
-        return str(result)
-
-    def _format_agent_result(self, agent_name: str, result: Any) -> str:
-        if agent_name == "conversation":
-            return self._format_conversation(result)
-        if agent_name == "text2sql" and isinstance(result, dict):
-            return self._format_text2sql(result)
-        if agent_name == "report":
-            return self._format_report(result.get("answer") if isinstance(result, dict) else result)
-        if agent_name == "planning":
-            if isinstance(result, dict) and result.get("answer"):
-                return str(result["answer"])
-            return self._format_planning(result)
-        if agent_name == "notification":
-            return self._format_notification(result)
         return str(result)
 
     def _jsonable(self, value: Any) -> Any:

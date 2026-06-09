@@ -27,6 +27,29 @@ export type TaskListParams = {
   sort?: string;
 };
 
+/** Task gợi ý để log worklog: ưu tiên task của user -> deadline gần -> mới cập
+ * nhật, loại DONE. Dùng cho quick-add (giảm friction tìm task). */
+export type TaskCandidate = {
+  id: number;
+  name: string;
+  status: TaskStatus;
+  deadline: string | null;
+  assigneeId: number | null;
+  mine: boolean;
+};
+
+export async function listTaskCandidates(params: {
+  projectId: number;
+  q?: string;
+  limit?: number;
+}) {
+  const { data } = await apiClient.get<{ data: TaskCandidate[] } | TaskCandidate[]>(
+    "/tasks/candidates",
+    { params },
+  );
+  return Array.isArray(data) ? data : data.data;
+}
+
 export async function listTasks(params: TaskListParams = {}) {
   const { data } = await apiClient.get<
     TaskListItem[] | {

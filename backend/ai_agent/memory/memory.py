@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 MAX_TURNS = 5
 
+# Tóm tắt hội thoại sau mỗi N lượt để nén lịch sử dài (tránh gọi LLM mỗi lượt).
+SUMMARIZE_EVERY_N_TURNS = 4
+
 MEMORY_SUMMARY_SYSTEM_PROMPT = """
 Bạn là bộ tóm tắt memory cho PM chatbot quản lý dự án.
 
@@ -191,7 +194,7 @@ async def save_memory(
     turn_count = inserted_row[1] or 0
     await db.commit()
 
-    if turn_count % 4 != 0:
+    if turn_count % SUMMARIZE_EVERY_N_TURNS != 0:
         return
 
     try:

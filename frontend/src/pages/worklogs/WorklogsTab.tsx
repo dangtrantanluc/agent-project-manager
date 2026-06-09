@@ -5,6 +5,7 @@ import { deleteWorklog, listWorklogs, type Worklog } from "@/features/worklogs/a
 import { formatDate, formatHours } from "@/lib/format";
 import { useAuth } from "@/features/auth/store";
 import { WorklogFormModal } from "./WorklogFormModal";
+import { QuickLogRow } from "./QuickLogRow";
 import { toast } from "sonner";
 
 export function WorklogsTab({ projectId }: { projectId: number }) {
@@ -70,10 +71,13 @@ export function WorklogsTab({ projectId }: { projectId: number }) {
             {totalHours > 0 && ` · ${formatHours(totalHours)} tổng`}
           </span>
         </div>
-        <button className="btn-primary" onClick={() => setCreating(true)}>
-          <Plus className="mr-1 h-4 w-4" /> Log giờ
+        <button className="btn-secondary" onClick={() => setCreating(true)}>
+          <Plus className="mr-1 h-4 w-4" /> Log giờ chi tiết
         </button>
       </div>
+
+      {/* Ghi nhanh: task gợi ý sẵn + giờ + Enter, không cần mở modal. */}
+      <QuickLogRow projectId={projectId} />
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative">

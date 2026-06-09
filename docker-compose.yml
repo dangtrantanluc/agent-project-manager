@@ -7,8 +7,11 @@ services:
       POSTGRES_DB: agent_pm
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
+    # Chỉ phơi trong mạng Docker nội bộ (backend gọi qua hostname `db`).
+    # KHÔNG map ra host để tránh phơi DB ra ngoài. Cần truy cập từ host khi
+    # debug? Tạm thêm: ports: ["127.0.0.1:5432:5432"].
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Schema hợp nhất (source of truth) + seed demo. Init chỉ chạy khi volume rỗng.
@@ -30,8 +33,9 @@ services:
     container_name: redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
+    # Chỉ nội bộ (backend gọi qua hostname `redis`). Không map ra host.
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -69,8 +73,10 @@ services:
       # URL công khai trình duyệt dùng để tải ảnh (qua port S3 expose ra host).
       MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-http://localhost:9000}
     working_dir: /app
-    ports:
-      - "8000:8000"
+    # Backend chỉ phơi nội bộ; frontend nginx proxy /api/ & /uploads/ về
+    # backend:8000. Không map ra host để không phơi API trực tiếp ra ngoài.
+    expose:
+      - "8000"
     depends_on:
       db:
         condition: service_healthy
@@ -91,15 +97,16 @@ services:
     container_name: frontend
     restart: unless-stopped
     ports:
-      - "${WEB_PORT:-5173}:80"
+      - "${FE_PORT:-8090}:80"
     depends_on:
       - backend
       
   9router:
     image: decolua/9router:latest
     container_name: 9router
-    ports:
-      - "20128:20128"
+    # Proxy LLM nội bộ (backend/agent gọi qua hostname `9router`). Không map ra host.
+    expose:
+      - "20128"
     volumes:
       - ./data:/app/data
     environment:
@@ -114,8 +121,12 @@ services:
     container_name: minio_server
     restart: unless-stopped
     ports:
-      - "9000:9000" # S3 API Port
-      - "9001:9001" # Web Console Port
+      # S3 API: trình duyệt tải avatar trực tiếp qua MINIO_PUBLIC_URL nên CẦN
+      # phơi ra host. Web console (9001) KHÔNG public — chỉ expose nội bộ;
+      # cần xem console thì tạm map "127.0.0.1:9001:9001".
+      - "9000:9000"
+    expose:
+      - "9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}

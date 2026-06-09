@@ -15,6 +15,50 @@ export function formatHours(v: number | null | undefined) {
   return `${v.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}h`;
 }
 
+/** Số ngày tới hạn được coi là "sắp đến hạn" (cảnh báo sớm). */
+const DUE_SOON_DAYS = 3;
+
+export type DeadlineState = "overdue" | "due-soon" | "normal";
+
+/**
+ * Trạng thái deadline của một task (để tô màu cột Deadline).
+ *  - overdue : đã quá hạn (deadline < hôm nay)
+ *  - due-soon: sắp đến hạn (hôm nay .. +3 ngày)
+ *  - normal  : còn xa / không có deadline / task đã Xong|Hủy
+ * Task đã DONE/CANCELLED không cảnh báo (đã xong, hạn không còn ý nghĩa).
+ */
+export function deadlineState(
+  deadline: string | null | undefined,
+  status?: string,
+): DeadlineState {
+  if (!deadline) return "normal";
+  if (status === "DONE" || status === "CANCELLED") return "normal";
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const due = new Date(deadline);
+  due.setHours(0, 0, 0, 0);
+
+  const diffDays = Math.round((due.getTime() - today.getTime()) / 86_400_000);
+  if (diffDays < 0) return "overdue";
+  if (diffDays <= DUE_SOON_DAYS) return "due-soon";
+  return "normal";
+}
+
+/** Class Tailwind cho text deadline theo trạng thái (đỏ-đậm quá hạn, hổ phách sắp tới). */
+export const deadlineTextClass: Record<DeadlineState, string> = {
+  overdue: "font-semibold text-rose-600 dark:text-rose-400",
+  "due-soon": "text-amber-600 dark:text-amber-400",
+  normal: "",
+};
+
+/** Class nền cho CẢ HÀNG task theo trạng thái deadline (kèm hover đậm hơn). */
+export const deadlineRowClass: Record<DeadlineState, string> = {
+  overdue: "bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/30 dark:hover:bg-rose-950/50",
+  "due-soon": "bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/30 dark:hover:bg-amber-950/50",
+  normal: "",
+};
+
 export const statusColors: Record<string, string> = {
   TODO: "bg-slate-100 text-slate-700",
   PLANNED: "bg-slate-100 text-slate-700",

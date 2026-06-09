@@ -118,6 +118,14 @@ def test_fallback_conversation_only(router):
     assert router._fallback_agent_for_message("chào bạn", ["conversation"]) == ["conversation"]
 
 
+def test_fallback_completion_claim_forces_task_update(router):
+    # Root-cause fix: câu xác nhận hoàn thành PHẢI vào task_update kể cả khi LLM
+    # phân nhầm sang notification/conversation. Trả ĐỘC QUYỀN ["task_update"].
+    assert router._fallback_agent_for_message("tôi update rồi", ["notification"]) == ["task_update"]
+    assert router._fallback_agent_for_message("xong rồi nhé", ["conversation", "notification"]) == ["task_update"]
+    assert router._fallback_agent_for_message("done", ["report"]) == ["task_update"]
+
+
 def test_fallback_drops_extra_conversation(router):  # 3a
     # 'conversation' kèm agent nghiệp vụ -> bỏ conversation thừa.
     assert router._fallback_agent_for_message(

@@ -16,7 +16,6 @@ Một câu hỏi PM có thể rất khác nhau về bản chất:
 | "Báo cáo tiến độ tuần này" | Tổng hợp nhiều truy vấn + diễn giải | `report` |
 | "Giúp tôi lập kế hoạch dự án X" | Sinh nội dung có cấu trúc | `planning` |
 | "Tạo thông báo nhắc deadline thứ 6" | Sinh nội dung thông báo | `notification` |
-| "Tôi update task ABC rồi nhé" | Xác minh & cập nhật trạng thái task | `task_update` |
 | "Chào bạn" | Hội thoại tự nhiên | `conversation` |
 
 Thay vì nhồi tất cả vào **một** prompt khổng lồ (vừa chậm, vừa khó kiểm soát, vừa dễ "ảo giác"), hệ thống chia thành **các agent chuyên biệt**, mỗi agent có prompt + logic riêng. Một **router** đứng trước phân loại ý định và chọn **một hoặc nhiều** agent phù hợp; nếu chọn nhiều, chúng chạy **song song** rồi gộp kết quả.
@@ -29,9 +28,8 @@ flowchart LR
     D -.song song.-> A2[report]
     D -.song song.-> A3[planning]
     D -.song song.-> A4[notification]
-    D -.song song.-> A5[task_update]
-    D -.song song.-> A6[conversation]
-    A1 & A2 & A3 & A4 & A5 & A6 --> C[Gộp kết quả]
+    D -.song song.-> A5[conversation]
+    A1 & A2 & A3 & A4 & A5 --> C[Gộp kết quả]
     C --> U
 ```
 
@@ -74,7 +72,6 @@ backend/ai_agent/
 ├── text_to_sql/text2sql.py  # Text2SQLAgent — NL → SQL → kết quả → diễn giải
 ├── report_generator/        # ReportAgent — template-first, sinh báo cáo
 ├── planning/planning_agent.py  # PlanningAgent — sinh kế hoạch (structured output)
-├── task_update/             # TaskVerifyAgent — xác minh "đã làm xong task X"
 ├── coversation/conversation.py # ConversationAgent — chào hỏi & trợ giúp [sic: thư mục viết sai chính tả]
 ├── notification/            # NotificationAgent — sinh nội dung nhắc nhở + in-app repo
 │
@@ -120,7 +117,7 @@ flowchart TD
 3. **Fail-fast:** `timeout=10, max_retries=1` — phân loại phải nhanh; nếu LLM lỗi/timeout thì trả list rỗng để tầng trên fallback ([router.py:116-126](backend/ai_agent/router/router.py#L116-L126)).
 4. **Mặc định:** nếu không trích được agent nào → `["conversation"]` (`DEFAULT_AGENT`).
 
-`VALID_AGENTS = {report, text2sql, planning, conversation, notification, task_update}` ([router.py:16-23](backend/ai_agent/router/router.py#L16-L23)).
+`VALID_AGENTS = {report, text2sql, planning, conversation, notification, task_update}` ([router.py:16-23](backend/ai_agent/router/router.py#L16-L23)). Trong đó `task_update` là một intent nội bộ — khi user báo đã hoàn thành task đã được nhắc, hệ thống xác minh lại trạng thái trong DB rồi diễn giải bằng LLM (verify-then-narrate). Phần xử lý là một **service tất định** (`TaskVerifyService`, [task_update/task_verify_service.py](backend/ai_agent/task_update/task_verify_service.py)), không phải agent LLM tự quyết — nên không liệt kê ở danh sách agent §4.
 
 ### 4.2 Điều phối — `AgentMessageRouter` ([router/message_router.py](backend/ai_agent/router/message_router.py))
 
@@ -148,7 +145,7 @@ flowchart TD
 ```
 
 - **Chạy song song** việc phân loại ý định, nạp memory, và nạp user profile bằng `asyncio.gather` ([message_router.py:61-66](backend/ai_agent/router/message_router.py#L61-L66)) — cả ba đều I/O-bound.
-- **Fallback bằng từ khoá** ([message_router.py:140-199](backend/ai_agent/router/message_router.py#L140-L199)): chỉ kích hoạt khi LLM trả về **đúng** `["conversation"]` (tức "không chắc"). Lưới từ khoá tiếng Việt ưu tiên `task_update` → `planning` → `report` → `notification` → `text2sql`. Lưu ý `task_update` được kiểm **trước** từ khoá dữ liệu, vì câu "làm xong task X" chứa cả 'task' lẫn 'làm xong'.
+- **Fallback bằng từ khoá** ([message_router.py:140-199](backend/ai_agent/router/message_router.py#L140-L199)): chỉ kích hoạt khi LLM trả về **đúng** `["conversation"]` (tức "không chắc"). Lưới từ khoá tiếng Việt đoán lại intent theo thứ tự ưu tiên: `planning` → `report` → `notification` → `text2sql`.
 - **Loại `conversation` thừa**: nếu LLM chọn nhiều agent gồm cả `conversation`, bỏ `conversation` vì agent nghiệp vụ đã tự chào + trả lời đủ ngữ cảnh.
 - **Chạy mọi agent song song** với `return_exceptions=True` — lỗi 1 agent không làm hỏng cả reply ([message_router.py:87-102](backend/ai_agent/router/message_router.py#L87-L102)).
 - **Gộp kết quả** (`_combine_results`, [message_router.py:201-229](backend/ai_agent/router/message_router.py#L201-L229)): bỏ agent lỗi/rỗng; 1 agent → trả thẳng; ≥2 agent → nối prose bằng dòng trống, **không** gọi LLM lần nữa và **không** thêm nhãn.
@@ -210,30 +207,11 @@ flowchart TD
 
 Sinh **structured output** (`ProjectPlan` Pydantic): tối đa 3 milestone, 2 task/milestone. Pydantic ép LLM trả JSON đúng schema, tránh văn bản tự do.
 
-### 4.6 Task update — `TaskVerifyAgent` ([task_update/task_verify_agent.py](backend/ai_agent/task_update/task_verify_agent.py))
-
-Kích hoạt khi user **khẳng định** đã hoàn thành/cập nhật một task đã được nhắc trước đó ("tôi update rồi", "xong rồi", "done"). Vì câu nói không nêu rõ task nào, agent phải **phân giải task** từ ngữ cảnh:
-
-```mermaid
-flowchart TD
-    C["Claim hoàn thành<br/>('xong rồi', 'done'...)"] --> RF[_resolve_from_followup<br/>follow-up PENDING trong TTL]
-    RF --> RF1{Có ĐÚNG 1<br/>follow-up?}
-    RF1 -->|có| VDB[_verify_with_db<br/>kiểm trạng thái task trong DB]
-    RF1 -->|không| RA[_resolve_from_audit<br/>deadline_notification gần nhất]
-    RA --> RA1{Batch chỉ có<br/>1 task?}
-    RA1 -->|có| VDB
-    RA1 -->|không / mơ hồ| ASK[_ask_which_task<br/>hỏi lại user task nào]
-    VDB --> OUT["dict{type, message, resolved, status, task_id}"]
-    ASK --> OUT
-```
-
-Nguồn phân giải theo thứ tự: follow-up PENDING duy nhất → audit `deadline_notification` (nếu batch chỉ 1 task) → nếu vẫn mơ hồ thì **hỏi lại** user task nào.
-
-### 4.7 Conversation — `ConversationAgent` ([coversation/conversation.py](backend/ai_agent/coversation/conversation.py))
+### 4.6 Conversation — `ConversationAgent` ([coversation/conversation.py](backend/ai_agent/coversation/conversation.py))
 
 Chào hỏi, trợ giúp, câu xã giao. `temperature` cao hơn (sáng tạo hơn), prompt có ngữ cảnh thời gian trong ngày + profile người dùng.
 
-### 4.8 Notification — `NotificationAgent` ([notification/notification_agent.py](backend/ai_agent/notification/notification_agent.py))
+### 4.7 Notification — `NotificationAgent` ([notification/notification_agent.py](backend/ai_agent/notification/notification_agent.py))
 
 Sinh nội dung nhắc deadline thân thiện. **Có fallback template tất định** nếu LLM lỗi — thông báo cần đáng tin, không được "im lặng" khi LLM down. Kèm `inapp_repository.py` để ghi notification in-app song song với nhắc qua Gapo.
 
@@ -327,7 +305,7 @@ flowchart LR
 ```
 
 - **Check-in worklog** ([checkin/scheduler.py](backend/ai_agent/checkin/scheduler.py)): APScheduler chạy 11:50 & 17:50 (giờ VN). Máy trạng thái: chọn dự án → chọn task → nhập giờ. `worklog_parser` bóc số giờ từ câu trả lời tự do.
-- **Nhắc deadline**: `NotificationAgent` + scheduler gửi nhắc qua Gapo + ghi in-app vào giờ cấu hình (`DEADLINE_NOTIFY_HOUR/MINUTE`). Mỗi nhắc tạo follow-up để `task_update` xác minh sau.
+- **Nhắc deadline**: `NotificationAgent` + scheduler gửi nhắc qua Gapo + ghi in-app vào giờ cấu hình (`DEADLINE_NOTIFY_HOUR/MINUTE`).
 
 ---
 
