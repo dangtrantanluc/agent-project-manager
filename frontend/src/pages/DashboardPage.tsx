@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchOverview, type OverviewFilters } from "@/features/dashboard/api";
+import { fetchOverview, fetchTagsSummary, type OverviewFilters } from "@/features/dashboard/api";
+import { TagChips } from "@/components/ui/TagChips";
 import { listProjects } from "@/features/projects/api";
 import { listUsers } from "@/features/users/api";
 import { useAuth } from "@/features/auth/store";
@@ -75,6 +76,9 @@ export function DashboardPage() {
   const overview = overviewQ.data;
   const projectOverview = overview?.projectOverview;
   const progressSummary = overview?.progressSummary;
+
+  const tagsSummaryQ = useQuery({ queryKey: ["dashboard-tags-summary"], queryFn: fetchTagsSummary });
+  const tagRows = tagsSummaryQ.data ?? [];
 
   return (
     <div className="space-y-6 p-6">
@@ -285,6 +289,50 @@ export function DashboardPage() {
           </div>
         </DetailCard>
       </div>
+
+      <DetailCard
+        title="Công việc theo nhãn"
+        icon={<ListChecks className="h-5 w-5" />}
+        actions={<Link to="/tags" className="text-xs font-medium text-brand-700 hover:underline">Quản lý nhãn</Link>}
+      >
+        {tagRows.length === 0 ? (
+          <p className="py-6 text-center text-sm text-slate-500">
+            Chưa có task nào gắn nhãn. Gắn nhãn cho task để theo dõi theo nhóm công việc.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-left text-slate-500">
+                <tr>
+                  <th className="py-2 pr-3 font-medium">Nhãn</th>
+                  <th className="py-2 pr-3 font-medium">Tổng</th>
+                  <th className="py-2 pr-3 font-medium">Hoàn thành</th>
+                  <th className="py-2 pr-3 font-medium">Quá hạn</th>
+                  <th className="py-2 font-medium">Tiến độ</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tagRows.map((r) => (
+                  <tr key={r.id} className="border-t border-slate-100 dark:border-slate-800">
+                    <td className="py-2 pr-3"><TagChips tags={[r]} /></td>
+                    <td className="py-2 pr-3 font-medium">{r.total}</td>
+                    <td className="py-2 pr-3 text-emerald-600">{r.done}</td>
+                    <td className={`py-2 pr-3 ${r.overdue ? "font-medium text-red-600" : "text-slate-400"}`}>{r.overdue}</td>
+                    <td className="py-2">
+                      <div className="flex items-center gap-2">
+                        <div className="h-2 w-24 overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                          <div className="h-full rounded-full bg-blue-600" style={{ width: `${percent(r.done, r.total)}%` }} />
+                        </div>
+                        <span className="text-xs text-slate-500">{percent(r.done, r.total)}%</span>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </DetailCard>
 
     </div>
   );

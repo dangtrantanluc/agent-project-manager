@@ -1,5 +1,6 @@
 import { apiClient } from "@/lib/apiClient";
 import type { ProjectCreateInput, ProjectUpdateInput, ProjectStatus } from "@bb-pm/shared";
+import type { Milestone } from "@/features/milestones/api";
 
 export type ProjectListItem = {
   id: number;
@@ -16,6 +17,8 @@ export type ProjectListItem = {
   customerName: string | null;
   description?: string | null;
   currency: { id: number; code: string; symbol: string } | null;
+  tags: { id: number; name: string; color: string }[];
+  gapoThreadId?: string | null;
 };
 
 type ProjectResponse = ProjectListItem & {
@@ -36,7 +39,23 @@ type ProjectResponse = ProjectListItem & {
     members: number;
     milestones: number;
   };
-  milestones: any[];
+  milestones: Milestone[];
+};
+
+/** Shape thô từ BE trước normalize: scalar luôn có; nested/_count/owner optional
+ * (normalize sẽ điền, dùng _count thay *Count). An toàn hơn `any`. */
+type RawProject = Omit<
+  ProjectResponse,
+  "owner" | "currency" | "tags" | "milestones" | "_count" | "taskCount" | "memberCount"
+> & {
+  owner?: ProjectResponse["owner"];
+  currency?: ProjectResponse["currency"];
+  tags?: ProjectResponse["tags"];
+  milestones?: ProjectResponse["milestones"];
+  taskCount?: number;
+  memberCount?: number;
+  ownerId?: number;
+  _count?: Partial<ProjectResponse["_count"]>;
 };
 
 export type ProjectListParams = {
@@ -95,7 +114,7 @@ export async function transitionProject(id: number, status: ProjectStatus) {
   return normalizeProject("data" in data ? data.data : data);
 }
 
-function normalizeProject(project: any): ProjectResponse {
+function normalizeProject(project: RawProject): ProjectResponse {
   const taskCount = project.taskCount ?? project._count?.tasks ?? 0;
   const worklogCount = project.worklogCount ?? project._count?.worklogs ?? project.backlogCount ?? project._count?.backlogs ?? 0;
   const memberCount = project.memberCount ?? project._count?.members ?? 0;
@@ -115,6 +134,8 @@ function normalizeProject(project: any): ProjectResponse {
     },
     customerName: project.customerName ?? null,
     currency: project.currency ?? null,
+    tags: project.tags ?? [],
+    gapoThreadId: project.gapoThreadId ?? null,
     milestones: project.milestones ?? [],
     _count: {
       tasks: taskCount,

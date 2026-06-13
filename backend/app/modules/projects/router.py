@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Optional
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
@@ -31,7 +32,14 @@ _SELECT_PROJECT = """
            p.owner_id, p.customer_name, p.account_manager_id, p.currency_id,
            p.created_at, p.updated_at,
            o.full_name AS owner_name, o.avatar_url AS owner_avatar,
-           am.full_name AS account_manager_name
+           am.full_name AS account_manager_name,
+           COALESCE((
+               SELECT json_agg(json_build_object('id', tg.id, 'name', tg.name, 'color', tg.color)
+                               ORDER BY tg.name)
+               FROM project_tags pt JOIN tags tg ON tg.id = pt.tag_id
+               WHERE pt.project_id = p.id
+           ), '[]'::json) AS tags,
+           p.gapo_thread_id
     FROM projects p
     LEFT JOIN users o ON o.id = p.owner_id
     LEFT JOIN users am ON am.id = p.account_manager_id
@@ -107,6 +115,11 @@ def _row_to_dict(r) -> dict:
             {"id": r[16], "fullName": r[22]}
             if len(r) > 22 and r[22] else None
         ),
+        "tags": (
+            (json.loads(r[23]) if isinstance(r[23], str) else (r[23] or []))
+            if len(r) > 23 else []
+        ),
+        "gapoThreadId": r[24] if len(r) > 24 else None,
     }
 
 
@@ -135,6 +148,7 @@ def _restricted(current_user: dict) -> bool:
 async def list_projects(
     status: Optional[str] = Query(default=None),
     q: Optional[str] = Query(default=None),
+    tag_id: Optional[int] = Query(default=None, alias="tagId"),
     page_size: int = Query(default=50, ge=1, le=500, alias="pageSize"),
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -147,6 +161,9 @@ async def list_projects(
     if status:
         where += " AND p.status::text = :status"
         params["status"] = status
+    if tag_id:
+        where += " AND EXISTS (SELECT 1 FROM project_tags pt WHERE pt.project_id = p.id AND pt.tag_id = :tag_id)"
+        params["tag_id"] = tag_id
     if q:
         where += " AND (p.name ILIKE :q OR p.code ILIKE :q)"
         params["q"] = f"%{q}%"
@@ -313,6 +330,8 @@ async def update_project(
         "startDate": "start_date", "endDate": "end_date",
         "ownerId": "owner_id", "customerName": "customer_name",
         "accountManagerId": "account_manager_id", "currencyId": "currency_id",
+        # Thread group Gapo để broadcast cảnh báo rủi ro / tin giao việc cho cả nhóm.
+        "gapoThreadId": "gapo_thread_id",
     }
     sets, params = ["updated_at = NOW()"], {"pid": project_id}
     for js, col in field_map.items():

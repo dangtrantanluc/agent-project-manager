@@ -29,10 +29,10 @@ def test_deadline_reminder_type_includes_two_days_before_and_deadline_day():
 
 def test_group_due_deadline_tasks_batches_by_assignee_and_thread():
     rows = [
-        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED"),
-        (2, "Task B", date(2026, 5, 29), 10, "Project X", 1000, "User A", "IN_PROGRESS"),
-        (3, "Task C", date(2026, 6, 2), 11, "Project Y", 2000, "User B", "PLANNED"),
-        (4, "Task D", date(2026, 6, 9), 10, "Project X", 1000, "User A", "PLANNED"),
+        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM"),
+        (2, "Task B", date(2026, 5, 29), 10, "Project X", 1000, "User A", "IN_PROGRESS", "HIGH"),
+        (3, "Task C", date(2026, 6, 2), 11, "Project Y", 2000, "User B", "PLANNED", "LOW"),
+        (4, "Task D", date(2026, 6, 9), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM"),
     ]
 
     grouped, skipped = _group_due_deadline_tasks(rows, date(2026, 5, 27))
@@ -45,8 +45,8 @@ def test_group_due_deadline_tasks_batches_by_assignee_and_thread():
 
 def test_group_due_deadline_tasks_includes_deadline_day_reminder():
     rows = [
-        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED"),
-        (2, "Task B", date(2026, 5, 30), 10, "Project X", 1000, "User A", "IN_PROGRESS"),
+        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM"),
+        (2, "Task B", date(2026, 5, 30), 10, "Project X", 1000, "User A", "IN_PROGRESS", "MEDIUM"),
     ]
 
     grouped, skipped = _group_due_deadline_tasks(rows, date(2026, 5, 29))

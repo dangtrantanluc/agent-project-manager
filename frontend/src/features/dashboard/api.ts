@@ -46,3 +46,17 @@ export async function fetchOverview(filters: OverviewFilters = {}) {
   const { data } = await apiClient.get<{ data: DashboardOverview }>("/dashboard/overview", { params });
   return data.data;
 }
+
+export type TagSummaryRow = {
+  id: number;
+  name: string;
+  color: string;
+  total: number;
+  done: number;
+  overdue: number;
+};
+
+export async function fetchTagsSummary() {
+  const { data } = await apiClient.get<{ data: TagSummaryRow[] }>("/dashboard/tags-summary");
+  return data.data;
+}

@@ -16,6 +16,7 @@ import {
 import type { ProjectStatus } from "@bb-pm/shared";
 import { deleteProject, listProjects, updateProject, type ProjectListItem } from "@/features/projects/api";
 import { Badge } from "@/components/ui/Badge";
+import { TagChips } from "@/components/ui/TagChips";
 import { formatDate, statusColors, statusLabels, priorityColors } from "@/lib/format";
 import { ProjectFormModal } from "./ProjectFormModal";
 import { useAuth } from "@/features/auth/store";
@@ -210,6 +211,7 @@ export function ProjectListPage() {
                 <tr key={p.id} className="border-b border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50">
                   <td className="p-3">
                     <Link to={`/projects/${p.id}`} className="font-medium text-brand-700 hover:underline">{p.name}</Link>
+                    <TagChips tags={p.tags} className="mt-1" />
                   </td>
                   <td className="p-3 text-slate-500">{p.code ?? "—"}</td>
                   <td className="p-3">{p.customerName ?? "—"}</td>
@@ -382,6 +384,7 @@ function ProjectCard({
       </div>
       {project.code && <p className="mt-0.5 text-xs text-slate-400">{project.code}</p>}
       {project.customerName && <p className="mt-1 text-xs text-slate-500">👤 {project.customerName}</p>}
+      <TagChips tags={project.tags} className="mt-2" />
       <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
         <span>{formatDate(project.endDate)}</span>
         <Badge className={priorityColors[project.priority]}>{project.priority}</Badge>

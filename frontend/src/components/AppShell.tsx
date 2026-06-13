@@ -2,7 +2,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "@/features/auth/store";
 import {
   LayoutDashboard, FolderKanban, ListTodo, ClipboardCheck, LogOut,
-  Settings,
+  Settings, Tag,
 } from "lucide-react";
 import { apiClient } from "@/lib/apiClient";
 import { LanguageSwitcher } from "./ui/LanguageSwitcher";
@@ -30,6 +30,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     { to: "/dashboard", label: t("nav.dashboard"), icon: LayoutDashboard },
     { to: "/projects",  label: t("nav.projects"),  icon: FolderKanban },
     { to: "/tasks",     label: t("nav.tasks"),     icon: ListTodo },
+    { to: "/tags",      label: t("nav.tags"),      icon: Tag },
     { to: "/worklogs",  label: t("nav.worklogs"),  icon: ClipboardCheck },
   ];
 
@@ -69,7 +70,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                   : "text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
               }`}
             >
-              <Settings className="h-5 w-5" /> Settings
+              <Settings className="h-5 w-5" /> {t("nav.settings")}
             </Link>
           )}
         </nav>

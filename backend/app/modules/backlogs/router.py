@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
@@ -6,6 +7,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import get_current_user, get_db, require_role, is_restricted, project_access_exists_sql
 
 router = APIRouter(prefix="/backlogs", tags=["backlogs"])
+
+
+def _parse_date(value: object) -> Optional[date]:
+    """Chuỗi ISO -> date object (asyncpg yêu cầu date cho cột DATE, không nhận chuỗi)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
 
 _SELECT = """
     SELECT b.id, b.status, b.source, b.work_date, b.description, b.hours,
@@ -66,6 +78,8 @@ async def list_backlogs(
     status: Optional[str] = Query(default=None),
     date_from: Optional[str] = Query(default=None, alias="workDateFrom"),
     date_to: Optional[str] = Query(default=None, alias="workDateTo"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500, alias="pageSize"),
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -84,16 +98,19 @@ async def list_backlogs(
     if status:
         where += ' AND b.status = CAST(:status AS "BacklogStatus")'; params["status"] = status
     if date_from:
-        where += " AND b.work_date >= :df"; params["df"] = date_from
+        where += " AND b.work_date >= :df"; params["df"] = _parse_date(date_from)
     if date_to:
-        where += " AND b.work_date <= :dt"; params["dt"] = date_to
+        where += " AND b.work_date <= :dt"; params["dt"] = _parse_date(date_to)
 
+    total = (await db.execute(
+        text(f"SELECT COUNT(*) FROM backlogs b {where}"), params)).scalar() or 0
+    params.update({"limit": page_size, "offset": (page - 1) * page_size})
     rows = (await db.execute(
-        text(f"{_SELECT} {where} ORDER BY b.work_date DESC"),
+        text(f"{_SELECT} {where} ORDER BY b.work_date DESC, b.id DESC LIMIT :limit OFFSET :offset"),
         params,
     )).fetchall()
     data = [_row(r) for r in rows]
-    return {"data": data, "meta": {"page": 1, "pageSize": len(data), "total": len(data)}}
+    return {"data": data, "meta": {"page": page, "pageSize": page_size, "total": total}}
 
 
 @router.post("", status_code=201)
@@ -112,14 +129,22 @@ async def create_backlog(
     if target_user_id != current_user["id"] and not is_privileged:
         raise HTTPException(status_code=403, detail="Không có quyền tạo backlog cho người khác")
 
+    # company_id là NOT NULL (không có DEFAULT) -> lấy theo company của project.
+    company_id = (await db.execute(
+        text("SELECT company_id FROM projects WHERE id = :pid"),
+        {"pid": target_project_id},
+    )).scalar()
+    if company_id is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy dự án")
+
     row = (await db.execute(
         text("""
             INSERT INTO backlogs (
                 work_date, description, hours, task_id, project_id,
-                user_id, currency_id, updated_at
+                company_id, user_id, currency_id, updated_at
             ) VALUES (
                 :work_date, :description, :hours, :task_id, :project_id,
-                :user_id, :currency_id, NOW()
+                :company_id, :user_id, :currency_id, NOW()
             )
             RETURNING id, status, source, work_date, description, hours,
                       task_id, project_id, user_id, currency_id,
@@ -128,7 +153,7 @@ async def create_backlog(
         {
             "work_date": body["workDate"], "description": body.get("description"),
             "hours": body["hours"], "task_id": body.get("taskId"),
-            "project_id": target_project_id,
+            "project_id": target_project_id, "company_id": company_id,
             "user_id": body.get("userId", current_user["id"]),
             "currency_id": body.get("currencyId"),
         },

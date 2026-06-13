@@ -8,7 +8,9 @@ import { listMilestones } from "@/features/milestones/api";
 import { listMembers } from "@/features/members/api";
 import { Modal } from "@/components/ui/Modal";
 import { DateField } from "@/components/ui/DateField";
-import { useEffect } from "react";
+import { TagMultiSelect } from "@/components/ui/TagMultiSelect";
+import { setTaskTags } from "@/features/tags/api";
+import { useEffect, useState } from "react";
 import { formatDate, formatHours } from "@/lib/format";
 
 type UserOption = { id: number; fullName: string; email: string };
@@ -46,6 +48,8 @@ export function TaskFormModal({
     resolver: zodResolver(taskCreateSchema),
     defaultValues: { priority: "MEDIUM", status: "TODO" },
   });
+  // Nhãn quản lý ngoài react-hook-form (lưu qua API riêng PUT /tasks/:id/tags).
+  const [selectedTagIds, setSelectedTagIds] = useState<number[]>([]);
 
   useEffect(() => {
     if (task) {
@@ -59,8 +63,10 @@ export function TaskFormModal({
         assigneeId: task.assignee?.id,
         milestoneId: task.milestone?.id,
       });
+      setSelectedTagIds(task.tags?.map((t) => t.id) ?? []);
     } else if (open) {
       form.reset({ priority: "MEDIUM", status: "TODO" });
+      setSelectedTagIds([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [task, open]);
@@ -83,13 +89,23 @@ export function TaskFormModal({
   };
 
   const save = useMutation({
-    mutationFn: async (v: TaskCreateInput) =>
-      task ? updateTask(task.id, buildPatch(v)) : createTask(projectId, v),
+    mutationFn: async (v: TaskCreateInput) => {
+      const saved = task ? await updateTask(task.id, buildPatch(v)) : await createTask(projectId, v);
+      // Đồng bộ nhãn sau khi task đã có id (best-effort: lỗi nhãn không chặn lưu task).
+      try {
+        await setTaskTags(saved.id, selectedTagIds);
+      } catch {
+        /* ignore — task vẫn đã lưu */
+      }
+      return saved;
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tasks"] });
       qc.invalidateQueries({ queryKey: ["worklogs"] });
       qc.invalidateQueries({ queryKey: ["project", projectId] });
       qc.invalidateQueries({ queryKey: ["milestones", projectId] });
+      qc.invalidateQueries({ queryKey: ["tags"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-tags-summary"] });
       onClose();
     },
   });
@@ -156,6 +172,10 @@ export function TaskFormModal({
           <div>
             <label className="label">End at</label>
             <DateField form={form} name="endAt" />
+          </div>
+          <div className="col-span-2">
+            <label className="label">Nhãn</label>
+            <TagMultiSelect value={selectedTagIds} onChange={setSelectedTagIds} />
           </div>
           <div className="col-span-2">
             <label className="label">Mô tả</label>

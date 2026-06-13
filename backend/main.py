@@ -21,6 +21,7 @@ from app.modules.milestones.router import router as milestones_router
 from app.modules.notifications.router import router as notifications_router
 from app.modules.projects.router import router as projects_router
 from app.modules.scopes.router import router as scopes_router
+from app.modules.tags.router import router as tags_router
 from app.modules.tasks.router import router as tasks_router
 from app.modules.uploads.router import router as uploads_router
 from app.modules.users.router import router as users_router
@@ -88,6 +89,7 @@ for router in (
     dashboard_router,
     projects_router,
     tasks_router,
+    tags_router,
     worklogs_router,
     backlogs_router,
     members_router,

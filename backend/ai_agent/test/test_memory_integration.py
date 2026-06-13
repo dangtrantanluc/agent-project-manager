@@ -15,13 +15,8 @@ from gapo.gapo_adapter import GapoAdapter
 
 class _FakeIntentRouter:
     async def selected_agents(self, message):
-        return [message_router.Agent(
-            name="conversation",
-            description="conversation",
-            threshold=0.2,
-            confidence=0.5,
-            selected=True,
-        )]
+        # Router hiện trả về list tên agent (str), không còn object Agent.
+        return ["conversation"]
 
 
 class _FakeConversationAgent:
@@ -59,8 +54,10 @@ def test_agent_router_loads_memory_context_when_db_and_conversation_id_are_prese
         return {}
     router._load_user_profile_new_session = fake_profile
 
+    # Câu chào thuần (không chứa data-keyword) để giữ ở nhánh 'conversation';
+    # test này chỉ kiểm tra memory/profile được nạp vào user_context.
     reply = asyncio.run(router.handle_message(
-        message="deadline của dự án đó?",
+        message="cảm ơn bạn nhiều nhé",
         user_id="9",
         thread_id="thread-1",
         db="db",

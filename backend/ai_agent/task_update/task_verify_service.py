@@ -20,6 +20,7 @@ Khi LLM lỗi/chưa cấu hình -> dùng câu template tất định (_fallback_
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 from langchain_openai import ChatOpenAI
@@ -32,6 +33,10 @@ from ai_agent.coversation.conversation import ConversationAgent
 logger = logging.getLogger(__name__)
 
 FOLLOW_UP_TTL_HOURS = 24
+
+# Mã task kiểu "[2.4]", "[1.10]"… thường nằm đầu tên task -> dùng để khớp khi user
+# gõ thẳng tên/mã task trong chat (không qua follow-up nhắc deadline).
+_TASK_CODE_RE = re.compile(r"\[\d+(?:\.\d+)*\]")
 
 # Map enum TaskStatus -> nhãn tiếng Việt thân thiện
 _STATUS_LABEL = {
@@ -128,7 +133,7 @@ class TaskVerifyService:
         except (TypeError, ValueError):
             return self._reply(self._ask_which_task_message(user_profile), facts=TaskFacts())
 
-        facts = await self._gather_facts(uid, thread_id, db)
+        facts = await self._gather_facts(uid, thread_id, db, message)
 
         # Side-effect HỢP LỆ: chỉ đánh dấu follow-up đã trả lời khi xác minh đầy đủ
         # (đúng assignee) và resolve được qua follow-up. KHÔNG bao giờ đụng bảng tasks.
@@ -149,11 +154,18 @@ class TaskVerifyService:
             "message": message,
         }
 
-    async def _gather_facts(self, uid, thread_id, db) -> TaskFacts:
-        """Đọc sự thật từ DB. task_id=None nếu không xác định được task nào."""
+    async def _gather_facts(self, uid, thread_id, db, message: str = "") -> TaskFacts:
+        """Đọc sự thật từ DB. task_id=None nếu không xác định được task nào.
+
+        Thứ tự resolve "task nào": follow-up PENDING -> audit deadline -> MÃ/TÊN task
+        gõ trong tin nhắn (vd "[2.4] Gửi báo giá..."). Bước cuối cho phép user cập
+        nhật task họ tự nêu tên, không cần đã được nhắc deadline trước đó.
+        """
         follow_up_id, task_id = await self._resolve_from_followup(db, uid, thread_id)
         if task_id is None:
             task_id = await self._resolve_from_audit(db, thread_id)
+        if task_id is None and message:
+            task_id = await self._resolve_from_message(db, uid, message)
         if task_id is None:
             return TaskFacts()
 
@@ -287,6 +299,32 @@ class TaskVerifyService:
                 return None
         task_ids = (args or {}).get("task_ids") or []
         return task_ids[0] if len(task_ids) == 1 else None
+
+    async def _resolve_from_message(self, db, uid, message):
+        """Resolve task theo MÃ/TÊN gõ trong tin nhắn, trong các task của user.
+
+        1) Có mã "[x.y]" -> khớp tasks.name ILIKE '%[x.y]%' (của user). Đúng 1 -> dùng.
+        2) Không có mã -> so tên task (của task chưa xong) là chuỗi con của tin nhắn,
+           chọn tên DÀI NHẤT (cụ thể nhất). Mơ hồ/không thấy -> None.
+        """
+        codes = _TASK_CODE_RE.findall(message or "")
+        if codes:
+            rows = (await db.execute(text("""
+                SELECT id FROM tasks
+                WHERE assignee_id = :uid AND name ILIKE ANY(:pats)
+            """), {"uid": uid, "pats": [f"%{c}%" for c in codes]})).fetchall()
+            return rows[0][0] if len(rows) == 1 else None
+
+        low = (message or "").lower()
+        rows = (await db.execute(text("""
+            SELECT id, name FROM tasks
+            WHERE assignee_id = :uid AND status::text NOT IN ('DONE','CANCELLED')
+        """), {"uid": uid})).fetchall()
+        matches = [(r[0], r[1]) for r in rows if r[1] and r[1].lower() in low]
+        if not matches:
+            return None
+        matches.sort(key=lambda m: len(m[1]), reverse=True)
+        return matches[0][0]
 
     def _ask_which_task_message(self, user_profile) -> str:
         name_part = self._name_part(user_profile)

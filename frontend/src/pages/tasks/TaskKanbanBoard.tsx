@@ -15,6 +15,8 @@ import { listTasks, updateTask, deleteTask, type TaskListItem } from "@/features
 import type { TaskStatus } from "@bb-pm/shared";
 import { Badge } from "@/components/ui/Badge";
 import { StatusSelect } from "@/components/ui/StatusSelect";
+import { TagChips } from "@/components/ui/TagChips";
+import { TagMultiSelect } from "@/components/ui/TagMultiSelect";
 import { statusColors, statusLabels, priorityColors, formatDate, deadlineState, deadlineTextClass, deadlineRowClass } from "@/lib/format";
 import { Pencil, Trash2, Plus, Upload, List, LayoutGrid, Search, X } from "lucide-react";
 import { TaskFormModal } from "./TaskFormModal";
@@ -50,6 +52,7 @@ export function TaskKanbanBoard({ projectId }: { projectId: number }) {
     milestoneId: "" as "" | number,
     from: "",
     to: "",
+    tagIds: [] as number[],
   });
 
   const all = tasksQ.data?.data ?? [];
@@ -78,6 +81,8 @@ export function TaskKanbanBoard({ projectId }: { projectId: number }) {
       if (filters.milestoneId !== "" && t.milestone?.id !== filters.milestoneId) return false;
       if (filters.from && (!t.deadline || t.deadline.slice(0, 10) < filters.from)) return false;
       if (filters.to && (!t.deadline || t.deadline.slice(0, 10) > filters.to)) return false;
+      // Lọc đa nhãn (OR): khớp nếu task có ÍT NHẤT 1 nhãn được chọn.
+      if (filters.tagIds.length && !t.tags?.some((tg) => filters.tagIds.includes(tg.id))) return false;
       return true;
     });
   }, [all, filters]);
@@ -230,6 +235,7 @@ type TaskFilters = {
   milestoneId: "" | number;
   from: string;
   to: string;
+  tagIds: number[];
 };
 
 function TaskFilterBar({
@@ -251,7 +257,8 @@ function TaskFilterBar({
     filters.assigneeId !== "" ||
     filters.milestoneId !== "" ||
     filters.from ||
-    filters.to;
+    filters.to ||
+    filters.tagIds.length > 0;
 
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -318,11 +325,12 @@ function TaskFilterBar({
           title="Đến ngày"
         />
       </div>
+      <div className="w-52"><TagMultiSelect value={filters.tagIds} onChange={(ids) => set({ tagIds: ids })} placeholder="Lọc theo nhãn…" /></div>
       {active && (
         <button
           className="btn-secondary flex items-center gap-1 text-sm"
           onClick={() =>
-            setFilters({ q: "", status: "", priority: "", assigneeId: "", milestoneId: "", from: "", to: "" })
+            setFilters({ q: "", status: "", priority: "", assigneeId: "", milestoneId: "", from: "", to: "", tagIds: [] })
           }
         >
           <X className="h-4 w-4" /> Xóa lọc
@@ -361,6 +369,7 @@ function TaskListView({
             <th className="px-3 py-2 font-medium">Tiêu đề</th>
             <th className="px-3 py-2 font-medium">Trạng thái</th>
             <th className="px-3 py-2 font-medium">Ưu tiên</th>
+            <th className="px-3 py-2 font-medium">Nhãn</th>
             <th className="px-3 py-2 font-medium">Assignee</th>
             <th className="px-3 py-2 font-medium">Milestone</th>
             <th className="px-3 py-2 font-medium">Deadline</th>
@@ -390,6 +399,7 @@ function TaskListView({
               <td className="px-3 py-2">
                 <Badge className={priorityColors[t.priority]}>{t.priority}</Badge>
               </td>
+              <td className="px-3 py-2"><TagChips tags={t.tags} /></td>
               <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{t.assignee?.fullName ?? "—"}</td>
               <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{t.milestone?.name ?? "—"}</td>
               {(() => {
@@ -509,6 +519,7 @@ function TaskCard({
           </div>
         )}
       </div>
+      <TagChips tags={task.tags} className="mt-2" />
       <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
         <span>{task.assignee?.fullName ?? "—"}</span>
         <Badge className={priorityColors[task.priority]}>{task.priority}</Badge>

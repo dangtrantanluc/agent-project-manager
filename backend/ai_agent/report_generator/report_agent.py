@@ -54,6 +54,7 @@ Tạo tối đa 2 SQL query.
 
 Rule:
 - Chỉ SELECT/WITH
+- MỖI câu SQL PHẢI kết thúc bằng dấu chấm phẩy (;)
 - Không markdown
 - Không giải thích
 """
@@ -189,6 +190,11 @@ class ReportAgent:
         for item in plan.get("queries") or []:
             name = str(item.get("name") or "query")
             sql = self.sql_agent._clean_sql(str(item.get("sql") or ""))
+            # LLM freeform hay quên ';' cuối -> is_safe_sql (yêu cầu endswith ';')
+            # chặn nhầm SQL hợp lệ. Thêm ';' nếu thiếu (chỉ định dạng, không đổi
+            # ngữ nghĩa an toàn: check single-statement & mutation vẫn nguyên).
+            if sql and not sql.rstrip().endswith(";"):
+                sql = sql.rstrip() + ";"
             args = item.get("args") or None
             if not self.sql_agent.is_safe_sql(sql):
                 query_results.append({

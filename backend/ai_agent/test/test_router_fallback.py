@@ -126,6 +126,61 @@ def test_fallback_completion_claim_forces_task_update(router):
     assert router._fallback_agent_for_message("done", ["report"]) == ["task_update"]
 
 
+def test_fallback_push_others_routes_outbound(router):
+    # "push/nhắc/nhắn NGƯỜI KHÁC ..." -> notification (outbound), kể cả khi câu có
+    # "hoàn thành" khiến LLM phân nhầm task_update.
+    assert router._fallback_agent_for_message(
+        "em push thảo hoàn thành deadline hôm nay đi", ["task_update"]) == ["notification"]
+    assert router._fallback_agent_for_message(
+        "nhắc Nam nộp báo cáo giúp anh", ["conversation"]) == ["notification"]
+
+
+def test_fallback_create_task_routes(router):
+    # Câu giao việc/tạo task -> create_task (ưu tiên trên cả task_update).
+    assert router._fallback_agent_for_message(
+        "giao task Viết tài liệu API cho Thảo deadline mai", ["conversation"]) == ["create_task"]
+    assert router._fallback_agent_for_message(
+        "tạo task kiểm thử cho Nam", ["text2sql"]) == ["create_task"]
+
+
+def test_fallback_create_vs_update_heuristic(router):
+    # Câu có CẢ create lẫn update keyword: " cho " (giao cho ai) -> create_task.
+    assert router._fallback_agent_for_message(
+        "giao task X cho Thảo làm xong trước thứ 6", ["conversation"]) == ["create_task"]
+    # Không có " cho " -> self-report -> task_update (verify, vô hại).
+    assert router._fallback_agent_for_message(
+        "tôi vừa tạo task xong rồi", ["conversation"]) == ["task_update"]
+
+
+def test_fallback_outbound_word_boundary(router):
+    # Regex \b: bắt "nhắn" cuối câu và "push!" (trước đây cần trailing space).
+    assert router._fallback_agent_for_message("có gì cứ nhắn", ["conversation"]) == ["notification"]
+    assert router._fallback_agent_for_message("push thảo đi!", ["conversation"]) == ["notification"]
+
+
+def test_fallback_self_report_still_task_update(router):
+    # Self-report hoàn thành vẫn vào task_update (không bị outbound cướp).
+    assert router._fallback_agent_for_message("tôi làm xong rồi", ["conversation"]) == ["task_update"]
+
+
+def test_notification_push_without_recipient_asks_back():
+    # "push ... cho bạn" (không rõ tên) -> HỎI LẠI, KHÔNG soạn nhắc vào thread người hỏi.
+    import asyncio
+    from types import SimpleNamespace
+
+    class _FakeOutbound:
+        async def send_on_behalf(self, **kw):
+            return SimpleNamespace(status="no_recipient")
+
+    r = object.__new__(AgentMessageRouter)
+    r.outbound_message_service = _FakeOutbound()
+    out = asyncio.run(r._run_agent(
+        "notification", "em push luôn deadline cho bạn hôm nay nhé",
+        "10", "gapo", "t1", {},
+    ))
+    assert "ai" in out.lower()
+
+
 def test_fallback_drops_extra_conversation(router):  # 3a
     # 'conversation' kèm agent nghiệp vụ -> bỏ conversation thừa.
     assert router._fallback_agent_for_message(

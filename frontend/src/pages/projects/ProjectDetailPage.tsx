@@ -2,6 +2,7 @@ import { useParams, Link, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { getProject, transitionProject } from "@/features/projects/api";
 import { Badge } from "@/components/ui/Badge";
+import { TagChips } from "@/components/ui/TagChips";
 import { formatDate, formatHours, statusColors, statusLabels, priorityColors } from "@/lib/format";
 import type { ProjectStatus } from "@bb-pm/shared";
 import { ArrowLeft, Pencil } from "lucide-react";
@@ -72,6 +73,7 @@ export function ProjectDetailPage() {
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <Badge className={statusColors[p.status as ProjectStatus]}>{statusLabels[p.status]}</Badge>
               <Badge className={priorityColors[p.priority]}>{p.priority}</Badge>
+              <TagChips tags={(p as any).tags ?? []} />
             </div>
           </div>
           <div className="flex flex-wrap gap-2">

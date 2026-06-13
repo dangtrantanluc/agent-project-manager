@@ -22,6 +22,9 @@ services:
       # Migrations idempotent (an toàn chạy lại): notifications + mã liên kết Gapo.
       - ./init/notifications.sql:/docker-entrypoint-initdb.d/004-notifications.sql:ro
       - ./init/gapo_link_codes.sql:/docker-entrypoint-initdb.d/005-gapo-link-codes.sql:ro
+      - ./init/agent_features.sql:/docker-entrypoint-initdb.d/006-agent-features.sql:ro
+      - ./init/tags.sql:/docker-entrypoint-initdb.d/007-tags.sql:ro
+      - ./init/deadline_quickactions.sql:/docker-entrypoint-initdb.d/008-deadline-quickactions.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d agent_pm"]
       interval: 10s
@@ -73,10 +76,12 @@ services:
       # URL công khai trình duyệt dùng để tải ảnh (qua port S3 expose ra host).
       MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-http://localhost:9000}
     working_dir: /app
-    # Backend chỉ phơi nội bộ; frontend nginx proxy /api/ & /uploads/ về
-    # backend:8000. Không map ra host để không phơi API trực tiếp ra ngoài.
-    expose:
-      - "8000"
+    # Publish ra host:8000 để router NAT (WAN:3637 -> 192.168.1.147:8000) đẩy
+    # được webhook Gapo (POST /webhook/gapo) tới backend. LƯU Ý BẢO MẬT: việc này
+    # phơi TOÀN BỘ API backend ra host/WAN, không chỉ webhook. Cần đặt
+    # GAPO_WEBHOOK_SECRET để xác thực chữ ký webhook.
+    ports:
+      - "8000:8000"
     depends_on:
       db:
         condition: service_healthy

@@ -32,6 +32,10 @@ data/db/backups/
 data/auth/
 data/bin/
 
+# Backup archives (không đưa file backup nặng vào repo)
+*.tar.gz
+agent-pm-FULL-backup_*
+
 # Logs
 *.log
 logs/

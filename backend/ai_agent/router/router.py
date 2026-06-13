@@ -20,6 +20,7 @@ VALID_AGENTS = {
     "conversation",
     "notification",
     "task_update",
+    "create_task",
 }
 DEFAULT_AGENT = "conversation"
 
@@ -29,14 +30,14 @@ class PMMultiAgentRouter:
         """Khởi tạo bộ định tuyến đa tác nhân cho các câu hỏi quản lý dự án.
 
         Router dùng model nhẹ để phân loại intent (fail-fast). Credentials/model
-        đọc từ env chung (đi qua 9router như các agent khác) — KHÔNG hardcode.
+        đọc từ env chung (như các agent khác) — KHÔNG hardcode.
         """
         self.llm = ChatOpenAI(
             timeout=10,
             max_retries=1,
-            model=os.getenv("MODEL_NAME"),
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
+            model=os.getenv("MODEL_NAME_ROUTER") or os.getenv("MODEL_NAME"),
+            api_key=os.getenv("API_KEY_ROUTER") or os.getenv("API_KEY"),
+            base_url=os.getenv("BASE_URL_ROUTER") or os.getenv("BASE_URL"),
             # Phân loại intent là tác vụ đơn giản, không cần thinking.
             reasoning_effort="none",
         )
@@ -90,7 +91,8 @@ Danh mục:
 - planning: lập kế hoạch dự án, phân chia công việc, milestone, quản lý thời gian.
 - conversation: chào hỏi, giao tiếp, cảm xúc, câu hỏi chung chung không thuộc nhóm trên.
 - notification: tạo nội dung thông báo, nhắc nhở, reminder.
-- task_update: người dùng KHẲNG ĐỊNH đã làm xong / đã cập nhật một task đã nhắc trước đó (vd: "tôi update rồi", "xong rồi", "done", "đã hoàn thành").
+- task_update: người dùng KHẲNG ĐỊNH đã làm xong / đã cập nhật một task đã nhắc trước đó (vd: "tôi update rồi", "xong rồi", "done", "đã hoàn thành", "task X xong 80%").
+- create_task: người dùng GIAO VIỆC / tạo task MỚI cho người khác (vd: "giao task X cho Thảo deadline mai", "tạo task ... cho Nam"). Khác task_update (báo task cũ) và notification (chỉ nhắc, không tạo).
 
 Quy tắc:
 - CHỈ trả về một JSON array các tên danh mục, KHÔNG giải thích, KHÔNG markdown.
@@ -120,7 +122,7 @@ Trả về (ví dụ: ["text2sql"] hoặc ["report", "planning"]):"""
             logger.error("Phân loại ý định thất bại: %s", e)
             agents = []
         logger.info(
-            "intent_classified agents=%s elapsed_ms=%.0f",
+            "Phân loại agents=%s elapsed_ms=%.0f",
             agents, (time.perf_counter() - t) * 1000,
         )
         return agents or [DEFAULT_AGENT]

@@ -8,6 +8,49 @@ from app.core.deps import get_current_user, get_db, is_restricted, project_acces
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
+@router.get("/tags-summary")
+async def get_tags_summary(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Thống kê task theo NHÃN (task-tag): mỗi nhãn có bao nhiêu task, done, quá hạn.
+
+    Scope theo company; MEMBER/VIEWER chỉ tính task thuộc dự án mình tham gia.
+    Chỉ trả nhãn đang có task (JOIN), sắp theo tổng số task giảm dần.
+    """
+    cid = current_user.get("companyId") or current_user.get("company_id") or 1
+    params: dict = {"cid": cid}
+    task_access = ""
+    if is_restricted(current_user):
+        task_access = f" AND {project_access_exists_sql('t.project_id')}"
+        params["access_uid"] = current_user["id"]
+
+    rows = (await db.execute(
+        text(f"""
+            SELECT tg.id, tg.name, tg.color,
+                   COUNT(t.id) AS total,
+                   COUNT(t.id) FILTER (WHERE t.status::text = 'DONE') AS done,
+                   COUNT(t.id) FILTER (
+                       WHERE t.deadline < CURRENT_DATE
+                         AND t.status::text NOT IN ('DONE','CANCELLED')) AS overdue
+            FROM tags tg
+            JOIN task_tags tt ON tt.tag_id = tg.id
+            JOIN tasks t ON t.id = tt.task_id{task_access}
+            WHERE tg.company_id = :cid
+            GROUP BY tg.id, tg.name, tg.color
+            ORDER BY total DESC, tg.name ASC
+        """),
+        params,
+    )).fetchall()
+    return {
+        "data": [
+            {"id": r[0], "name": r[1], "color": r[2],
+             "total": int(r[3]), "done": int(r[4]), "overdue": int(r[5])}
+            for r in rows
+        ]
+    }
+
+
 @router.get("/overview")
 async def get_overview(
     project_id: Optional[int] = Query(default=None, alias="projectId"),

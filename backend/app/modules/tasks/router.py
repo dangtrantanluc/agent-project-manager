@@ -1,10 +1,13 @@
+import json
 from datetime import date, datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_agent_user, get_current_user, get_db, require_role, is_restricted, project_access_exists_sql
+from app.services.task_assignment_notifier import notify_task_assigned, notify_group_new_task
+from app.services.risk_alert_service import RiskAlertService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -43,7 +46,13 @@ _SELECT_TASK = """
            t.project_id, t.assignee_id, t.milestone_id, t.currency_id,
            t.created_at, t.updated_at,
            u.full_name AS assignee_full_name, u.avatar_url AS assignee_avatar_url,
-           m.name AS milestone_name
+           m.name AS milestone_name,
+           COALESCE((
+               SELECT json_agg(json_build_object('id', tg.id, 'name', tg.name, 'color', tg.color)
+                               ORDER BY tg.name)
+               FROM task_tags tt JOIN tags tg ON tg.id = tt.tag_id
+               WHERE tt.task_id = t.id
+           ), '[]'::json) AS tags
     FROM tasks t
     LEFT JOIN users u ON u.id = t.assignee_id
     LEFT JOIN milestones m ON m.id = t.milestone_id
@@ -83,6 +92,11 @@ def _row_to_dict(r) -> dict:
             {"id": r[12], "name": r[18]}
             if len(r) > 18 and r[12] is not None else None
         ),
+        # tags là json array (asyncpg trả chuỗi json) -> parse về list dict.
+        "tags": (
+            (json.loads(r[19]) if isinstance(r[19], str) else (r[19] or []))
+            if len(r) > 19 else []
+        ),
     }
 
 
@@ -121,7 +135,13 @@ async def list_tasks(
     status: Optional[str] = Query(default=None),
     assignee_id: Optional[int] = Query(default=None, alias="assigneeId"),
     milestone_id: Optional[int] = Query(default=None, alias="milestoneId"),
+    tag_id: Optional[int] = Query(default=None, alias="tagId"),
+    tag_ids: Optional[list[int]] = Query(default=None, alias="tagIds"),
+    priority: Optional[str] = Query(default=None),
+    deadline_from: Optional[str] = Query(default=None, alias="deadlineFrom"),
+    deadline_to: Optional[str] = Query(default=None, alias="deadlineTo"),
     q: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
     page_size: int = Query(default=100, ge=1, le=500, alias="pageSize"),
     sort: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
@@ -138,10 +158,25 @@ async def list_tasks(
     if status:
         status = _normalize_task_status(status)
         where += ' AND t.status = CAST(:status AS "TaskStatus")'; params["status"] = status
+    if priority:
+        where += ' AND t.priority = CAST(:priority AS "Priority")'; params["priority"] = priority
     if assignee_id:
         where += " AND t.assignee_id = :aid"; params["aid"] = assignee_id
     if milestone_id:
         where += " AND t.milestone_id = :mid"; params["mid"] = milestone_id
+    # Lọc đa nhãn (OR): task khớp nếu mang ÍT NHẤT 1 trong các nhãn. Gộp cả tagId lẻ
+    # (tương thích cũ) vào danh sách.
+    all_tag_ids = list(tag_ids or [])
+    if tag_id and tag_id not in all_tag_ids:
+        all_tag_ids.append(tag_id)
+    if all_tag_ids:
+        where += (" AND EXISTS (SELECT 1 FROM task_tags tt WHERE tt.task_id = t.id "
+                  "AND tt.tag_id = ANY(:tag_ids))")
+        params["tag_ids"] = all_tag_ids
+    if deadline_from:
+        where += " AND t.deadline >= :dfrom"; params["dfrom"] = _parse_date(deadline_from)
+    if deadline_to:
+        where += " AND t.deadline <= :dto"; params["dto"] = _parse_date(deadline_to)
     if q:
         where += " AND t.name ILIKE :q"; params["q"] = f"%{q}%"
 
@@ -150,18 +185,28 @@ async def list_tasks(
         order_by = "t.updated_at DESC"
     elif sort == "updatedAt:asc":
         order_by = "t.updated_at ASC"
+    # Đếm tổng (cùng WHERE) để FE phân trang đúng; chỉ cần FROM tasks t.
+    total = (await db.execute(
+        text(f"SELECT COUNT(*) FROM tasks t {where}"), params,
+    )).scalar() or 0
+
     params["limit"] = page_size
+    params["offset"] = (page - 1) * page_size
     rows = (await db.execute(
-        text(f"{_SELECT_TASK} {where} ORDER BY {order_by} LIMIT :limit"),
+        text(f"{_SELECT_TASK} {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"),
         params,
     )).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return {
+        "data": [_row_to_dict(r) for r in rows],
+        "meta": {"total": int(total), "page": page, "pageSize": page_size},
+    }
 
 
 @router.post("", status_code=201)
 @router.post("/by-project/{project_id}", status_code=201)
 async def create_task(
     body: dict,
+    background_tasks: BackgroundTasks,
     project_id: Optional[int] = None,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -213,6 +258,25 @@ async def create_task(
         )
 
     await db.commit()
+
+    if row[11]:  # assignee_id — báo cho người được giao (Gapo DM + in-app), chạy nền
+        background_tasks.add_task(
+            notify_task_assigned,
+            task_id=row[0],
+            assignee_id=row[11],
+            actor_id=current_user["id"],
+        )
+
+    # Đăng tin giao việc vào group dự án (best-effort, tự bỏ qua nếu project chưa
+    # liên kết group Gapo). Tách riêng để gửi cả khi task chưa có assignee.
+    background_tasks.add_task(
+        notify_group_new_task,
+        task_id=row[0],
+        actor_id=current_user["id"],
+    )
+    # Near-real-time: task mới có thể khiến project at-risk (vd tạo task đã quá hạn).
+    background_tasks.add_task(RiskAlertService.trigger_for_project, row[10])
+
     return await _fetch_task_dict(row[0], db)
 
 
@@ -357,6 +421,7 @@ async def get_task(
 async def update_task(
     task_id: int,
     body: dict,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -402,6 +467,19 @@ async def update_task(
         await _recompute_milestone(row[12], db)
 
     await db.commit()
+
+    # Chỉ báo khi assignee ĐỔI sang người mới — sửa deadline/description của
+    # task đã giao thì không nhắc lại. existing[2] là assignee cũ.
+    if row[11] and row[11] != existing[2]:
+        background_tasks.add_task(
+            notify_task_assigned,
+            task_id=task_id,
+            assignee_id=row[11],
+            actor_id=current_user["id"],
+        )
+    # Near-real-time: đổi status/deadline có thể khiến task quá hạn -> quét lại project.
+    background_tasks.add_task(RiskAlertService.trigger_for_project, row[10])
+
     return await _fetch_task_dict(row[0], db)
 
 
@@ -434,6 +512,7 @@ async def delete_task(
 async def transition_task(
     task_id: int,
     body: dict,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -466,6 +545,7 @@ async def transition_task(
         await _recompute_milestone(row[1], db)
 
     await db.commit()
+    background_tasks.add_task(RiskAlertService.trigger_for_project, updated[10])
     return await _fetch_task_dict(updated[0], db)
 
 
@@ -500,11 +580,12 @@ async def list_blockers(
 async def create_blocker(
     task_id: int,
     body: dict,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     task = (await db.execute(
-        text("SELECT id, assignee_id FROM tasks WHERE id = :tid"),
+        text("SELECT id, assignee_id, project_id FROM tasks WHERE id = :tid"),
         {"tid": task_id},
     )).fetchone()
     if not task:
@@ -520,79 +601,9 @@ async def create_blocker(
         {"tid": task_id, "severity": body.get("severity"), "desc": body["description"]},
     )).fetchone()
     await db.commit()
+    # Near-real-time: thêm blocker -> task "blocked" -> đẩy rủi ro project lên ngay.
+    background_tasks.add_task(RiskAlertService.trigger_for_project, task[2])
     return {
         "id": row[0], "taskId": row[1], "severity": row[2], "description": row[3],
         "resolvedAt": row[4], "createdAt": row[5].isoformat(),
     }
-
-
-# ── Agent endpoints ────────────────────────────────────────────────────────────
-
-@router.get("/overdue")
-async def overdue_tasks(
-    project_id: Optional[int] = Query(default=None, alias="projectId"),
-    days: Optional[int] = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
-    agent_user: dict = Depends(get_agent_user),
-    db: AsyncSession = Depends(get_db),
-):
-    where = "WHERE t.deadline < CURRENT_DATE AND t.status <> 'DONE'::\"TaskStatus\""
-    params: dict = {"limit": limit}
-    if project_id:
-        where += " AND t.project_id = :pid"; params["pid"] = project_id
-    if days:
-        where += " AND t.deadline >= CURRENT_DATE - (:days * INTERVAL '1 day')"; params["days"] = days
-
-    rows = (await db.execute(
-        text(f"{_SELECT_TASK} {where} ORDER BY t.deadline LIMIT :limit"),
-        params,
-    )).fetchall()
-    return [_row_to_dict(r) for r in rows]
-
-
-@router.get("/stale")
-async def stale_tasks(
-    project_id: Optional[int] = Query(default=None, alias="projectId"),
-    days_since_update: int = Query(default=7, alias="daysSinceUpdate"),
-    limit: int = Query(default=50, ge=1, le=500),
-    agent_user: dict = Depends(get_agent_user),
-    db: AsyncSession = Depends(get_db),
-):
-    where = "WHERE t.status NOT IN ('DONE'::\"TaskStatus\") AND t.updated_at < NOW() - INTERVAL '1 day' * :days"
-    params: dict = {"days": days_since_update, "limit": limit}
-    if project_id:
-        where += " AND t.project_id = :pid"; params["pid"] = project_id
-
-    rows = (await db.execute(
-        text(f"{_SELECT_TASK} {where} ORDER BY t.updated_at LIMIT :limit"),
-        params,
-    )).fetchall()
-    return [_row_to_dict(r) for r in rows]
-
-
-@router.get("/hygiene")
-async def tasks_hygiene(
-    project_id: Optional[int] = Query(default=None, alias="projectId"),
-    stale_days: int = Query(default=14, alias="staleDays"),
-    agent_user: dict = Depends(get_agent_user),
-    db: AsyncSession = Depends(get_db),
-):
-    params: dict = {"stale_days": stale_days}
-    base = "WHERE t.status <> 'DONE'::\"TaskStatus\""
-    if project_id:
-        base += " AND t.project_id = :pid"; params["pid"] = project_id
-
-    no_assignee = (await db.execute(
-        text(f"SELECT COUNT(*) FROM tasks t {base} AND t.assignee_id IS NULL"), params
-    )).scalar()
-    no_deadline = (await db.execute(
-        text(f"SELECT COUNT(*) FROM tasks t {base} AND t.deadline IS NULL"), params
-    )).scalar()
-    overdue = (await db.execute(
-        text(f"SELECT COUNT(*) FROM tasks t {base} AND t.deadline < CURRENT_DATE"), params
-    )).scalar()
-    stale = (await db.execute(
-        text(f"SELECT COUNT(*) FROM tasks t {base} AND t.updated_at < NOW() - INTERVAL '1 day' * :stale_days"), params
-    )).scalar()
-
-    return {"noAssignee": no_assignee, "noDeadline": no_deadline, "overdue": overdue, "stale": stale}

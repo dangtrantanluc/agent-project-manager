@@ -13,6 +13,7 @@ export type TaskListItem = {
   assignee: { id: number; fullName: string; avatarUrl: string | null } | null;
   milestone: { id: number; name: string } | null;
   project: { id: number; name: string; code: string | null };
+  tags: { id: number; name: string; color: string }[];
   _count: { worklogs: number; backlogs?: number };
 };
 
@@ -21,6 +22,11 @@ export type TaskListParams = {
   status?: TaskStatus;
   assigneeId?: number;
   milestoneId?: number;
+  tagId?: number;
+  tagIds?: number[];
+  priority?: string;
+  deadlineFrom?: string;
+  deadlineTo?: string;
   q?: string;
   page?: number;
   pageSize?: number;
@@ -56,7 +62,11 @@ export async function listTasks(params: TaskListParams = {}) {
       data: TaskListItem[];
       meta: { total: number; page: number; pageSize: number };
     }
-  >("/tasks", { params });
+  >("/tasks", {
+    params,
+    // Serialize mảng dạng lặp `tagIds=1&tagIds=2` (FastAPI list[int]), KHÔNG `tagIds[]=`.
+    paramsSerializer: { indexes: null },
+  });
   if (Array.isArray(data)) {
     const page = params.page ?? 1;
     const pageSize = params.pageSize ?? data.length;
@@ -65,18 +75,32 @@ export async function listTasks(params: TaskListParams = {}) {
   return { ...data, data: data.data.map(normalizeTask) };
 }
 
+/** Shape thô từ BE trước khi normalize: các scalar luôn có (BE trả đủ); chỉ nested
+ * object & _count là optional vì normalize sẽ điền. An toàn hơn `any`. */
+type RawTask = Omit<TaskListItem, "project" | "assignee" | "milestone" | "tags" | "_count"> & {
+  project?: TaskListItem["project"] | null;
+  assignee?: TaskListItem["assignee"];
+  milestone?: TaskListItem["milestone"];
+  tags?: TaskListItem["tags"];
+  _count?: TaskListItem["_count"];
+  projectId?: number;
+  worklogCount?: number;
+  backlogCount?: number;
+};
+type Wrapped<T> = T | { data: T };
+
 export async function getTask(id: number) {
-  const { data } = await apiClient.get<any>(`/tasks/${id}`);
+  const { data } = await apiClient.get<Wrapped<RawTask>>(`/tasks/${id}`);
   return normalizeTask(unwrap(data));
 }
 
 export async function createTask(projectId: number, input: TaskCreateInput) {
-  const { data } = await apiClient.post<any>(`/tasks/by-project/${projectId}`, input);
+  const { data } = await apiClient.post<Wrapped<RawTask>>(`/tasks/by-project/${projectId}`, input);
   return normalizeTask(unwrap(data));
 }
 
 export async function updateTask(id: number, input: Partial<TaskCreateInput>) {
-  const { data } = await apiClient.patch<any>(`/tasks/${id}`, input);
+  const { data } = await apiClient.patch<Wrapped<RawTask>>(`/tasks/${id}`, input);
   return normalizeTask(unwrap(data));
 }
 
@@ -85,7 +109,7 @@ export async function deleteTask(id: number) {
 }
 
 export async function transitionTask(id: number, status: TaskStatus) {
-  const { data } = await apiClient.post<any>(`/tasks/${id}/transition`, { status });
+  const { data } = await apiClient.post<Wrapped<RawTask>>(`/tasks/${id}/transition`, { status });
   return normalizeTask(unwrap(data));
 }
 
@@ -93,13 +117,14 @@ function unwrap<T>(data: T | { data: T }): T {
   return data && typeof data === "object" && "data" in data ? data.data : data;
 }
 
-function normalizeTask(task: any): TaskListItem {
+function normalizeTask(task: RawTask): TaskListItem {
   const projectId = task.project?.id ?? task.projectId ?? 0;
   return {
     ...task,
     project: task.project ?? { id: projectId, name: projectId ? `Project #${projectId}` : "—", code: null },
     assignee: task.assignee ?? null,
     milestone: task.milestone ?? null,
+    tags: task.tags ?? [],
     _count: task._count ?? { worklogs: task.worklogCount ?? task.backlogCount ?? 0 },
   };
 }

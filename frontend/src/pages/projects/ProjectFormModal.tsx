@@ -6,8 +6,10 @@ import { createProject, updateProject, type ProjectListItem } from "@/features/p
 import { listUsers } from "@/features/users/api";
 import { Modal } from "@/components/ui/Modal";
 import { DateField } from "@/components/ui/DateField";
+import { TagMultiSelect } from "@/components/ui/TagMultiSelect";
+import { setProjectTags } from "@/features/tags/api";
 import { useAuth } from "@/features/auth/store";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 export function ProjectFormModal({
   open,
@@ -30,6 +32,11 @@ export function ProjectFormModal({
     resolver: zodResolver(projectCreateSchema),
     defaultValues: { ownerId: user.id, priority: "MEDIUM", status: "PLANNED" },
   });
+  // Nhãn lưu qua API riêng PUT /projects/:id/tags.
+  const [selectedTagIds, setSelectedTagIds] = useState<number[]>([]);
+  // Thread group Gapo (broadcast cảnh báo/giao việc). Ngoài react-hook-form vì
+  // không thuộc projectCreateSchema; gửi kèm trong patch khi SỬA.
+  const [gapoThreadId, setGapoThreadId] = useState("");
 
   // Owner/Account Manager hiện tại có thể trỏ tới id không còn trong danh sách
   // user (vd dữ liệu seed). Giữ id đó như một lựa chọn ẩn để <select> không tự
@@ -53,8 +60,12 @@ export function ProjectFormModal({
         startDate: project.startDate ?? undefined,
         endDate: project.endDate ?? undefined,
       } as any);
+      setSelectedTagIds(project.tags?.map((t) => t.id) ?? []);
+      setGapoThreadId(project.gapoThreadId ?? "");
     } else if (open) {
       form.reset({ ownerId: user.id, priority: "MEDIUM", status: "PLANNED" });
+      setSelectedTagIds([]);
+      setGapoThreadId("");
     }
   }, [project, open, usersQ.data]);
 
@@ -70,10 +81,25 @@ export function ProjectFormModal({
   };
 
   const save = useMutation({
-    mutationFn: async (v: ProjectCreateInput) =>
-      project ? updateProject(project.id, buildPatch(v)) : createProject(v),
+    mutationFn: async (v: ProjectCreateInput) => {
+      let saved;
+      if (project) {
+        // gửi kèm gapoThreadId (không thuộc RHF). "" -> null để cho phép xoá liên kết.
+        const patch = { ...buildPatch(v), gapoThreadId: gapoThreadId.trim() || null } as any;
+        saved = await updateProject(project.id, patch);
+      } else {
+        saved = await createProject(v);
+      }
+      try {
+        await setProjectTags(saved.id, selectedTagIds);
+      } catch {
+        /* ignore — dự án vẫn đã lưu */
+      }
+      return saved;
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["projects"] });
+      qc.invalidateQueries({ queryKey: ["tags"] });
       onSaved?.();
       onClose();
     },
@@ -145,6 +171,24 @@ export function ProjectFormModal({
               ))}
             </select>
           </div>
+          <div className="col-span-2">
+            <label className="label">Nhãn</label>
+            <TagMultiSelect value={selectedTagIds} onChange={setSelectedTagIds} />
+          </div>
+          {project && (
+            <div className="col-span-2">
+              <label className="label">Group Gapo (thread ID)</label>
+              <input
+                className="input"
+                placeholder="VD: 1779201401766 — để bot đăng cảnh báo/giao việc vào nhóm"
+                value={gapoThreadId}
+                onChange={(e) => setGapoThreadId(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-slate-400">
+                Dán thread ID của group dự án trên GapoWork. Bỏ trống nếu chưa liên kết nhóm.
+              </p>
+            </div>
+          )}
           <div className="col-span-2">
             <label className="label">Mô tả</label>
             <textarea rows={3} className="input" {...form.register("description")} />

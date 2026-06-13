@@ -4,6 +4,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { ProjectListPage } from "@/pages/projects/ProjectListPage";
 import { ProjectDetailPage } from "@/pages/projects/ProjectDetailPage";
 import { TasksPage } from "@/pages/tasks/TasksPage";
+import { TagsPage } from "@/pages/tags/TagsPage";
 import { WorklogsPage } from "@/pages/worklogs/WorklogsPage";
 import { ProfilePage } from "@/pages/ProfilePage";
 import { NotificationsPage } from "@/pages/NotificationsPage";
@@ -36,6 +37,7 @@ export function Router() {
                 <Route path="/projects" element={<ProjectListPage />} />
                 <Route path="/projects/:id" element={<ProjectDetailPage />} />
                 <Route path="/tasks" element={<TasksPage />} />
+                <Route path="/tags" element={<TagsPage />} />
                 <Route path="/worklogs" element={<WorklogsPage />} />
                 <Route path="/profile" element={<ProfilePage />} />
                 <Route path="/notifications" element={<NotificationsPage />} />

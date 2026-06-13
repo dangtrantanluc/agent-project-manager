@@ -62,10 +62,9 @@ async def list_members(
         """),
         {"pid": project_id},
     )).fetchall()
-    data = []
-    for r in rows:
-        data.append(await _get_member(r[0], db))
-    return {"data": data}
+    # rows đã JOIN đủ thông tin user -> map thẳng, tránh N+1 (trước đây gọi
+    # _get_member() cho từng dòng = thêm 1 query/member).
+    return {"data": [_member_row(r) for r in rows]}
 
 
 @router.post("/by-project/{project_id}", status_code=201)

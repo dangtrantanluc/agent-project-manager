@@ -63,6 +63,18 @@ def start_checkin_scheduler() -> None:
         id="deadline_notifications_afternoon", replace_existing=True,
         kwargs={"slot": "afternoon"},
     )
+    risk_hour = int(os.getenv("RISK_SCAN_HOUR", "8"))
+    risk_minute = int(os.getenv("RISK_SCAN_MINUTE", "30"))
+    _scheduler.add_job(
+        run_risk_scan,
+        CronTrigger(day_of_week="mon-fri", hour=risk_hour, minute=risk_minute, timezone=_VN_TZ),
+        id="risk_scan", replace_existing=True,
+    )
+    _scheduler.add_job(
+        run_expire_stale,
+        CronTrigger(minute=5, timezone=_VN_TZ),  # mỗi giờ, phút thứ 5
+        id="expire_stale", replace_existing=True,
+    )
     _scheduler.start()
     logger.info("[Scheduler] Check-in scheduler started")
 
@@ -245,6 +257,57 @@ async def run_missing_summary() -> None:
     await _with_advisory_lock(_run())
 
 
+async def run_expire_stale() -> None:
+    """Đánh dấu EXPIRED cho cảnh báo rủi ro & follow-up PENDING đã quá TTL.
+
+    Bộ lọc theo thời gian ở find_pending_for / _resolve_from_followup đã loại các
+    bản ghi quá hạn khỏi việc khớp; job này dọn TRẠNG THÁI để giữ dữ liệu sạch,
+    partial index nhỏ gọn, và đếm "đang chờ" chính xác.
+    """
+    async def _run():
+        from database import AsyncSessionLocal
+        from sqlalchemy import text
+        from app.services.risk_alert_service import PENDING_TTL_HOURS
+        from ai_agent.task_update.task_verify_service import FOLLOW_UP_TTL_HOURS
+
+        async with AsyncSessionLocal() as db:
+            risk = (await db.execute(text("""
+                UPDATE risk_alerts
+                SET status = 'EXPIRED', updated_at = NOW()
+                WHERE status = 'PENDING_PM_CONFIRMATION'
+                  AND created_at < NOW() - (CAST(:ttl AS int) * INTERVAL '1 hour')
+            """), {"ttl": PENDING_TTL_HOURS})).rowcount
+            followups = (await db.execute(text("""
+                UPDATE agent_follow_ups
+                SET status = CAST('EXPIRED' AS "FollowUpStatus"), updated_at = NOW()
+                WHERE status = CAST('PENDING' AS "FollowUpStatus")
+                  AND created_at < NOW() - (CAST(:ttl AS int) * INTERVAL '1 hour')
+            """), {"ttl": FOLLOW_UP_TTL_HOURS})).rowcount
+            await db.commit()
+        logger.info("[Scheduler] run_expire_stale risk_alerts=%s follow_ups=%s", risk, followups)
+
+    await _with_advisory_lock(_run())
+
+
+async def run_risk_scan(today: date | None = None) -> None:
+    """Quét dự án at-risk và gửi cảnh báo PENDING cho PM (sơ đồ Luồng 4).
+
+    Cảnh báo ở trạng thái chờ PM xác nhận — human-in-the-loop. PM trả lời trong DM,
+    message_router (state-gate) bắt câu trả lời để duyệt/bỏ qua.
+    """
+    async def _run():
+        from database import AsyncSessionLocal
+        from app.services.risk_alert_service import RiskAlertService
+
+        target_day = today or datetime.now(_VN_TZ).date()
+        service = RiskAlertService()
+        async with AsyncSessionLocal() as db:
+            stats = await service.scan_and_alert(db, today_iso=target_day.isoformat())
+        logger.info("[Scheduler] run_risk_scan today=%s %s", target_day, stats)
+
+    await _with_advisory_lock(_run())
+
+
 def _deadline_notify_date(deadline: date) -> date:
     notify_date = deadline - timedelta(days=2)
     if notify_date.weekday() == 5:  # Saturday -> Friday
@@ -277,6 +340,7 @@ def _group_due_deadline_tasks(rows, target_day: date) -> tuple[dict[tuple[int, s
             thread_id,
             assignee_name,
             status,
+            priority,
         ) = row
         reminder_type = _deadline_reminder_type(deadline, target_day)
         if reminder_type is None:
@@ -292,10 +356,40 @@ def _group_due_deadline_tasks(rows, target_day: date) -> tuple[dict[tuple[int, s
             "project_name": project_name,
             "thread_id": str(thread_id),
             "status": status,
+            "priority": priority,
             "reminder_type": reminder_type,
         })
 
     return dict(due_by_recipient), skipped
+
+
+def _deadline_quick_actions(tasks: list[dict]) -> tuple[str, list[dict]]:
+    """(title, actions) cho quick-reply sau digest deadline.
+
+    1 task  -> menu trạng thái thẳng (1 chạm là xong).
+    Nhiều   -> mỗi nút 1 task (TASKPICK|id) -> bấm task ra menu trạng thái.
+    """
+    def _short(name: str, n: int = 44) -> str:
+        name = name or "task"
+        return name if len(name) <= n else name[:n] + "…"
+
+    if len(tasks) == 1:
+        tid = tasks[0]["task_id"]
+        return ("Cập nhật nhanh task này:", [
+            {"label": "✅ Đã xong", "payload": f"TASKUPD|{tid}|100"},
+            {"label": "🔄 50%", "payload": f"TASKUPD|{tid}|50"},
+            {"label": "🔄 75%", "payload": f"TASKUPD|{tid}|75"},
+            {"label": "⛔ Đang kẹt (blocker)", "payload": f"TASKBLOCK|{tid}"},
+            {"label": "⏰ Gia hạn 3 ngày", "payload": f"TASKEXTEND|{tid}|3"},
+            {"label": "😴 Hoãn nhắc 1 ngày", "payload": f"TASKSNOOZE|{tid}"},
+        ])
+    # Gapo render ~9-10 nút -> cap 6 task + nút "➡️ Xem thêm" (mở pager qua các trang).
+    _MAX = 6
+    actions = [{"label": _short(t["task_name"]), "payload": f"TASKPICK|{t['task_id']}"}
+               for t in tasks[:_MAX]]
+    if len(tasks) > _MAX:
+        actions.append({"label": "➡️ Xem thêm", "payload": "TASKPAGE|2"})
+    return ("Bấm task để cập nhật nhanh:", actions)
 
 
 async def run_deadline_notifications(today: date | None = None, slot: str = "morning") -> None:
@@ -321,7 +415,8 @@ async def run_deadline_notifications(today: date | None = None, slot: str = "mor
             rows = (await db.execute(text("""
                 SELECT t.id, t.name, t.deadline, t.assignee_id,
                        p.name AS project_name, g.gapo_thread_id,
-                       u.full_name AS assignee_name, t.status::text AS status
+                       u.full_name AS assignee_name, t.status::text AS status,
+                       t.priority::text AS priority
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 JOIN users u ON u.id = t.assignee_id
@@ -329,6 +424,8 @@ async def run_deadline_notifications(today: date | None = None, slot: str = "mor
                 WHERE t.deadline IS NOT NULL
                   AND t.assignee_id IS NOT NULL
                   AND t.status::text <> 'DONE'
+                  -- Bỏ qua task user đã bấm "😴 Hoãn nhắc 1 ngày".
+                  AND (t.snooze_reminder_until IS NULL OR t.snooze_reminder_until < CURRENT_DATE)
                 ORDER BY t.deadline ASC, t.id ASC
             """))).fetchall()
 
@@ -450,6 +547,13 @@ async def run_deadline_notifications(today: date | None = None, slot: str = "mor
                             "correlation_id": per_task_corr,
                         })
                     await db.commit()
+                    # Gửi NÚT BẤM nhanh sau digest: bấm là cập nhật, khỏi gõ.
+                    # 1 task -> menu trạng thái thẳng (Đã xong/50%/75%/Kẹt/Gia hạn/Hoãn).
+                    # Nhiều task -> picker (mỗi nút 1 task, payload TASKPICK|id).
+                    try:
+                        await gapo.send_menu(thread_id, *_deadline_quick_actions(tasks))
+                    except Exception:
+                        logger.warning("[Scheduler] gửi quick-reply deadline lỗi (bỏ qua)", exc_info=True)
                     sent_batches += 1
                     sent_tasks += len(tasks)
                 except Exception as e:

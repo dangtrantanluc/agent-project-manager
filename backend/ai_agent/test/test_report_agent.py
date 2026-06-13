@@ -7,29 +7,46 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from ai_agent.report_generator.report_agent import ReportAgent
+from ai_agent.report_generator.report_agent import (
+    ReportAgent, ReportPlan, ReportQuery, TemplateSelection,
+)
+
+
+class _StructuredLLM:
+    """Bản wrap của with_structured_output: ainvoke trả thẳng object đã validate."""
+    def __init__(self, value):
+        self._value = value
+
+    async def ainvoke(self, messages):
+        return self._value
 
 
 class _FakeLLM:
-    def __init__(self):
+    """Mô phỏng ChatOpenAI sau refactor structured-output.
+
+    - with_structured_output(ReportPlan/TemplateSelection) -> _StructuredLLM trả
+      object tương ứng (không còn parse JSON từ .content).
+    - ainvoke (gốc) chỉ dùng cho generate_report_result -> trả .content tự do.
+    """
+    def __init__(self, plan: ReportPlan | None = None, final: str = "Hiện tại có 7 dự án."):
         self.calls = []
+        self._plan = plan or ReportPlan(queries=[
+            ReportQuery(name="project_count",
+                        sql="SELECT COUNT(*) AS total_projects FROM projects;")
+        ])
+        self._final = final
+
+    def with_structured_output(self, schema, method=None):
+        if schema is TemplateSelection:
+            # Không khớp template nào -> fallback freeform (đi qua plan_llm).
+            return _StructuredLLM(TemplateSelection(template_id=None, params={}))
+        if schema is ReportPlan:
+            return _StructuredLLM(self._plan)
+        return _StructuredLLM(None)
 
     async def ainvoke(self, messages):
         self.calls.append(messages)
-        if len(self.calls) == 1:
-            # select_template: không khớp template nào -> fallback freeform
-            return SimpleNamespace(content='{"template_id": null, "params": {}}')
-        if len(self.calls) == 2:
-            # generate_report_plan (freeform fallback)
-            return SimpleNamespace(content="""
-            {
-              "need_clarification": false,
-              "queries": [
-                {"name": "project_count", "sql": "SELECT COUNT(*) AS total_projects FROM projects;"}
-              ]
-            }
-            """)
-        return SimpleNamespace(content="Hiện tại có 7 dự án.")
+        return SimpleNamespace(content=self._final)
 
 
 class _FakeSQLAgent:
@@ -58,17 +75,12 @@ def test_report_agent_executes_plan_and_returns_final_answer():
 
 
 def test_report_agent_rejects_unsafe_plan_query_but_still_summarizes():
-    class UnsafeLLM(_FakeLLM):
-        async def ainvoke(self, messages):
-            self.calls.append(messages)
-            if len(self.calls) == 1:
-                return SimpleNamespace(content='{"template_id": null, "params": {}}')
-            if len(self.calls) == 2:
-                return SimpleNamespace(content='{"need_clarification": false, "queries": [{"name": "bad", "sql": "DROP TABLE projects;"}]}')
-            return SimpleNamespace(content="Không thể tạo báo cáo vì query không an toàn.")
-
+    # Plan trả về SQL nguy hiểm (DROP) -> is_safe_sql chặn -> không execute,
+    # nhưng vẫn tóm tắt (báo không an toàn) thay vì crash.
+    unsafe_plan = ReportPlan(queries=[ReportQuery(name="bad", sql="DROP TABLE projects;")])
+    llm = _FakeLLM(plan=unsafe_plan, final="Không thể tạo báo cáo vì query không an toàn.")
     sql_agent = _FakeSQLAgent()
-    agent = ReportAgent(llm=UnsafeLLM(), sql_agent=sql_agent)
+    agent = ReportAgent(llm=llm, sql_agent=sql_agent)
 
     answer = asyncio.run(agent.generate_report("Báo cáo dự án"))
 

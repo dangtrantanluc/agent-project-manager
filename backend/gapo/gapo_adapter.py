@@ -1,10 +1,12 @@
 # backend/integrations/gapo/gapo_adapter.py
 
+import collections
 import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from sqlalchemy import text
@@ -19,6 +21,23 @@ from ai_agent.memory.memory import save_memory
 from ai_agent.router.message_router import AgentMessageRouter
 logger = logging.getLogger(__name__)
 
+# Lớp dedup CẤP 2 (in-process) khi Redis lỗi: chặn retry trùng trong cùng tiến
+# trình — đúng case phổ biến nhất (Gapo retry vì pipeline >30s). Không thay được
+# Redis (không chia sẻ giữa nhiều worker) nhưng tránh fail-open hoàn toàn.
+_SEEN_EVENT_IDS: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+_SEEN_EVENT_MAX = 2000
+
+
+def _seen_recently(key: str) -> bool:
+    """True nếu key đã gặp trong process này (và ghi nhận nếu chưa). LRU-cap."""
+    if key in _SEEN_EVENT_IDS:
+        _SEEN_EVENT_IDS.move_to_end(key)
+        return True
+    _SEEN_EVENT_IDS[key] = None
+    if len(_SEEN_EVENT_IDS) > _SEEN_EVENT_MAX:
+        _SEEN_EVENT_IDS.popitem(last=False)
+    return False
+
 
 class GapoAdapter:
     def __init__(self):
@@ -28,6 +47,10 @@ class GapoAdapter:
             model=os.getenv("MODEL_NAME"),
             api_key=os.getenv("API_KEY"),
             base_url=os.getenv("BASE_URL"),
+            # Không có timeout thì default SDK là 600s/lần + 2 retry — endpoint
+            # chết sẽ block webhook hàng chục phút (user thấy bot "treo").
+            timeout=30,
+            max_retries=1,
         )
         self.checkin = CheckinFlowService(
             gapo=self.client,
@@ -101,6 +124,30 @@ class GapoAdapter:
         if not payload.message:
             return {"ok": True, "ignored": "empty_message"}
 
+        # IDEMPOTENCY: Gapo retry webhook khi timeout (pipeline có thể >30s) →
+        # cùng message_id đến 2 lần sẽ chạy đôi side-effect (tạo task trùng,
+        # nhắn người khác 2 lần...). Check-and-set vào Redis; Redis chết thì rơi
+        # về dedup in-process (cấp 2) thay vì fail-open hoàn toàn.
+        dedup_key = payload.message.id or payload.id
+        if dedup_key:
+            dk = str(dedup_key)
+            try:
+                from core.redis import get_redis
+                redis = await get_redis()
+                first_time = await redis.set(
+                    f"gapo_evt:{dk}", "1", nx=True, ex=600)
+                # Ghi nhận vào set in-process để 2 lớp đồng bộ nhau.
+                _seen_recently(dk)
+                if not first_time:
+                    logger.info("gapo duplicate event message_id=%s — bỏ qua", dk)
+                    return {"ok": True, "deduped": True}
+            except Exception:
+                # Redis lỗi: dùng lớp in-process. Nâng lên ERROR để ops thấy.
+                logger.error("Redis dedup lỗi, dùng dedup in-process", exc_info=True)
+                if _seen_recently(dk):
+                    logger.info("gapo duplicate event (in-process) message_id=%s — bỏ qua", dk)
+                    return {"ok": True, "deduped": True, "via": "in_process"}
+
         if not payload.thread_id or not bot_id:
             logger.warning("gapo missing thread_id or bot_id")
             return {"ok": False, "error": "missing_thread_or_bot_id"}
@@ -109,6 +156,26 @@ class GapoAdapter:
 
         message_type = payload.message.type
         user_text = self._extract_user_text(payload)
+
+        # Group: bot nhận qua webhook CẢ tin nhắn thường của nhóm (docs trang 35).
+        # Chỉ phản hồi khi được mention hoặc tin là command/quick_reply; còn lại
+        # bỏ qua IM LẶNG (kể cả ảnh/file/tin rỗng) để không spam nhóm.
+        is_group = self._is_group_thread(payload)
+        if is_group:
+            is_command = message_type in ("quick_reply", "menu") or user_text.strip().startswith("/")
+            if not self._is_bot_mentioned(payload, bot_id) and not is_command:
+                return {"ok": True, "ignored": "group_message_not_for_bot"}
+            user_text = self._strip_mentions(user_text)
+
+        # Trong group, mọi reply mention lại người hỏi để họ nhận thông báo và
+        # cả nhóm biết bot đang trả lời ai. Chat 1-1 thì để None (gửi thường).
+        mention_user_id = payload.from_user_id if is_group else None
+        mention_name = (
+            payload.message.user.name
+            if is_group and payload.message.user
+            else None
+        )
+
         timing_context = {
             "event_id": payload.id,
             "message_id": payload.message.id,
@@ -126,6 +193,8 @@ class GapoAdapter:
                 started_at=response_timer,
                 correlation_id=correlation_id,
                 audit_context={**timing_context, "reply_kind": "empty_message"},
+                mention_user_id=mention_user_id,
+                mention_name=mention_name,
             )
             return {"ok": True, "response_time_ms": elapsed_ms}
 
@@ -137,6 +206,8 @@ class GapoAdapter:
                 started_at=response_timer,
                 correlation_id=correlation_id,
                 audit_context={**timing_context, "reply_kind": "unsupported_message_type"},
+                mention_user_id=mention_user_id,
+                mention_name=mention_name,
             )
             return {"ok": True, "response_time_ms": elapsed_ms}
 
@@ -145,11 +216,17 @@ class GapoAdapter:
         # Lệnh tự-liên-kết: xử lý TRƯỚC khi chặn user chưa map, vì đây chính là
         # cách user chưa map gắn tài khoản Gapo của họ vào hệ thống.
         if user_text.strip().lower().startswith("/link"):
-            reply = await self._handle_link_command(
-                user_text=user_text,
-                gapo_user_id=payload.from_user_id,
-                thread_id=payload.thread_id,
-            )
+            if is_group:
+                # KHÔNG link trong group: gapo_thread_id lưu vào gapo_user_maps là
+                # thread nhận thông báo riêng tư (nhắc deadline...) — link ở đây sẽ
+                # bắn tin riêng của user vào nhóm.
+                reply = "Vui lòng nhắn /link trong cuộc trò chuyện 1-1 với bot để bảo mật thông tin của bạn."
+            else:
+                reply = await self._handle_link_command(
+                    user_text=user_text,
+                    gapo_user_id=payload.from_user_id,
+                    thread_id=payload.thread_id,
+                )
             elapsed_ms = await self.send_text_with_response_time(
                 thread_id=payload.thread_id,
                 bot_id=bot_id,
@@ -157,6 +234,8 @@ class GapoAdapter:
                 started_at=response_timer,
                 correlation_id=correlation_id,
                 audit_context={**timing_context, "reply_kind": "link_command"},
+                mention_user_id=mention_user_id,
+                mention_name=mention_name,
             )
             return {"ok": True, "handled_by": "link_command", "response_time_ms": elapsed_ms}
 
@@ -179,10 +258,16 @@ class GapoAdapter:
                 started_at=response_timer,
                 correlation_id=correlation_id,
                 audit_context={**timing_context, "reply_kind": "unmapped_user"},
+                mention_user_id=mention_user_id,
+                mention_name=mention_name,
             )
             return {"ok": True, "handled_by": "rejected_unmapped", "response_time_ms": elapsed_ms}
 
-        if mapped_user:
+        # Lệnh/nút bấm cập nhật task HOẶC đang trong PHIÊN /update -> KHÔNG để checkin
+        # nuốt (kể cả câu gõ thẳng để tìm task); đẩy thẳng xuống router.
+        from app.services.task_progress_service import is_in_session as _taskupd_in_session
+        skip_checkin = self._is_task_update_cmd(user_text) or await _taskupd_in_session(mapped_user["user_id"])
+        if mapped_user and not skip_checkin:
             async with AsyncSessionLocal() as db:
                 checkin_answer = await self.checkin.handle_message(
                     db,
@@ -200,6 +285,8 @@ class GapoAdapter:
                         started_at=response_timer,
                         correlation_id=correlation_id,
                         audit_context={**timing_context, "reply_kind": "checkin"},
+                        mention_user_id=mention_user_id,
+                        mention_name=mention_name,
                     )
                     return {"ok": True, "handled_by": "checkin", "response_time_ms": elapsed_ms}
                 elapsed_ms = self.response_time_ms(response_timer)
@@ -231,18 +318,27 @@ class GapoAdapter:
             )
             
             answer = getattr(result, "answer", None) or str(result)
-            elapsed_ms = await self.send_text_with_response_time(
-                thread_id=payload.thread_id,
-                bot_id=bot_id,
-                text=answer,
-                started_at=response_timer,
-                correlation_id=correlation_id,
-                audit_context={
-                    **timing_context,
-                    "reply_kind": "agent",
-                    "agent": getattr(result, "agent", "unknown"),
-                },
-            )
+            # Reply kèm 'menu' (nút chọn task khi mơ hồ) -> gửi quick-reply thay vì text.
+            menu = (getattr(result, "metadata", None) or {}).get("menu")
+            if menu:
+                await self.client.send_menu(
+                    thread_id=payload.thread_id, title=answer, actions=menu)
+                elapsed_ms = self.response_time_ms(response_timer)
+            else:
+                elapsed_ms = await self.send_text_with_response_time(
+                    thread_id=payload.thread_id,
+                    bot_id=bot_id,
+                    text=answer,
+                    started_at=response_timer,
+                    correlation_id=correlation_id,
+                    audit_context={
+                        **timing_context,
+                        "reply_kind": "agent",
+                        "agent": getattr(result, "agent", "unknown"),
+                    },
+                    mention_user_id=mention_user_id,
+                    mention_name=mention_name,
+                )
             
             if getattr(result, "agent", "") != "error":
                 try:
@@ -280,12 +376,24 @@ class GapoAdapter:
         started_at: float,
         correlation_id: str | None = None,
         audit_context: dict | None = None,
+        mention_user_id: int | str | None = None,
+        mention_name: str | None = None,
     ) -> int:
-        await self.client.send_text(
-            thread_id=thread_id,
-            bot_id=bot_id,
-            text=text,
-        )
+        # Có mention_user_id (trả lời trong group) → mention lại người hỏi;
+        # send_text_with_mention tự rơi về text thường nếu thiếu tên.
+        if mention_user_id is not None:
+            await self.client.send_text_with_mention(
+                thread_id=thread_id,
+                text=text,
+                mention_user_id=mention_user_id,
+                mention_name=mention_name,
+            )
+        else:
+            await self.client.send_text(
+                thread_id=thread_id,
+                bot_id=bot_id,
+                text=text,
+            )
         elapsed_ms = self.response_time_ms(started_at)
         logger.info(
             "[GAPO_RESPONSE_TIME] thread_id=%s correlation_id=%s response_time_ms=%s",
@@ -460,6 +568,37 @@ class GapoAdapter:
             return message.payload or message.text or ""
         return message.text or ""
 
+    @staticmethod
+    def _is_task_update_cmd(text: str) -> bool:
+        """Lệnh /update [<từ khoá>] hoặc payload nút bấm cập nhật task (router tự xử lý)."""
+        t = (text or "").strip()
+        first = t.split(maxsplit=1)[0].lower() if t else ""
+        return (first in ("/update", "/capnhat", "/task", "/tasks", "/mytask")
+                or t == "TASKCANCEL"
+                or t.startswith(("TASKPICK|", "TASKUPD|", "TASKBLOCK|", "TASKEXTEND|", "TASKSNOOZE|", "TASKPAGE|")))
+
     def _resolve_bot_id(self, payload: GapoWebhookPayload, headers: dict) -> str | int | None:
         header_bot_id = headers.get("x-gapo-bot-id") or headers.get("X-Gapo-Bot-Id")
         return header_bot_id or payload.to_bot_id
+
+
+    def _is_group_thread(self, payload: GapoWebhookPayload) -> bool:
+        thread = payload.message.thread if payload.message else None
+        # Docs chỉ ví dụ type="direct" cho 1-1; thiếu thông tin thì coi là direct
+        # để không lỡ tin nhắn 1-1 (an toàn hơn chiều ngược lại).
+        return bool(thread and thread.type and thread.type != "direct")
+    
+
+    def _is_bot_mentioned(self, payload: GapoWebhookPayload, bot_id) -> bool:
+        metadata = (payload.message.metadata or {}) if payload.message else {}
+        mentions = metadata.get("mentions") or []
+        return any(
+            str(m.get("target")) == str(bot_id)
+            for m in mentions if isinstance(m, dict)
+        )
+        
+    def _strip_mentions(self, text: str) -> str:
+        # Bỏ mention dạng "[@Tên](https://www.gapowork.vn/profile/123)" và "@Tên"
+        # đứng đầu câu để agent không phải đoán "@PM Bot" là gì.
+        text = re.sub(r"\[@[^\]]+\]\([^)]*\)", "", text)
+        return re.sub(r"^\s*@\S+\s*", "", text).strip()

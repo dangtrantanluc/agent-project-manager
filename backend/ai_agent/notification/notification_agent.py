@@ -23,6 +23,31 @@ Yêu cầu:
 - Chỉ trả về nội dung tin nhắn, không thêm tiêu đề.
 """
 
+# Số task tối đa liệt kê chi tiết trong 1 tin nhắc deadline; dư ra gộp thành
+# dòng "... và N task khác" để tin không quá dài (tối ưu UX).
+DEADLINE_MAX_DISPLAY = int(os.getenv("DEADLINE_MAX_DISPLAY", "5"))
+
+# Thứ tự ưu tiên hiển thị: URGENT > HIGH > MEDIUM > LOW (lạ -> cuối).
+_PRIORITY_RANK = {"URGENT": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+
+def _prioritize_tasks(tasks: list[dict], max_display: int) -> tuple[list[dict], int]:
+    """Sắp xếp task theo độ quan trọng và cắt còn tối đa max_display.
+
+    Khoá sắp xếp: đến-hạn-hôm-nay trước, rồi priority cao trước, rồi deadline gần.
+    Trả về (danh sách hiển thị, số task bị ẩn bớt).
+    """
+    def sort_key(t: dict):
+        due_today = 0 if t.get("reminder_type") == "due_today" else 1
+        prank = _PRIORITY_RANK.get(str(t.get("priority") or "").upper(), 4)
+        deadline = t.get("deadline")
+        return (due_today, prank, str(deadline))
+
+    ordered = sorted(tasks, key=sort_key)
+    if len(ordered) <= max_display:
+        return ordered, 0
+    return ordered[:max_display], len(ordered) - max_display
+
 @dataclass
 class NotificationPayload:
     user_id: str
@@ -91,10 +116,14 @@ class NotificationAgent:
         Falls back to a deterministic template whenever the LLM is unavailable
         or returns an empty response so scheduled reminders are not dropped.
         """
+        # Ưu tiên + cắt bớt để tin không quá dài khi có nhiều task trễ.
+        display_tasks, extra_count = _prioritize_tasks(tasks, DEADLINE_MAX_DISPLAY)
         fallback = self._fallback_deadline_digest(
             recipient_name=recipient_name,
             notify_date=notify_date,
-            tasks=tasks,
+            tasks=display_tasks,
+            extra_count=extra_count,
+            total=len(tasks),
         )
         if not tasks:
             return fallback
@@ -105,7 +134,9 @@ class NotificationAgent:
             prompt = self._deadline_digest_prompt(
                 recipient_name=recipient_name,
                 notify_date=notify_date,
-                tasks=tasks,
+                tasks=display_tasks,
+                extra_count=extra_count,
+                total=len(tasks),
             )
             start = time.perf_counter()
             response = await self.llm.ainvoke([
@@ -126,6 +157,8 @@ class NotificationAgent:
         recipient_name: str | None,
         notify_date: date | str,
         tasks: list[dict[str, Any]],
+        extra_count: int = 0,
+        total: int | None = None,
     ) -> str:
         task_lines = []
         for index, task in enumerate(tasks, start=1):
@@ -135,24 +168,32 @@ class NotificationAgent:
                     f"{index}. Task: {task.get('task_name') or task.get('name')}",
                     f"   Project: {task.get('project_name')}",
                     f"   Deadline: {self._format_date(task.get('deadline'))}",
+                    f"   Độ ưu tiên: {task.get('priority') or 'N/A'}",
                     f"   Status: {task.get('status') or 'N/A'}",
                     f"   Loại nhắc: {reminder_note}",
                 ])
             )
 
+        extra_note = (
+            f"\n\nLƯU Ý: còn {extra_count} task khác ưu tiên thấp hơn — KẾT THÚC tin bằng "
+            f'một dòng "...và {extra_count} task khác — gõ /update để xem & cập nhật".'
+            if extra_count else ""
+        )
         return (
             "Tạo một tin nhắn Gapo nhắc deadline bằng tiếng Việt.\n"
             "Chỉ trả về nội dung tin nhắn, không markdown phức tạp, không JSON.\n"
             "Nếu có một task, dùng format ngắn với Project/Task/Deadline.\n"
-            "Nếu có nhiều task, gom thành danh sách đánh số.\n"
+            "Nếu có nhiều task, gom thành danh sách đánh số, ưu tiên cao liệt kê trước.\n"
             "Giọng văn thân thiện, rõ hành động: cập nhật tiến độ, hoàn thành task hoặc báo blocker.\n"
             "Nếu loại nhắc là đến hạn hôm nay, nhấn mạnh task cần hoàn thành trong hôm nay.\n"
             "Nếu loại nhắc là sắp đến hạn, nhắc còn khoảng 2 ngày.\n\n"
             f"Người nhận: {recipient_name or 'bạn'}\n"
             f"Ngày gửi nhắc: {self._format_date(notify_date)}\n"
-            f"Số task: {len(tasks)}\n\n"
+            f"Tổng số task đến hạn: {total if total is not None else len(tasks)} "
+            f"(hiển thị {len(tasks)} task ưu tiên cao nhất)\n\n"
             "Danh sách task:\n"
             + "\n\n".join(task_lines)
+            + extra_note
         )
 
     def _fallback_deadline_digest(
@@ -161,6 +202,8 @@ class NotificationAgent:
         recipient_name: str | None,
         notify_date: date | str,
         tasks: list[dict[str, Any]],
+        extra_count: int = 0,
+        total: int | None = None,
     ) -> str:
         if not tasks:
             return (
@@ -169,7 +212,10 @@ class NotificationAgent:
                 "Hiện không có task nào cần nhắc."
             )
 
-        if len(tasks) == 1:
+        if total is None:
+            total = len(tasks)
+
+        if total == 1:
             task = tasks[0]
             reminder_text = self._fallback_reminder_text(task)
             return (
@@ -189,13 +235,18 @@ class NotificationAgent:
             "",
         ]
         for index, task in enumerate(tasks, start=1):
+            prio = task.get("priority")
             lines.extend([
-                f"{index}. {task.get('task_name') or task.get('name')}",
+                f"{index}. {task.get('task_name') or task.get('name')}"
+                + (f" [{prio}]" if prio else ""),
                 f"   Project: {task.get('project_name')}",
                 f"   Deadline: {self._format_date(task.get('deadline'))}",
                 f"   Ghi chú: {self._reminder_note(task)}",
                 "",
             ])
+        if extra_count:
+            lines.append(f"...và {extra_count} task khác — gõ /update để xem & cập nhật.")
+            lines.append("")
         lines.append("Bạn cập nhật tiến độ, hoàn thành task hoặc báo blocker nếu cần hỗ trợ nhé.")
         return "\n".join(lines).strip()
 
