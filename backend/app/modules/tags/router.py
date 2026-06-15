@@ -25,13 +25,17 @@ def _tag_row(r) -> dict:
         "id": r[0], "name": r[1], "color": r[2],
         "taskCount": int(r[3]) if len(r) > 3 and r[3] is not None else 0,
         "projectCount": int(r[4]) if len(r) > 4 and r[4] is not None else 0,
+        # owner_user_id NULL -> tag chung; có giá trị -> tag riêng của user đó.
+        "ownerUserId": r[5] if len(r) > 5 else None,
+        "isPersonal": (len(r) > 5 and r[5] is not None),
     }
 
 
 _SELECT_TAG_COUNTS = """
     SELECT t.id, t.name, t.color,
            (SELECT COUNT(*) FROM task_tags tt WHERE tt.tag_id = t.id)    AS task_count,
-           (SELECT COUNT(*) FROM project_tags pt WHERE pt.tag_id = t.id) AS project_count
+           (SELECT COUNT(*) FROM project_tags pt WHERE pt.tag_id = t.id) AS project_count,
+           t.owner_user_id
     FROM tags t
 """
 
@@ -40,11 +44,19 @@ _SELECT_TAG_COUNTS = """
 @router.get("/tags")
 async def list_tags(
     q: str | None = None,
+    scope: str | None = None,  # mine | shared | None(=all: chung + của tôi)
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    where = "WHERE t.company_id = :cid"
-    params: dict = {"cid": current_user["companyId"]}
+    # Mặc định: tag chung (owner NULL) + tag riêng CỦA CHÍNH MÌNH. Không bao giờ
+    # trả tag riêng của người khác.
+    params: dict = {"cid": current_user["companyId"], "me": current_user["id"]}
+    if scope == "mine":
+        where = "WHERE t.company_id = :cid AND t.owner_user_id = :me"
+    elif scope == "shared":
+        where = "WHERE t.company_id = :cid AND t.owner_user_id IS NULL"
+    else:
+        where = "WHERE t.company_id = :cid AND (t.owner_user_id IS NULL OR t.owner_user_id = :me)"
     if q:
         where += " AND t.name ILIKE :like"
         params["like"] = f"%{q}%"
@@ -65,15 +77,17 @@ async def create_tag(
     if not name:
         raise HTTPException(status_code=422, detail="Tên nhãn không được rỗng")
     color = (body.get("color") or "#3b82f6").strip()
+    # personal=true -> tag RIÊNG của người tạo; không -> tag chung công ty (như cũ).
+    owner_user_id = current_user["id"] if body.get("personal") else None
     try:
         row = (await db.execute(
             text("""
-                INSERT INTO tags (name, color, company_id, created_by, updated_at)
-                VALUES (:name, :color, :cid, :uid, NOW())
-                RETURNING id, name, color
+                INSERT INTO tags (name, color, company_id, created_by, owner_user_id, updated_at)
+                VALUES (:name, :color, :cid, :uid, :owner, NOW())
+                RETURNING id, name, color, 0, 0, owner_user_id
             """),
             {"name": name, "color": color, "cid": current_user["companyId"],
-             "uid": current_user["id"]},
+             "uid": current_user["id"], "owner": owner_user_id},
         )).fetchone()
         await db.commit()
     except IntegrityError:
@@ -90,9 +104,12 @@ async def update_tag(
     db: AsyncSession = Depends(get_db),
 ):
     _ensure_can_write(current_user)
+    # Tag riêng: chỉ chủ sửa được. Tag chung (owner NULL): ai cũng sửa (như cũ).
     existing = (await db.execute(
-        text("SELECT id FROM tags WHERE id = :id AND company_id = :cid"),
-        {"id": tag_id, "cid": current_user["companyId"]},
+        text("""SELECT id FROM tags
+                WHERE id = :id AND company_id = :cid
+                  AND (owner_user_id IS NULL OR owner_user_id = :me)"""),
+        {"id": tag_id, "cid": current_user["companyId"], "me": current_user["id"]},
     )).fetchone()
     if not existing:
         raise HTTPException(status_code=404, detail="Nhãn không tồn tại")
@@ -108,7 +125,8 @@ async def update_tag(
             params[js] = value
     try:
         row = (await db.execute(
-            text(f"UPDATE tags SET {', '.join(sets)} WHERE id = :id RETURNING id, name, color"),
+            text(f"UPDATE tags SET {', '.join(sets)} WHERE id = :id "
+                 "RETURNING id, name, color, 0, 0, owner_user_id"),
             params,
         )).fetchone()
         await db.commit()
@@ -125,9 +143,12 @@ async def delete_tag(
     db: AsyncSession = Depends(get_db),
 ):
     _ensure_can_write(current_user)
+    # Tag riêng: chỉ chủ xoá được. Tag chung: ai cũng xoá (như cũ).
     row = (await db.execute(
-        text("SELECT id FROM tags WHERE id = :id AND company_id = :cid"),
-        {"id": tag_id, "cid": current_user["companyId"]},
+        text("""SELECT id FROM tags
+                WHERE id = :id AND company_id = :cid
+                  AND (owner_user_id IS NULL OR owner_user_id = :me)"""),
+        {"id": tag_id, "cid": current_user["companyId"], "me": current_user["id"]},
     )).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Nhãn không tồn tại")
@@ -139,14 +160,21 @@ async def delete_tag(
 # ── Gắn tag cho TASK / PROJECT (set toàn bộ danh sách) ─────────────────────────
 async def _set_entity_tags(
     db: AsyncSession, *, link_table: str, id_col: str, entity_id: int,
-    tag_ids: list[int], company_id: int,
+    tag_ids: list[int], company_id: int, user_id: int,
 ) -> list[dict]:
-    """Đặt lại toàn bộ tag cho 1 thực thể. Chỉ nhận tag cùng company."""
+    """Đặt lại toàn bộ tag GẮN ĐƯỢC cho 1 thực thể.
+
+    Chỉ nhận tag cùng company VÀ (tag chung HOẶC tag riêng của chính người gắn) —
+    không cho gắn tag riêng của người khác. Khi trả về cũng chỉ gồm tag người gắn
+    được phép thấy (đồng nhất với danh sách họ vừa set).
+    """
     clean_ids = sorted({int(t) for t in (tag_ids or [])})
     if clean_ids:
         valid = (await db.execute(
-            text("SELECT id FROM tags WHERE company_id = :cid AND id = ANY(:ids)"),
-            {"cid": company_id, "ids": clean_ids},
+            text("""SELECT id FROM tags
+                    WHERE company_id = :cid AND id = ANY(:ids)
+                      AND (owner_user_id IS NULL OR owner_user_id = :me)"""),
+            {"cid": company_id, "ids": clean_ids, "me": user_id},
         )).fetchall()
         valid_ids = {r[0] for r in valid}
         invalid = set(clean_ids) - valid_ids
@@ -186,6 +214,7 @@ async def set_task_tags(
     tags = await _set_entity_tags(
         db, link_table="task_tags", id_col="task_id", entity_id=task_id,
         tag_ids=body.get("tagIds", []), company_id=current_user["companyId"],
+        user_id=current_user["id"],
     )
     return {"data": tags}
 
@@ -207,5 +236,6 @@ async def set_project_tags(
     tags = await _set_entity_tags(
         db, link_table="project_tags", id_col="project_id", entity_id=project_id,
         tag_ids=body.get("tagIds", []), company_id=current_user["companyId"],
+        user_id=current_user["id"],
     )
     return {"data": tags}

@@ -112,7 +112,8 @@ Lưu ý quan trọng:
 - Câu truy vấn phải trả về dữ liệu phù hợp để trả lời câu hỏi, không được trả về dữ liệu thừa hoặc thiếu
 - Cố gắng tối ưu câu truy vấn để trả về kết quả nhanh nhất có thể, tránh sử dụng các phép toán phức tạp hoặc subquery không cần thiết
 - Viết câu truy vấn bằng tiếng Việt nếu có thể, nhưng vẫn phải tuân thủ cú pháp SQL chuẩn
-- Nếu câu hỏi không thể trả lời bằng SQL, hãy trả về một câu truy vấn đơn giản trả về một thông báo phù hợp, ví dụ: SELECT 'Câu hỏi không thể trả lời bằng SQL' AS message;
+- Nếu kết quả rỗng, nói rõ không tìm thấy và gợi ý hỏi lại cụ thể hơn
+- ĐỊNH DẠNG ĐẦU RA (BẮT BUỘC): CHỈ trả về DUY NHẤT câu lệnh SQL, bắt đầu bằng SELECT hoặc WITH và kết thúc bằng dấu chấm phẩy. TUYỆT ĐỐI KHÔNG kèm lời giải thích, KHÔNG văn xuôi dẫn nhập ("Để trả lời..."), KHÔNG markdown, KHÔNG khối ```sql. Ký tự đầu tiên của câu trả lời phải là chữ S (SELECT) hoặc W (WITH).
 
 Cú pháp ngày tháng (BẮT BUỘC dùng PostgreSQL, KHÔNG dùng cú pháp MySQL):
 - Đây là PostgreSQL. TUYỆT ĐỐI KHÔNG viết `INTERVAL (biểu_thức) DAY` hay `INTERVAL n DAY` (đó là MySQL và sẽ gây lỗi cú pháp).
@@ -121,6 +122,8 @@ Cú pháp ngày tháng (BẮT BUỘC dùng PostgreSQL, KHÔNG dùng cú pháp My
 - "Tuần này" (tuần bắt đầu từ Thứ Hai): dùng `date_trunc('week', CURRENT_DATE)` làm đầu tuần và `date_trunc('week', CURRENT_DATE) + INTERVAL '6 days'` làm cuối tuần.
 - "Tháng này": `date_trunc('month', CURRENT_DATE)` đến `date_trunc('month', CURRENT_DATE) + INTERVAL '1 month' - INTERVAL '1 day'`.
 - Lấy số thứ tự ngày trong tuần: `EXTRACT(DOW FROM CURRENT_DATE)` (Chủ Nhật = 0). Ưu tiên `date_trunc` thay vì tự tính bằng EXTRACT.
+
+NHẮC LẠI LẦN CUỐI: Chỉ in ra câu SQL thuần. Không một từ nào khác ngoài SQL.
 """
 
 class Text2SQLAgent:
@@ -148,13 +151,26 @@ class Text2SQLAgent:
         return SCHEMA_COMPACT
 
     def _clean_sql(self, sql: str) -> str:
+        """Bóc câu SQL từ output LLM kèm markdown — AN TOÀN.
+
+        LLM (nhất là qua proxy) hay trả "Để trả lời ... đây là SQL: ```sql ...```"
+        thay vì SQL thuần. Ở đây CHỈ gỡ khối markdown bao quanh, lấy NGUYÊN ruột
+        fence (không cắt tại ; đầu) — để chuỗi nhiều câu lệnh / mutation ẩn / tiền
+        tố lạ (EXPLAIN...) vẫn lộ nguyên cho is_safe_sql từ chối.
+
+        TUYỆT ĐỐI không "trích" 1 câu SELECT ra khỏi văn bản: làm thế sẽ vô hiệu
+        is_safe_sql (vd "SELECT 1; DROP" -> "SELECT 1;" thì lọt mutation; "EXPLAIN
+        ... SELECT 1;" -> "SELECT 1;" thì lọt lệnh không phải SELECT).
+
+        Không có fence -> trả nguyên (để is_safe_sql kiểm trên chuỗi gốc).
+        """
         sql = sql.strip()
-        if sql.startswith("```"):
-            parts = sql.split("```")
-            sql = parts[1] if len(parts) > 1 else sql
-            if sql.lstrip().lower().startswith("sql"):
-                sql = sql.lstrip()[3:]
-        return sql.strip()
+
+        fence = re.search(r"```(?:sql)?\s*(.*?)```", sql, re.DOTALL | re.IGNORECASE)
+        if fence:
+            return fence.group(1).strip()
+
+        return sql
 
     def _coerce_user_id(self, current_user_id: int | str | None) -> int | None:
         if current_user_id is None:
@@ -318,20 +334,25 @@ Yêu cầu:
 - Không hiển thị SQL, tên bảng, hoặc JSON thô
 - Đừng chỉ đọc số — hãy nói ý nghĩa: tốt hay chưa tốt, đúng hạn hay trễ
 - Nếu dữ liệu cho thấy vấn đề (task trễ, không có worklog, milestone sắp hết), nhận xét 1 câu
-- Nếu kết quả rỗng, nói rõ không tìm thấy và gợi ý hỏi lại cụ thể hơn
+- Nếu kết quả rỗng ([]), nghĩa là truy vấn chạy đúng nhưng KHÔNG có bản ghi nào thỏa câu hỏi. Hãy trả lời tự nhiên đúng theo câu hỏi rằng không có dữ liệu đó — ví dụ hỏi "hôm nay tôi có task gì không?" thì trả lời "Hôm nay bạn không có task nào cả." Tuyệt đối không nói chung chung kiểu "không tìm thấy dữ liệu phù hợp".
 """
 
     async def summarize_result(self, question: str, rows: list[dict], memory_context: str = "") -> str:
-        """Dùng LLM diễn giải kết quả truy vấn thành câu trả lời gửi cho người dùng (1 call)."""
-        if not rows:
-            return "Mình không tìm thấy dữ liệu phù hợp để trả lời câu hỏi này."
+        """Dùng LLM diễn giải kết quả truy vấn thành câu trả lời gửi cho người dùng (1 call).
 
+        Kể cả khi rows rỗng vẫn gọi LLM để câu trả lời "không có dữ liệu" bám sát
+        câu hỏi (vd. "Hôm nay bạn không có task nào") thay vì câu chung chung.
+        """
         prompt_text = self._build_summary_prompt(question, rows, memory_context)
         response = await self.llm.ainvoke([
             SystemMessage(content=prompt_text),
             HumanMessage(content="Hãy trả lời câu hỏi dựa trên kết quả truy vấn database ở trên.")
         ])
-        return (response.content or "").strip()
+        answer = (response.content or "").strip()
+        # Fallback an toàn nếu LLM trả rỗng (vd. lỗi proxy) — vẫn ưu tiên LLM ở trên.
+        if not answer:
+            return "Hiện mình chưa tìm thấy dữ liệu nào khớp với câu hỏi của bạn."
+        return answer
 
     def _answer_cache_key(self, sql: str, result: list[dict]) -> str:
         raw = f"{sql}:{json.dumps(result, sort_keys=True, default=str)}"

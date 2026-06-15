@@ -351,6 +351,7 @@ class GapoAdapter:
                         db=db,
                         user_id=mapped_user["user_id"],
                         company_id=mapped_user.get("company_id"),
+                        last_sql=getattr(result, "last_sql", None),
                     )
                 except Exception:
                     await db.rollback()

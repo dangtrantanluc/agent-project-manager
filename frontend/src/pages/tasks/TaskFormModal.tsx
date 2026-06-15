@@ -2,7 +2,7 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { taskCreateSchema, type TaskCreateInput, TaskStatus, Priority } from "@bb-pm/shared";
-import { createTask, updateTask, type TaskListItem } from "@/features/tasks/api";
+import { createTask, updateTask, listBlockers, resolveBlocker, type TaskListItem } from "@/features/tasks/api";
 import { listWorklogs } from "@/features/worklogs/api";
 import { listMilestones } from "@/features/milestones/api";
 import { listMembers } from "@/features/members/api";
@@ -14,6 +14,17 @@ import { useEffect, useState } from "react";
 import { formatDate, formatHours } from "@/lib/format";
 
 type UserOption = { id: number; fullName: string; email: string };
+
+/** "đã kẹt bao lâu" tính từ created_at đến giờ — dạng ngắn gọn tiếng Việt. */
+function elapsedSince(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  const days = Math.floor(ms / 86_400_000);
+  if (days >= 1) return `${days} ngày`;
+  const hours = Math.floor(ms / 3_600_000);
+  if (hours >= 1) return `${hours} giờ`;
+  const mins = Math.max(1, Math.floor(ms / 60_000));
+  return `${mins} phút`;
+}
 
 export function TaskFormModal({
   open,
@@ -42,6 +53,19 @@ export function TaskFormModal({
     queryKey: ["worklogs", { taskId: task?.id }],
     queryFn: () => listWorklogs({ taskId: task!.id, limit: 100 }),
     enabled: open && !!task?.id,
+  });
+  const blockersQ = useQuery({
+    queryKey: ["blockers", { taskId: task?.id }],
+    queryFn: () => listBlockers(task!.id),
+    enabled: open && !!task?.id,
+  });
+  const resolveBlockerM = useMutation({
+    mutationFn: (blockerId: number) => resolveBlocker(blockerId),
+    onSuccess: () => {
+      blockersQ.refetch();
+      // Badge "đang kẹt" ở list/board lấy từ blockerCount -> làm mới task lists.
+      qc.invalidateQueries({ queryKey: ["tasks"] });
+    },
   });
 
   const form = useForm<TaskCreateInput>({
@@ -168,10 +192,12 @@ export function TaskFormModal({
           <div>
             <label className="label">Deadline</label>
             <DateField form={form} name="deadline" />
+            {form.formState.errors.deadline && <p className="mt-1 text-xs text-red-600">{form.formState.errors.deadline.message}</p>}
           </div>
           <div>
-            <label className="label">End at</label>
+            <label className="label">End at <span className="font-normal text-slate-400">(tùy chọn)</span></label>
             <DateField form={form} name="endAt" />
+            {form.formState.errors.endAt && <p className="mt-1 text-xs text-red-600">{form.formState.errors.endAt.message}</p>}
           </div>
           <div className="col-span-2">
             <label className="label">Nhãn</label>
@@ -184,6 +210,46 @@ export function TaskFormModal({
         </div>
 
         {save.isError && <p className="text-sm text-red-600">Có lỗi, vui lòng thử lại.</p>}
+
+        {task && (blockersQ.data?.some((b) => !b.resolvedAt) || (blockersQ.data?.length ?? 0) > 0) && (
+          <section className="rounded-md border border-red-200 bg-red-50/40 p-3 dark:border-red-900/50 dark:bg-red-900/10">
+            <div className="mb-2 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-red-700 dark:text-red-300">⛔ Vướng mắc (blocker)</h3>
+              <span className="text-xs text-slate-500">
+                {blockersQ.data?.filter((b) => !b.resolvedAt).length ?? 0} chưa gỡ
+              </span>
+            </div>
+            <ul className="space-y-1.5">
+              {blockersQ.data?.map((b) => (
+                <li
+                  key={b.id}
+                  className={`flex items-start justify-between gap-2 rounded border border-slate-100 bg-white p-2 text-xs dark:border-slate-800 dark:bg-slate-900 ${b.resolvedAt ? "opacity-60" : ""}`}
+                >
+                  <div className="min-w-0">
+                    <p className={`text-slate-700 dark:text-slate-300 ${b.resolvedAt ? "line-through" : ""}`}>
+                      {b.description || "—"}
+                    </p>
+                    <p className="mt-0.5 text-slate-400">
+                      {b.resolvedAt
+                        ? `Đã gỡ ${formatDate(b.resolvedAt)}`
+                        : `Đã kẹt ${elapsedSince(b.createdAt)} · báo ${formatDate(b.createdAt)}`}
+                    </p>
+                  </div>
+                  {!b.resolvedAt && (
+                    <button
+                      type="button"
+                      className="btn-ghost shrink-0 border border-slate-200 px-2 py-1 text-xs dark:border-slate-700"
+                      disabled={resolveBlockerM.isPending}
+                      onClick={() => resolveBlockerM.mutate(b.id)}
+                    >
+                      ✅ Đã gỡ
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         {task && (
           <section className="rounded-md border border-slate-200 p-3 dark:border-slate-800">

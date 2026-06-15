@@ -6,16 +6,25 @@ export type Tag = {
   color: string;
   taskCount?: number;
   projectCount?: number;
+  /** null = tag chung công ty; có giá trị = tag riêng của user đó. */
+  ownerUserId?: number | null;
+  /** true = tag riêng (chỉ chủ thấy). */
+  isPersonal?: boolean;
 };
 
-export async function listTags(q?: string): Promise<Tag[]> {
-  const { data } = await apiClient.get<{ data: Tag[] }>("/tags", {
-    params: q ? { q } : {},
-  });
+export async function listTags(q?: string, scope?: "mine" | "shared"): Promise<Tag[]> {
+  const params: Record<string, string> = {};
+  if (q) params.q = q;
+  if (scope) params.scope = scope;
+  const { data } = await apiClient.get<{ data: Tag[] }>("/tags", { params });
   return data.data;
 }
 
-export async function createTag(input: { name: string; color?: string }): Promise<Tag> {
+export async function createTag(input: {
+  name: string;
+  color?: string;
+  personal?: boolean;
+}): Promise<Tag> {
   const { data } = await apiClient.post<{ data: Tag }>("/tags", input);
   return data.data;
 }

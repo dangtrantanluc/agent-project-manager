@@ -1,20 +1,14 @@
-"""Cảnh báo rủi ro có PM phê duyệt — human-in-the-loop (sơ đồ Luồng 4, ⑰⑱⑲⑳).
+"""Cảnh báo rủi ro — THÔNG BÁO THUẦN cho PM (không cần duyệt).
 
 Luồng:
-  1. scan_and_alert(): quét at-risk (risk_detector) -> soạn cảnh báo + đề xuất ->
-     gửi DM cho PM (owner/account_manager) -> lưu risk_alerts (PENDING_PM_CONFIRMATION).
-  2. PM trả lời trong DM -> message_router gọi find_pending_for() (STATE-GATE) ->
-     classify_decision() phân APPROVE/DISMISS -> handle_decision() chốt trạng thái,
-     (tuỳ chọn) broadcast cảnh báo vào group dự án.
-
-Thiết kế phân loại xác nhận: LLM là chính, rule là lưới an toàn — và CHỈ chạy SAU
-khi state-gate xác nhận có cảnh báo đang chờ (không thêm danh mục vào router toàn cục,
-tránh lỗi định tuyến mở). Xem [[project_router_multiagent]].
+  scan_and_alert(): quét at-risk (risk_detector) -> soạn cảnh báo + đề xuất ->
+  GỬI THẲNG DM cho PM (owner/account_manager) -> lưu risk_alerts ('APPROVED' = đã
+  gửi & ghi nhận). KHÔNG còn bước PM duyệt/bỏ qua, KHÔNG broadcast group, KHÔNG
+  state-gate. Bản ghi giữ để dedup 1 cảnh báo/project/ngày + audit.
 """
 import json
 import logging
 import os
-from dataclasses import dataclass
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,10 +20,8 @@ from app.services.risk_detector import detect_at_risk_projects, ProjectRisk
 
 logger = logging.getLogger(__name__)
 
-PENDING_TTL_HOURS = 48
-
 # Sentinel để phân biệt "không truyền llm" (mặc định -> tự build từ env) với
-# "truyền llm=None" (ép tắt LLM -> dùng rule/template, dùng trong test).
+# "truyền llm=None" (ép tắt LLM -> dùng template, dùng trong test).
 _LLM_UNSET = object()
 
 # Đề xuất hành động tất định theo từng loại tín hiệu rủi ro.
@@ -60,29 +52,10 @@ def _task_action(reason: str, name: str, assignee: str | None) -> str:
         "stale":        f"Yêu cầu {who} cập nhật tiến độ '{name}' (lâu không động).",
     }.get(reason, f"Rà soát '{name}'.")
 
-_APPROVE_WORDS = (
-    "ok", "oke", "okay", "duyệt", "duyet", "đồng ý", "dong y", "gửi", "gui",
-    "xác nhận", "xac nhan", "yes", "ừ", "u", "uh", "đồng ý gửi", "chốt", "chot",
-)
-_DISMISS_WORDS = (
-    "không", "khong", "bỏ qua", "bo qua", "khoan", "để sau", "de sau", "thôi",
-    "thoi", "huỷ", "huy", "hủy", "no", "khỏi", "khoi", "đừng", "dung gui",
-)
-
-
-@dataclass
-class PendingAlert:
-    id: int
-    project_id: int
-    project_name: str
-    draft_message: str
-    pm_user_id: int
-
-
 class RiskAlertService:
     def __init__(self, gapo: GapoClient | None = None, llm=_LLM_UNSET):
         self.gapo = gapo or GapoClient()
-        # LLM dùng để (a) soạn cảnh báo đẹp hơn, (b) phân loại xác nhận.
+        # LLM dùng để soạn cảnh báo mạch lạc hơn (tuỳ chọn; không có vẫn chạy template).
         # Không truyền -> tự build từ env; truyền None -> tắt LLM (rule/template).
         self.llm = self._build_llm() if llm is _LLM_UNSET else llm
 
@@ -100,8 +73,10 @@ class RiskAlertService:
     # ── 1. QUÉT & GỬI CẢNH BÁO ────────────────────────────────────────────────
     async def scan_and_alert(self, db: AsyncSession, today_iso: str,
                              project_id: int | None = None) -> dict:
-        """Quét at-risk và gửi cảnh báo PENDING cho PM. Trả thống kê {sent, skipped}.
+        """Quét at-risk và GỬI THẲNG cảnh báo (thông báo thuần) cho PM. {sent, skipped}.
 
+        KHÔNG còn bước PM duyệt/bỏ qua: gửi DM xong là ghi 'APPROVED' (= đã gửi &
+        ghi nhận). Bản ghi vẫn giữ để dedup 1 cảnh báo/project/ngày + audit.
         project_id != None -> chỉ quét đúng 1 project (near-real-time).
         """
         risks = await detect_at_risk_projects(db, project_id=project_id)
@@ -128,7 +103,7 @@ class RiskAlertService:
                      draft_message, status, thread_id, correlation_id, created_at, updated_at)
                 VALUES
                     (:pid, :pm, :score, :level, CAST(:reasons AS jsonb),
-                     :draft, 'PENDING_PM_CONFIRMATION', :thread, :cid, NOW(), NOW())
+                     :draft, 'APPROVED', :thread, :cid, NOW(), NOW())
             """), {
                 "pid": risk.project_id, "pm": pm_id, "score": risk.score,
                 "level": risk.level, "reasons": json.dumps(risk.reasons, ensure_ascii=False),
@@ -138,7 +113,7 @@ class RiskAlertService:
             await create_notification(
                 db, user_id=pm_id, type="risk_alert",
                 title=f"Cảnh báo rủi ro: {risk.project_name}",
-                body=f"Mức {risk.level} — cần bạn xác nhận", link="/projects", commit=False,
+                body=f"Mức {risk.level} — dự án đang có rủi ro, bạn rà soát giúp nhé", link="/projects", commit=False,
             )
             await db.execute(text("""
                 INSERT INTO agent_audit_log (tool, args_json, source, correlation_id, created_at)
@@ -153,8 +128,8 @@ class RiskAlertService:
 
             # Gửi DM cho PM — ưu tiên receiver_id (DM chủ động, Gapo tự định tuyến
             # thread 1-1 đúng người; POST vào thread_id cũ có thể 200 nhưng không giao).
-            # GỬI THẤT BẠI -> đánh EXPIRED ngay: alert "ma" (PENDING mà PM chưa từng
-            # thấy) sẽ khiến state-gate chặn hội thoại của PM vô cớ.
+            # GỬI THẤT BẠI -> đánh EXPIRED: bản ghi 'APPROVED' (đã gửi) nhưng PM chưa
+            # từng thấy là sai sự thật; EXPIRED đánh dấu "thông báo không tới được".
             try:
                 if gapo_user_id:
                     await self.gapo.send_to_user(receiver_id=gapo_user_id, text=draft)
@@ -223,8 +198,7 @@ class RiskAlertService:
             "Đề xuất hành động:",
             *[f"- {a}" for a in actions],
             "",
-            'Bạn xác nhận ghi nhận/gửi cảnh báo này chứ? Trả lời "OK/duyệt" để xác nhận, '
-            '"bỏ qua" để huỷ.',
+            "Bạn rà soát và xử lý sớm giúp nhé.",
         ]
         template = "\n".join(lines)
         if self.llm is None:
@@ -232,8 +206,8 @@ class RiskAlertService:
         try:
             prompt = (
                 "Bạn là trợ lý PM. Viết lại cảnh báo rủi ro dưới đây cho mạch lạc, "
-                "thân thiện, GIỮ NGUYÊN số liệu và các đề xuất, kết thúc bằng câu hỏi "
-                "xác nhận. KHÔNG bịa thêm số liệu.\n\n" + template
+                "thân thiện, GIỮ NGUYÊN số liệu và các đề xuất. KHÔNG bịa thêm số "
+                "liệu. KHÔNG hỏi xác nhận (đây là thông báo, không cần PM duyệt).\n\n" + template
             )
             resp = self.llm.invoke(prompt)
             return (resp.content or "").strip() or template
@@ -241,126 +215,7 @@ class RiskAlertService:
             logger.exception("[Risk] LLM soạn cảnh báo lỗi, dùng template")
             return template
 
-    # ── 2. STATE-GATE: có cảnh báo đang chờ PM này không? ─────────────────────
-    async def find_pending_list(self, db: AsyncSession, user_id: str, thread_id: str | None) -> list[PendingAlert]:
-        """TẤT CẢ cảnh báo PENDING của PM trong thread (mới nhất trước), còn TTL.
-
-        Trả list để quyết định của PM áp cho TOÀN BỘ (PM sở hữu nhiều project
-        at-risk -> nhiều alert cùng thread; duyệt từng cái một sẽ khiến tin nhắn
-        kế tiếp lại bị gate bắt — và PM không biết mình đang duyệt cái nào).
-        """
-        if not thread_id:
-            return []
-        try:
-            uid = int(user_id)
-        except (TypeError, ValueError):
-            return []
-        rows = (await db.execute(text("""
-            SELECT ra.id, ra.project_id, p.name, ra.draft_message, ra.pm_user_id
-            FROM risk_alerts ra
-            JOIN projects p ON p.id = ra.project_id
-            WHERE ra.pm_user_id = :uid AND ra.thread_id = :thread
-              AND ra.status = 'PENDING_PM_CONFIRMATION'
-              AND ra.created_at >= NOW() - (CAST(:ttl AS int) * INTERVAL '1 hour')
-            ORDER BY ra.created_at DESC
-        """), {"uid": uid, "thread": str(thread_id), "ttl": PENDING_TTL_HOURS})).fetchall()
-        return [PendingAlert(id=r[0], project_id=r[1], project_name=r[2],
-                             draft_message=r[3], pm_user_id=r[4]) for r in rows]
-
-    async def find_pending_for(self, db: AsyncSession, user_id: str, thread_id: str | None) -> PendingAlert | None:
-        """Cảnh báo PENDING mới nhất (giữ cho tương thích cũ/test)."""
-        alerts = await self.find_pending_list(db, user_id, thread_id)
-        return alerts[0] if alerts else None
-
-    # ── Phân loại APPROVE / DISMISS / UNCLEAR ─────────────────────────────────
-    def classify_decision(self, message: str) -> str:
-        """LLM chính, rule lưới. Trả 'approve' | 'dismiss' | 'unclear'."""
-        if self.llm is not None:
-            try:
-                return self._llm_decision(message)
-            except Exception:
-                logger.exception("[Risk] LLM classify lỗi, dùng rule")
-        return self._rule_decision(message)
-
-    def _rule_decision(self, message: str) -> str:
-        lowered = (message or "").lower().strip()
-        # Ưu tiên DISMISS khi có phủ định rõ ("không gửi") để không bị "gửi" lừa.
-        if any(w in lowered for w in _DISMISS_WORDS):
-            return "dismiss"
-        if any(w in lowered for w in _APPROVE_WORDS):
-            return "approve"
-        return "unclear"
-
-    def _llm_decision(self, message: str) -> str:
-        prompt = (
-            "PM vừa nhận một cảnh báo rủi ro và đang trả lời. Phân loại câu trả lời "
-            "thành ĐÚNG MỘT từ: approve (đồng ý/duyệt/gửi), dismiss (bỏ qua/không gửi/để sau), "
-            "hoặc unclear (không rõ). CHỈ in ra một từ đó.\n\n"
-            f'Câu trả lời: "{message}"\nKết quả:'
-        )
-        resp = self.llm.invoke(prompt)
-        out = (resp.content or "").strip().lower()
-        for label in ("approve", "dismiss", "unclear"):
-            if label in out:
-                return label
-        return self._rule_decision(message)
-
-    # ── 3. CHỐT QUYẾT ĐỊNH ────────────────────────────────────────────────────
-    async def apply_decision(
-        self, db: AsyncSession, alerts: list[PendingAlert], decision: str, note: str,
-    ) -> str:
-        """Áp quyết định approve/dismiss cho TOÀN BỘ alerts. Trả câu phản hồi cho PM.
-
-        Chống race: UPDATE có guard ``status='PENDING_PM_CONFIRMATION'`` và chỉ
-        ghi audit / broadcast cho alert mà CHÍNH transaction này chuyển trạng thái
-        (rowcount=1). Hai tin nhắn đồng thời -> tin thứ 2 update 0 dòng -> không
-        duyệt/đăng group lần hai.
-        """
-        new_status = "APPROVED" if decision == "approve" else "DISMISSED"
-        applied: list[PendingAlert] = []
-        for alert in alerts:
-            res = await db.execute(text("""
-                UPDATE risk_alerts
-                SET status = :st, decided_at = NOW(), decision_note = :note, updated_at = NOW()
-                WHERE id = :id AND status = 'PENDING_PM_CONFIRMATION'
-            """), {"st": new_status, "note": note, "id": alert.id})
-            if res.rowcount != 1:
-                continue  # alert đã được xử lý bởi request khác -> bỏ qua
-            applied.append(alert)
-            await db.execute(text("""
-                INSERT INTO agent_audit_log (tool, args_json, source, created_at)
-                VALUES ('risk_alert_decision', CAST(:args AS jsonb), CAST('chat' AS "AgentAuditSource"), NOW())
-            """), {"args": json.dumps({"alert_id": alert.id, "project_id": alert.project_id,
-                                       "decision": decision})})
-        await db.commit()
-
-        # Nếu không có alert nào do request này chốt (đã bị xử lý song song trước đó).
-        if not applied:
-            return "Cảnh báo rủi ro này đã được xử lý rồi. Cảm ơn bạn nhé!"
-
-        names = ", ".join(f"'{a.project_name}'" for a in applied)
-        if decision == "dismiss":
-            return f"Đã bỏ qua cảnh báo rủi ro cho dự án {names}. Khi cần bạn cứ nhắn mình nhé."
-
-        # APPROVE: (tuỳ chọn) broadcast vào group dự án nếu đã liên kết.
-        broadcasted = 0
-        for alert in applied:
-            if await self._maybe_broadcast(db, alert):
-                broadcasted += 1
-        suffix = f" và đã đăng vào group dự án ({broadcasted})" if broadcasted else ""
-        return f"Đã xác nhận cảnh báo rủi ro dự án {names}{suffix}. Cảm ơn bạn đã duyệt!"
-
-    async def handle_decision(self, db: AsyncSession, alert: PendingAlert, message: str) -> str:
-        """Phân loại + chốt MỘT cảnh báo (giữ tương thích cũ/test)."""
-        decision = self.classify_decision(message)
-        if decision == "unclear":
-            return (
-                f"Mình chưa rõ ý bạn về cảnh báo dự án '{alert.project_name}'. "
-                'Trả lời "OK/duyệt" để xác nhận gửi, hoặc "bỏ qua" để huỷ giúp mình nhé.'
-            )
-        return await self.apply_decision(db, [alert], decision, message)
-
-    # ── 4. QUÉT NEAR-REAL-TIME cho 1 project (gọi nền khi task thay đổi) ───────
+    # ── QUÉT NEAR-REAL-TIME cho 1 project (gọi nền khi task thay đổi) ─────────
     @staticmethod
     async def trigger_for_project(project_id: int) -> None:
         """Quét rủi ro NGAY cho 1 project (best-effort, chạy nền sau khi task đổi).
@@ -381,17 +236,3 @@ class RiskAlertService:
                 logger.info("[Risk] realtime project=%s %s", project_id, stats)
         except Exception:
             logger.exception("[Risk] trigger_for_project lỗi project=%s", project_id)
-
-    async def _maybe_broadcast(self, db, alert: PendingAlert) -> bool:
-        row = (await db.execute(text("""
-            SELECT gapo_thread_id FROM projects WHERE id = :pid
-        """), {"pid": alert.project_id})).fetchone()
-        group_thread = row[0] if row else None
-        if not group_thread:
-            return False
-        try:
-            await self.gapo.send_message(thread_id=str(group_thread), text=alert.draft_message)
-            return True
-        except Exception:
-            logger.exception("[Risk] broadcast group cho project=%s lỗi", alert.project_id)
-            return False

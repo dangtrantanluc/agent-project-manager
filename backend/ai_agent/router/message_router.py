@@ -25,6 +25,7 @@ from app.services.task_progress_service import (
 from app.services.outbound_message_service import OutboundMessageService
 from app.services.risk_alert_service import RiskAlertService
 from app.services.task_create_service import TaskCreateService
+from app.services.add_member_service import AddMemberService
 
 logger = logging.getLogger(__name__)
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
@@ -60,6 +61,16 @@ CREATE_TASK_KEYWORDS = ("giao task", "giao việc", "tạo task", "tạo việc"
 _TASK_CODE_RE = re.compile(r"\[\d+(?:\.\d+)*\]")
 TASKUPD_PAYLOAD_PREFIX = "TASKUPD|"
 
+# Dấu hiệu câu hỏi THAM CHIẾU lại lượt trước (anaphora) -> chèn SQL lượt trước vào
+# memory_context để LLM tái dùng điều kiện. List để rộng tay (xem _references_previous_turn).
+_ANAPHORA_PATTERNS = (
+    " đó", " đấy", " này", " kia", " ấy",
+    "còn lại", "trong số", "trong đó", "số còn",
+    "liệt kê", "chi tiết", "cụ thể", "gồm những", "là những",
+    "vừa rồi", "vừa nói", "ở trên", "bên trên", "nói trên",
+    "khác", "còn",
+)
+
 
 def _parse_payload_id(payload: str) -> int | None:
     """Lấy task_id từ payload dạng 'PREFIX|<id>'."""
@@ -73,6 +84,8 @@ class AgentReply:
     answer: str
     agent: str
     metadata: dict | None = None
+    # SQL của lượt text2sql (nếu có) để gapo_adapter lưu vào memory cho follow-up.
+    last_sql: str | None = None
 
 def _parse_page_args(message: str):
     """TASKPAGE|<page>[|<query>] -> (query|None, page). Sai định dạng -> trang 1."""
@@ -132,6 +145,7 @@ class AgentMessageRouter:
         self.task_progress_service = TaskProgressService(verify_service=self.task_verify_service)
         self.risk_alert_service = RiskAlertService()
         self.task_create_service = TaskCreateService()
+        self.add_member_service = AddMemberService()
 
     async def handle_message(
         self,
@@ -150,10 +164,6 @@ class AgentMessageRouter:
         memory_context = ""
         t_total = time.perf_counter()
 
-        # Nhắc kèm khi PM có cảnh báo chờ nhưng câu hiện tại KHÔNG phải duyệt/bỏ —
-        # gate phải FALL-THROUGH về routing thường, tuyệt đối không nuốt hội thoại
-        # (PM hỏi việc khác trong 48h chờ duyệt vẫn phải được trả lời bình thường).
-        risk_reminder = ""
         try:
             # ── Luồng /update có PHIÊN (Redis, TTL ngắn) ─────────────────────────
             msg_stripped = message.strip()
@@ -190,34 +200,15 @@ class AgentMessageRouter:
                 res = await self.task_progress_service.menu_my_tasks(user_id, msg_stripped, db=db)
                 return self._task_menu_reply(res, metadata)
 
-            # STATE-GATE (Luồng 4): nếu PM đang có cảnh báo rủi ro CHỜ XÁC NHẬN trong
-            # thread này VÀ câu trả lời rõ ràng là duyệt/bỏ qua -> chốt TOÀN BỘ alert
-            # đang chờ (tránh duyệt nhầm "cái mới nhất" khi có nhiều alert).
-            # getattr: an toàn khi router được dựng qua object.__new__ trong test.
-            risk_service = getattr(self, "risk_alert_service", None)
-            if risk_service is not None and db is not None and thread_id:
-                pendings = await risk_service.find_pending_list(db, user_id, thread_id)
-                if pendings:
-                    decision = risk_service.classify_decision(message)
-                    if decision in ("approve", "dismiss"):
-                        reply = await risk_service.apply_decision(db, pendings, decision, message)
-                        return AgentReply(
-                            answer=reply, agent="risk_confirm",
-                            metadata={**metadata,
-                                      "risk_alert_ids": [p.id for p in pendings]},
-                        )
-                    # unclear -> xử lý như tin nhắn thường + nhắc nhẹ ở cuối.
-                    risk_reminder = (
-                        f"\n\n_(Bạn đang có {len(pendings)} cảnh báo rủi ro chờ duyệt — "
-                        'trả lời "OK/duyệt" hoặc "bỏ qua" khi sẵn sàng nhé.)_'
-                    )
+            # Cảnh báo rủi ro giờ là THÔNG BÁO THUẦN (gửi thẳng cho PM, không cần
+            # duyệt) -> không còn state-gate bắt câu trả lời ở đây.
 
             user_profile: dict = {}
             t_route = time.perf_counter()
             if db is not None and conversation_id:
                 selected_task = asyncio.create_task(self.intent_router.selected_agents(message))
                 memory_context, user_profile = await asyncio.gather(
-                    self._load_memory_context_new_session(conversation_id),
+                    self._load_memory_context_new_session(conversation_id, message),
                     self._load_user_profile_new_session(user_id),
                 )
                 selected = await selected_task
@@ -244,7 +235,7 @@ class AgentMessageRouter:
                 if res.get("menu"):
                     md["menu"] = res["menu"]
                 return AgentReply(
-                    answer=self._extract_message(res) + risk_reminder,
+                    answer=self._extract_message(res),
                     agent="task_update", metadata=md,
                 )
 
@@ -254,8 +245,10 @@ class AgentMessageRouter:
             )
 
             t_exec = time.perf_counter()
-            # Chạy song song mọi agent được chọn; mỗi agent độc lập, lỗi 1 agent
-            # không làm hỏng cả reply (return_exceptions=True).
+            # sql_sink: text2sql ghi câu SQL nó vừa chạy vào đây để lưu memory cho
+            # follow-up. Chạy song song nên dùng 1 dict chung (chỉ text2sql ghi; nếu
+            # có >1 text2sql, lượt sau đè lượt trước — chấp nhận, lấy SQL gần nhất).
+            sql_sink: dict = {}
             results = await asyncio.gather(
                 *[
                     self._run_agent(
@@ -267,6 +260,7 @@ class AgentMessageRouter:
                         metadata,
                         memory_context,
                         user_profile,
+                        sql_sink,
                     )
                     for name in agent_names
                 ],
@@ -291,11 +285,12 @@ class AgentMessageRouter:
                 )
 
             return AgentReply(
-                answer=answer + risk_reminder,
+                answer=answer,
                 # agent là chuỗi str (vd "text2sql+report") để JSON-serializable
                 # ở gapo_adapter (audit_context, tools_used).
                 agent="+".join(ran_agents),
                 metadata={"selected_agents": list(selected), **metadata},
+                last_sql=sql_sink.get("last_sql"),
             )
         except Exception:
             total_ms = (time.perf_counter() - t_total) * 1000
@@ -478,6 +473,7 @@ class AgentMessageRouter:
         metadata: dict,
         memory_context: str = "",
         user_profile: dict | None = None,
+        sql_sink: dict | None = None,
     ) -> str:
         if agent_name == "conversation":
             result = await self.conversation_agent.process_message_async(
@@ -496,6 +492,9 @@ class AgentMessageRouter:
                 current_user_id=user_id,
                 user_role=user_role,
             )
+            # Đẩy SQL ra ngoài để lưu memory cho follow-up (xem save_memory/last_sql).
+            if sql_sink is not None and isinstance(result, dict) and result.get("sql"):
+                sql_sink["last_sql"] = result["sql"]
             return self._format_text2sql(result)
 
         if agent_name == "report":
@@ -562,6 +561,15 @@ class AgentMessageRouter:
             )
             return result.message
 
+        if agent_name == "add_member":
+            result = await self.add_member_service.add_from_chat(
+                message=message,
+                sender_user_id=user_id,
+                user_profile=user_profile or {},
+                memory_context=memory_context,
+            )
+            return result.message
+
         result = await self.conversation_agent.process_message_async(
             message,
             user_context=self._user_context(user_id, channel, thread_id, memory_context, metadata, user_profile),
@@ -570,10 +578,10 @@ class AgentMessageRouter:
         )
         return self._extract_message(result)
 
-    async def _load_memory_context_new_session(self, conversation_id: str) -> str:
+    async def _load_memory_context_new_session(self, conversation_id: str, message: str = "") -> str:
         t = time.perf_counter()
         async with AsyncSessionLocal() as db:
-            result = await self._load_memory_context(conversation_id, db)
+            result = await self._load_memory_context(conversation_id, db, message)
         logger.info("memory_load_ms=%.0f", (time.perf_counter() - t) * 1000)
         return result
 
@@ -584,13 +592,13 @@ class AgentMessageRouter:
         logger.info("profile_load_ms=%.0f", (time.perf_counter() - t) * 1000)
         return result
 
-    async def _load_memory_context(self, conversation_id: str, db: AsyncSession) -> str:
+    async def _load_memory_context(self, conversation_id: str, db: AsyncSession, message: str = "") -> str:
         try:
-            summary, recent_turns = await load_memory(conversation_id, db)
+            summary, recent_turns, last_sql = await load_memory(conversation_id, db)
         except Exception:
             logger.exception("Failed to load memory for conversation %s", conversation_id)
             return ""
-        return self._build_memory_context(summary, recent_turns)
+        return self._build_memory_context(summary, recent_turns, last_sql, message)
 
     async def _load_user_profile(self, user_id: str, db: AsyncSession) -> dict:
         try:
@@ -649,7 +657,13 @@ class AgentMessageRouter:
             logger.exception("Failed to load user profile for user_id=%s", user_id)
             return {}
 
-    def _build_memory_context(self, summary: str, recent_turns: list[dict]) -> str:
+    def _build_memory_context(
+        self,
+        summary: str,
+        recent_turns: list[dict],
+        last_sql: str = "",
+        message: str = "",
+    ) -> str:
         parts = []
         if summary:
             parts.append(f"Tóm tắt trước: {summary}")
@@ -659,7 +673,28 @@ class AgentMessageRouter:
                 lines.append(f"User: {turn.get('user', '')}")
                 lines.append(f"Bot: {turn.get('bot', '')}")
             parts.append("\n".join(lines))
+
+        # Chỉ chèn SQL lượt trước khi câu hiện tại CÓ DẤU HIỆU tham chiếu lại lượt
+        # trước ("66 task đó", "còn lại", "liệt kê chi tiết"). Câu chủ đề mới không
+        # chèn → tránh phình token và tránh LLM dính nhầm điều kiện cũ. Kèm nhãn cho
+        # LLM tự bỏ qua nếu thực ra không liên quan (van kiểm soát cuối).
+        if last_sql and self._references_previous_turn(message):
+            parts.append(
+                "SQL của lượt truy vấn dữ liệu gần nhất (CHỈ tái sử dụng điều kiện "
+                "WHERE/JOIN khi câu hỏi hiện tại tham chiếu lại lượt trước — vd "
+                "\"… đó\", \"còn lại\", \"liệt kê chi tiết\". Nếu câu hỏi là chủ đề "
+                f"mới, BỎ QUA hoàn toàn SQL này):\n{last_sql}"
+            )
         return "\n\n".join(parts).strip()
+
+    def _references_previous_turn(self, message: str) -> bool:
+        """Câu có dấu hiệu tham chiếu lại lượt trước (anaphora) không?
+
+        Đây là van mở rộng tay: thà chèn dư (LLM tự bỏ qua nhờ nhãn) còn hơn sót
+        (sót → tái phát bug "66 task đó là gì"). Không phải bộ phân loại chính xác.
+        """
+        lowered = (message or "").lower()
+        return any(p in lowered for p in _ANAPHORA_PATTERNS)
 
     def _user_context(
         self,

@@ -35,7 +35,7 @@ def test_agent_router_loads_memory_context_when_db_and_conversation_id_are_prese
     # không dùng tham số db của handle_message — nên mock ở tầng *_new_session.
     async def fake_load_memory(conversation_id, db):
         assert conversation_id == "thread-1"
-        return "summary cũ", [{"user": "dự án A sao rồi?", "bot": "Dự án A đang chạy."}]
+        return "summary cũ", [{"user": "dự án A sao rồi?", "bot": "Dự án A đang chạy."}], ""
 
     monkeypatch.setattr(message_router, "load_memory", fake_load_memory)
 
@@ -45,8 +45,8 @@ def test_agent_router_loads_memory_context_when_db_and_conversation_id_are_prese
 
     # Dùng phiên bản load memory bám theo _load_memory_context (gọi load_memory đã
     # mock) nhưng với một db giả, tránh mở kết nối thật.
-    async def fake_load_memory_session(conversation_id):
-        return await router._load_memory_context(conversation_id, db="db")
+    async def fake_load_memory_session(conversation_id, message=""):
+        return await router._load_memory_context(conversation_id, db="db", message=message)
     router._load_memory_context_new_session = fake_load_memory_session
 
     # Tránh mở session DB thật khi nạp user profile (test chỉ quan tâm memory).

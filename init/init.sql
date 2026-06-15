@@ -262,6 +262,7 @@ CREATE TABLE public.agent_memory (
     project_ids integer[],
     task_ids integer[],
     correlation_id text,
+    last_sql text,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 

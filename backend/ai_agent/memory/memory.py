@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 
 MAX_TURNS = 5
 
+# Marker SQL fallback do text2sql sinh khi câu hỏi không trả lời được bằng SQL.
+# Không lưu SQL chứa marker này vào last_sql — nó vô dụng cho follow-up.
+_FALLBACK_SQL_MARKER = "Câu hỏi không thể trả lời bằng SQL"
+
 # Tóm tắt hội thoại sau mỗi N lượt để nén lịch sử dài (tránh gọi LLM mỗi lượt).
 SUMMARIZE_EVERY_N_TURNS = 4
 
@@ -99,8 +103,29 @@ async def _resolve_company_id(
 
     return None
 
-async def load_memory(conversation_id: str, db: AsyncSession) -> tuple[str, list[dict]]:
-    """Returns (summary_text, recent_turns_list) — oldest first."""
+async def load_memory(conversation_id: str, db: AsyncSession) -> tuple[str, list[dict], str]:
+    """Returns (summary_text, recent_turns_list, last_sql) — turns oldest first.
+
+    last_sql là câu SQL của lượt text2sql GẦN NHẤT trong hội thoại (không phải của
+    turn cuối — turn cuối có thể là conversation/notification không có SQL). Dùng để
+    lượt sau tái sử dụng điều kiện WHERE khi người dùng hỏi tham chiếu ("66 task đó",
+    "còn lại", "liệt kê chi tiết"). Rỗng nếu schema chưa có cột hoặc chưa có SQL nào.
+    """
+    last_sql = ""
+    if await _has_column(db, "agent_memory", "last_sql"):
+        sql_result = await db.execute(
+            text("""
+                SELECT last_sql
+                FROM agent_memory
+                WHERE conversation_id = :cid
+                  AND NULLIF(BTRIM(last_sql), '') IS NOT NULL
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            """),
+            {"cid": conversation_id},
+        )
+        last_sql = sql_result.scalar() or ""
+
     summary_result = await db.execute(
         text("""
             SELECT summary
@@ -126,7 +151,7 @@ async def load_memory(conversation_id: str, db: AsyncSession) -> tuple[str, list
     )
     rows = turns_result.fetchall()
     if not rows:
-        return "", []
+        return latest_summary, [], last_sql
 
     logger.info(
         "Loaded memory for conversation %s: has_summary=%s, turns=%s",
@@ -135,7 +160,7 @@ async def load_memory(conversation_id: str, db: AsyncSession) -> tuple[str, list
         len(rows),
     )
     recent_turns = [{"user": r[0], "bot": r[1]} for r in reversed(rows)]
-    return latest_summary, recent_turns
+    return latest_summary, recent_turns, last_sql
 
 
 async def save_memory(
@@ -147,9 +172,9 @@ async def save_memory(
     db: AsyncSession,
     company_id: int | None = None,
     user_id: int | str | None = None,
+    last_sql: str | None = None,
     **_kwargs,  # absorb deprecated llm= callers
 ) -> None:
-    has_company_id = await _has_column(db, "agent_memory", "company_id")
     insert_columns = "conversation_id, source, user_text, reply_text, summary, tools_used, correlation_id"
     insert_values = ":conv_id, 'chat', :user_text, :reply_text, '', CAST(:tools AS jsonb), :corr_id"
     params = {
@@ -160,6 +185,16 @@ async def save_memory(
         "corr_id": correlation_id,
     }
 
+    # Lưu SQL của lượt text2sql để lượt sau tái dùng điều kiện (xem load_memory).
+    # Bỏ qua SQL fallback "không trả lời được" — vô dụng cho follow-up, chỉ gây nhiễu.
+    cleaned_sql = (last_sql or "").strip()
+    if cleaned_sql and _FALLBACK_SQL_MARKER not in cleaned_sql:
+        if await _has_column(db, "agent_memory", "last_sql"):
+            insert_columns = f"{insert_columns}, last_sql"
+            insert_values = f"{insert_values}, :last_sql"
+            params["last_sql"] = cleaned_sql
+
+    has_company_id = await _has_column(db, "agent_memory", "company_id")
     if has_company_id:
         resolved_company_id = await _resolve_company_id(db, company_id=company_id, user_id=user_id)
         if resolved_company_id is None:
@@ -198,7 +233,7 @@ async def save_memory(
         return
 
     try:
-        prev_summary, recent = await load_memory(conversation_id, db)
+        prev_summary, recent, _prev_sql = await load_memory(conversation_id, db)
         ctx = f"Tóm tắt trước: {prev_summary}\n" if prev_summary else ""
         for turn in recent:
             ctx += f"User: {turn['user']}\nBot: {turn['bot']}\n"

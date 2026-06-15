@@ -173,11 +173,20 @@ export function TasksPage() {
                   </Link>
                 </td>
                 <td className="p-3">
-                  {canEdit ? (
-                    <StatusSelect value={t.status} onChange={(s) => transition.mutate({ id: t.id, status: s })} />
-                  ) : (
-                    <Badge className={statusColors[t.status]}>{statusLabels[t.status]}</Badge>
-                  )}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {canEdit ? (
+                      <StatusSelect value={t.status} onChange={(s) => transition.mutate({ id: t.id, status: s })} />
+                    ) : (
+                      <Badge className={statusColors[t.status]}>{statusLabels[t.status]}</Badge>
+                    )}
+                    {t.blockerCount > 0 && (
+                      <span title={`${t.blockerCount} vướng mắc chưa gỡ`}>
+                        <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">
+                          ⛔ Đang kẹt{t.blockerCount > 1 ? ` (${t.blockerCount})` : ""}
+                        </Badge>
+                      </span>
+                    )}
+                  </div>
                 </td>
                 <td className="p-3"><Badge className={priorityColors[t.priority]}>{t.priority}</Badge></td>
                 <td className="p-3"><TagChips tags={t.tags} /></td>

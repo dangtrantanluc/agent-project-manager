@@ -37,10 +37,12 @@ async def get_tags_summary(
             JOIN task_tags tt ON tt.tag_id = tg.id
             JOIN tasks t ON t.id = tt.task_id{task_access}
             WHERE tg.company_id = :cid
+              -- Tag riêng: chỉ chủ thấy trong thống kê của mình.
+              AND (tg.owner_user_id IS NULL OR tg.owner_user_id = :viewer_id)
             GROUP BY tg.id, tg.name, tg.color
             ORDER BY total DESC, tg.name ASC
         """),
-        params,
+        {**params, "viewer_id": current_user["id"]},
     )).fetchall()
     return {
         "data": [

@@ -258,25 +258,18 @@ async def run_missing_summary() -> None:
 
 
 async def run_expire_stale() -> None:
-    """Đánh dấu EXPIRED cho cảnh báo rủi ro & follow-up PENDING đã quá TTL.
+    """Đánh dấu EXPIRED cho follow-up PENDING đã quá TTL.
 
-    Bộ lọc theo thời gian ở find_pending_for / _resolve_from_followup đã loại các
-    bản ghi quá hạn khỏi việc khớp; job này dọn TRẠNG THÁI để giữ dữ liệu sạch,
-    partial index nhỏ gọn, và đếm "đang chờ" chính xác.
+    (Risk alert giờ là thông báo thuần, gửi xong = APPROVED, không còn PENDING nên
+    không cần expire.) Bộ lọc theo thời gian ở _resolve_from_followup đã loại bản
+    ghi quá hạn khỏi việc khớp; job này dọn TRẠNG THÁI để giữ dữ liệu sạch.
     """
     async def _run():
         from database import AsyncSessionLocal
         from sqlalchemy import text
-        from app.services.risk_alert_service import PENDING_TTL_HOURS
         from ai_agent.task_update.task_verify_service import FOLLOW_UP_TTL_HOURS
 
         async with AsyncSessionLocal() as db:
-            risk = (await db.execute(text("""
-                UPDATE risk_alerts
-                SET status = 'EXPIRED', updated_at = NOW()
-                WHERE status = 'PENDING_PM_CONFIRMATION'
-                  AND created_at < NOW() - (CAST(:ttl AS int) * INTERVAL '1 hour')
-            """), {"ttl": PENDING_TTL_HOURS})).rowcount
             followups = (await db.execute(text("""
                 UPDATE agent_follow_ups
                 SET status = CAST('EXPIRED' AS "FollowUpStatus"), updated_at = NOW()
@@ -284,7 +277,7 @@ async def run_expire_stale() -> None:
                   AND created_at < NOW() - (CAST(:ttl AS int) * INTERVAL '1 hour')
             """), {"ttl": FOLLOW_UP_TTL_HOURS})).rowcount
             await db.commit()
-        logger.info("[Scheduler] run_expire_stale risk_alerts=%s follow_ups=%s", risk, followups)
+        logger.info("[Scheduler] run_expire_stale follow_ups=%s", followups)
 
     await _with_advisory_lock(_run())
 

@@ -24,10 +24,13 @@ from sqlalchemy import text
 
 from database import AsyncSessionLocal
 from app.services.task_assignment_notifier import notify_task_assigned, notify_group_new_task
+from ai_agent.shared.entity_resolver import (
+    is_privileged,
+    resolve_users,
+    resolve_projects,
+)
 
 logger = logging.getLogger(__name__)
-
-_PRIVILEGED_ROLES = {"MANAGER", "ADMIN", "SUPER_ADMIN"}
 _VALID_PRIORITIES = {"LOW", "MEDIUM", "HIGH", "URGENT"}
 
 _EXTRACT_SYSTEM_PROMPT = """\
@@ -96,8 +99,7 @@ class TaskCreateService:
     ) -> TaskCreateResult:
         profile = user_profile or {}
         # 1. Phân quyền: chỉ quản lý được giao việc.
-        role = str(profile.get("role") or "").upper()
-        if role not in _PRIVILEGED_ROLES:
+        if not is_privileged(profile.get("role")):
             return TaskCreateResult(
                 status="forbidden",
                 message="Chỉ quản lý (MANAGER/ADMIN) mới giao việc được. Bạn nhờ quản lý dự án giúp nhé.",
@@ -214,29 +216,12 @@ class TaskCreateService:
             logger.exception("TaskCreateService bóc tách thất bại")
             return None
 
+    # Resolve người/dự án dùng chung với các luồng ghi khác (entity_resolver).
     async def _resolve_users(self, db, name: str, sender_id: int) -> list[dict]:
-        like = f"%{name.lower()}%"
-        rows = (await db.execute(text("""
-            SELECT u.id, u.full_name
-            FROM users u
-            WHERE u.active = true
-              AND u.company_id = (SELECT company_id FROM users WHERE id = :sender)
-              AND (lower(u.full_name) LIKE :like
-                   OR lower(COALESCE((SELECT gapo_full_name FROM gapo_user_maps WHERE user_id = u.id), '')) LIKE :like)
-            ORDER BY u.full_name
-        """), {"sender": sender_id, "like": like})).fetchall()
-        return [{"user_id": r[0], "full_name": r[1]} for r in rows]
+        return await resolve_users(db, name, sender_id)
 
     async def _resolve_projects(self, db, name: str, sender_id: int) -> list[dict]:
-        like = f"%{name.lower()}%"
-        rows = (await db.execute(text("""
-            SELECT p.id, p.name, p.company_id
-            FROM projects p
-            WHERE p.company_id = (SELECT company_id FROM users WHERE id = :sender)
-              AND lower(p.name) LIKE :like
-            ORDER BY (p.status::text IN ('PLANNED','IN_PROGRESS')) DESC, p.name
-        """), {"sender": sender_id, "like": like})).fetchall()
-        return [{"id": r[0], "name": r[1], "company_id": r[2]} for r in rows]
+        return await resolve_projects(db, name, sender_id)
 
     def _ask_project_message(self, profile: dict) -> str:
         projects = profile.get("active_projects") or []

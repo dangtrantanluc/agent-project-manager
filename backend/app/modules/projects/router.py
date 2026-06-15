@@ -38,6 +38,8 @@ _SELECT_PROJECT = """
                                ORDER BY tg.name)
                FROM project_tags pt JOIN tags tg ON tg.id = pt.tag_id
                WHERE pt.project_id = p.id
+                 -- Tag riêng: chỉ chủ thấy. :viewer_id BẮT BUỘC bind ở mọi nơi chạy _SELECT_PROJECT.
+                 AND (tg.owner_user_id IS NULL OR tg.owner_user_id = :viewer_id)
            ), '[]'::json) AS tags,
            p.gapo_thread_id
     FROM projects p
@@ -168,6 +170,7 @@ async def list_projects(
         where += " AND (p.name ILIKE :q OR p.code ILIKE :q)"
         params["q"] = f"%{q}%"
 
+    params["viewer_id"] = current_user["id"]  # lọc tag riêng theo người xem
     rows = (await db.execute(
         text(f'{_SELECT_PROJECT} {where} ORDER BY p.updated_at DESC LIMIT :limit'),
         params,
@@ -297,7 +300,7 @@ async def get_project(
     db: AsyncSession = Depends(get_db),
 ):
     where = "WHERE p.id = :pid"
-    params: dict = {"pid": project_id}
+    params: dict = {"pid": project_id, "viewer_id": current_user["id"]}
     if _restricted(current_user):
         where += f" AND ({_PROJECT_ACCESS_CLAUSE})"
         params["access_uid"] = current_user["id"]
@@ -354,7 +357,7 @@ async def update_project(
     # manager names (RETURNING can't JOIN users).
     row = (await db.execute(
         text(f'{_SELECT_PROJECT} WHERE p.id = :pid'),
-        {"pid": project_id},
+        {"pid": project_id, "viewer_id": current_user["id"]},
     )).fetchone()
     return _row_to_dict(row)
 
@@ -403,7 +406,7 @@ async def transition_project(
     await db.commit()
     updated = (await db.execute(
         text(f'{_SELECT_PROJECT} WHERE p.id = :pid'),
-        {"pid": project_id},
+        {"pid": project_id, "viewer_id": current_user["id"]},
     )).fetchone()
     return _row_to_dict(updated)
 

@@ -50,8 +50,9 @@ class PlanningAgent:
             llm (ChatOpenAI | None): Một instance của ChatOpenAI để tạo kế hoạch dự án. Nếu None, sẽ tạo một instance mới với cấu hình mặc định.
         """
         base_llm = ChatOpenAI(model=os.getenv("MODEL_NAME"),
-                              timeout=60,
+                              timeout=25,
                               temperature=0.4,
+                              max_retries=1,
                               api_key=os.getenv("API_KEY"),
                               base_url=os.getenv("BASE_URL")) if llm is None else llm
         # Ép LLM trả thẳng đối tượng ProjectPlan đã validate (qua tool-calling).

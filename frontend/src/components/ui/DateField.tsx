@@ -22,9 +22,22 @@ export function DateField<T extends FieldValues>({
   className?: string;
   todayLabel?: string;
 }) {
+  // Ô date trống/nhập dở -> đẩy undefined vào form thay vì chuỗi rỗng "", để field
+  // optional (vd. endAt) không bị Zod .date() reject làm kẹt submit im lặng.
+  const reg = form.register(name);
   return (
     <div className="flex items-center gap-1">
-      <input type="date" className={className} {...form.register(name)} />
+      <input
+        type="date"
+        className={className}
+        {...reg}
+        onChange={(e) =>
+          form.setValue(name, (e.target.value || undefined) as any, {
+            shouldDirty: true,
+            shouldValidate: true,
+          })
+        }
+      />
       <button
         type="button"
         className="whitespace-nowrap rounded-md border border-slate-200 px-2 py-1.5 text-xs text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"

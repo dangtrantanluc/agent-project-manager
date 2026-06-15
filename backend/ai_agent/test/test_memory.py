@@ -54,6 +54,14 @@ class _FakeMemorySession:
         if "select id from companies" in sql:
             return _Result(scalar_value=1)
 
+        if "select last_sql" in sql:
+            rows = [
+                row for row in self.rows
+                if row["conversation_id"] == params["cid"] and (row.get("last_sql") or "").strip()
+            ]
+            rows.sort(key=lambda row: (row["created_at"], row["id"]), reverse=True)
+            return _Result(scalar_value=rows[0]["last_sql"] if rows else None)
+
         if "select summary" in sql:
             rows = [
                 row for row in self.rows
@@ -77,6 +85,7 @@ class _FakeMemorySession:
                 "user_text": params["user_text"],
                 "reply_text": params["reply_text"],
                 "summary": "",
+                "last_sql": params.get("last_sql"),
                 "created_at": datetime(2026, 5, 27, 12, 0, 0) + timedelta(seconds=row_id),
             })
             # CTE mới trả về (id, turn_count) qua fetchone().
@@ -148,10 +157,11 @@ def test_load_memory_uses_latest_non_empty_summary_and_five_recent_turns():
         _row(6, ""),
     ])
 
-    summary, turns = asyncio.run(load_memory("c1", db))
+    summary, turns, last_sql = asyncio.run(load_memory("c1", db))
 
     assert summary == "latest useful summary"
     assert [turn["user"] for turn in turns] == ["user 2", "user 3", "user 4", "user 5", "user 6"]
+    assert last_sql == ""  # schema chưa có cột last_sql -> không query, trả rỗng
 
 
 def test_save_memory_inserts_raw_turns_before_summary_threshold(monkeypatch):
@@ -211,3 +221,53 @@ def test_save_memory_includes_company_id_when_live_schema_requires_it(monkeypatc
     ))
 
     assert db.rows[0]["company_id"] == 7
+
+
+def test_save_memory_persists_last_sql_when_schema_has_column():
+    db = _FakeMemorySession(columns={("agent_memory", "last_sql")})
+
+    asyncio.run(save_memory(
+        "c1", "66 task rủi ro của MTL?", "MTL có 66 task rủi ro.",
+        ["text2sql"], "corr-1", db,
+        last_sql="SELECT * FROM tasks WHERE project='MTL' AND risk=true;",
+    ))
+
+    assert db.rows[0]["last_sql"] == "SELECT * FROM tasks WHERE project='MTL' AND risk=true;"
+
+
+def test_save_memory_skips_last_sql_when_schema_missing_column():
+    db = _FakeMemorySession()  # không khai báo cột last_sql
+
+    asyncio.run(save_memory(
+        "c1", "q", "a", ["text2sql"], "corr-1", db,
+        last_sql="SELECT 1;",
+    ))
+
+    assert db.rows[0].get("last_sql") is None
+
+
+def test_save_memory_does_not_store_fallback_sql():
+    db = _FakeMemorySession(columns={("agent_memory", "last_sql")})
+
+    asyncio.run(save_memory(
+        "c1", "câu linh tinh", "không trả lời được",
+        ["text2sql"], "corr-1", db,
+        last_sql="SELECT 'Câu hỏi không thể trả lời bằng SQL' AS message;",
+    ))
+
+    assert db.rows[0].get("last_sql") is None
+
+
+def test_load_memory_returns_latest_text2sql_sql():
+    db = _FakeMemorySession(
+        columns={("agent_memory", "last_sql")},
+        rows=[
+            {**_row(1), "last_sql": "SELECT 1;"},
+            {**_row(2), "last_sql": "SELECT 2;"},
+            {**_row(3), "last_sql": None},  # lượt conversation xen giữa -> bỏ qua
+        ],
+    )
+
+    _summary, _turns, last_sql = asyncio.run(load_memory("c1", db))
+
+    assert last_sql == "SELECT 2;"  # SQL gần nhất, không phải turn cuối (None)

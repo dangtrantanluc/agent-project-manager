@@ -21,6 +21,7 @@ VALID_AGENTS = {
     "notification",
     "task_update",
     "create_task",
+    "add_member",
 }
 DEFAULT_AGENT = "conversation"
 
@@ -93,6 +94,7 @@ Danh mục:
 - notification: tạo nội dung thông báo, nhắc nhở, reminder.
 - task_update: người dùng KHẲNG ĐỊNH đã làm xong / đã cập nhật một task đã nhắc trước đó (vd: "tôi update rồi", "xong rồi", "done", "đã hoàn thành", "task X xong 80%").
 - create_task: người dùng GIAO VIỆC / tạo task MỚI cho người khác (vd: "giao task X cho Thảo deadline mai", "tạo task ... cho Nam"). Khác task_update (báo task cũ) và notification (chỉ nhắc, không tạo).
+- add_member: người dùng THÊM THÀNH VIÊN vào DỰ ÁN (vd: "thêm Thảo vào dự án Logistics", "add Nam vào project CRM vai trò dev"). KHÁC create_task: add_member gắn người vào DỰ ÁN (không tạo task); create_task tạo CÔNG VIỆC giao cho người.
 
 Quy tắc:
 - CHỈ trả về một JSON array các tên danh mục, KHÔNG giải thích, KHÔNG markdown.

@@ -390,11 +390,20 @@ function TaskListView({
             >
               <td className="px-3 py-2 font-medium text-slate-900 dark:text-slate-100">{t.name}</td>
               <td className="px-3 py-2">
-                {canEdit ? (
-                  <StatusSelect value={t.status} onChange={(s) => onChangeStatus(t, s)} />
-                ) : (
-                  <Badge className={statusColors[t.status]}>{statusLabels[t.status]}</Badge>
-                )}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {canEdit ? (
+                    <StatusSelect value={t.status} onChange={(s) => onChangeStatus(t, s)} />
+                  ) : (
+                    <Badge className={statusColors[t.status]}>{statusLabels[t.status]}</Badge>
+                  )}
+                  {t.blockerCount > 0 && (
+                    <span title={`${t.blockerCount} vướng mắc chưa gỡ`}>
+                      <Badge className="bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300">
+                        ⛔ Đang kẹt{t.blockerCount > 1 ? ` (${t.blockerCount})` : ""}
+                      </Badge>
+                    </span>
+                  )}
+                </div>
               </td>
               <td className="px-3 py-2">
                 <Badge className={priorityColors[t.priority]}>{t.priority}</Badge>
@@ -520,6 +529,14 @@ function TaskCard({
         )}
       </div>
       <TagChips tags={task.tags} className="mt-2" />
+      {task.blockerCount > 0 && (
+        <span
+          className="mt-2 inline-block rounded px-1.5 py-0.5 text-xs font-medium bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
+          title={`${task.blockerCount} vướng mắc chưa gỡ`}
+        >
+          ⛔ Đang kẹt{task.blockerCount > 1 ? ` (${task.blockerCount})` : ""}
+        </span>
+      )}
       <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
         <span>{task.assignee?.fullName ?? "—"}</span>
         <Badge className={priorityColors[task.priority]}>{task.priority}</Badge>

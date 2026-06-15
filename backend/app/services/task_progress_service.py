@@ -497,6 +497,15 @@ class TaskProgressService:
         """), {"tid": task_id, "uid": uid})).fetchone()
         if row is None:
             return {"message": "Task này không phải của bạn hoặc không tồn tại."}
+        # Chống trùng: nếu task đã có blocker CHƯA gỡ thì không tạo thêm (bấm 2 lần
+        # không sinh 2 dòng rác). Báo lại là đã ghi nhận trước đó.
+        existing = (await db.execute(text("""
+            SELECT 1 FROM task_blockers
+            WHERE task_id = :tid AND resolved_at IS NULL LIMIT 1
+        """), {"tid": task_id})).fetchone()
+        if existing is not None:
+            return {"message": f"Task '{row[0]}' đã được ghi nhận đang kẹt từ trước rồi. "
+                               "Khi gỡ được bạn cập nhật lại giúp mình nhé."}
         await db.execute(text("""
             INSERT INTO task_blockers (task_id, severity, description)
             VALUES (:tid, 'MED'::"BlockerSeverity", :desc)

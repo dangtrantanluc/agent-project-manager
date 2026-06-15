@@ -52,7 +52,12 @@ _SELECT_TASK = """
                                ORDER BY tg.name)
                FROM task_tags tt JOIN tags tg ON tg.id = tt.tag_id
                WHERE tt.task_id = t.id
-           ), '[]'::json) AS tags
+                 -- Tag riêng: chỉ chủ thấy. :viewer_id BẮT BUỘC bind ở mọi nơi chạy _SELECT_TASK.
+                 AND (tg.owner_user_id IS NULL OR tg.owner_user_id = :viewer_id)
+           ), '[]'::json) AS tags,
+           -- PHẢI ở cuối SELECT: _row_to_dict đọc theo chỉ số r[N]; chèn giữa sẽ lệch tags/assignee.
+           (SELECT COUNT(*) FROM task_blockers b
+            WHERE b.task_id = t.id AND b.resolved_at IS NULL) AS open_blockers
     FROM tasks t
     LEFT JOIN users u ON u.id = t.assignee_id
     LEFT JOIN milestones m ON m.id = t.milestone_id
@@ -97,14 +102,20 @@ def _row_to_dict(r) -> dict:
             (json.loads(r[19]) if isinstance(r[19], str) else (r[19] or []))
             if len(r) > 19 else []
         ),
+        # Số blocker chưa gỡ (open). Chỉ có ở row từ _SELECT_TASK; row RETURNING
+        # (create/update/transition) ngắn hơn -> mặc định 0.
+        "blockerCount": (r[20] if len(r) > 20 else 0),
     }
 
 
-async def _fetch_task_dict(task_id: int, db: AsyncSession) -> dict:
+async def _fetch_task_dict(task_id: int, db: AsyncSession, viewer_id: int) -> dict:
     """Re-fetch a task via _SELECT_TASK so the response includes the nested
-    assignee object (RETURNING rows from INSERT/UPDATE don't join users)."""
+    assignee object (RETURNING rows from INSERT/UPDATE don't join users).
+
+    viewer_id: để lọc tag riêng (chỉ chủ thấy) trong _SELECT_TASK.
+    """
     row = (await db.execute(
-        text(f"{_SELECT_TASK} WHERE t.id = :tid"), {"tid": task_id},
+        text(f"{_SELECT_TASK} WHERE t.id = :tid"), {"tid": task_id, "viewer_id": viewer_id},
     )).fetchone()
     return _row_to_dict(row)
 
@@ -192,6 +203,7 @@ async def list_tasks(
 
     params["limit"] = page_size
     params["offset"] = (page - 1) * page_size
+    params["viewer_id"] = current_user["id"]  # lọc tag riêng theo người xem
     rows = (await db.execute(
         text(f"{_SELECT_TASK} {where} ORDER BY {order_by} LIMIT :limit OFFSET :offset"),
         params,
@@ -277,7 +289,7 @@ async def create_task(
     # Near-real-time: task mới có thể khiến project at-risk (vd tạo task đã quá hạn).
     background_tasks.add_task(RiskAlertService.trigger_for_project, row[10])
 
-    return await _fetch_task_dict(row[0], db)
+    return await _fetch_task_dict(row[0], db, current_user["id"])
 
 
 @router.get("/overdue")
@@ -295,6 +307,7 @@ async def overdue_tasks(
     if days:
         where += " AND t.deadline >= CURRENT_DATE - (:days * INTERVAL '1 day')"; params["days"] = days
 
+    params["viewer_id"] = agent_user["id"]  # lọc tag riêng theo người xem
     rows = (await db.execute(
         text(f"{_SELECT_TASK} {where} ORDER BY t.deadline LIMIT :limit"),
         params,
@@ -315,6 +328,7 @@ async def stale_tasks(
     if project_id:
         where += " AND t.project_id = :pid"; params["pid"] = project_id
 
+    params["viewer_id"] = agent_user["id"]  # lọc tag riêng theo người xem
     rows = (await db.execute(
         text(f"{_SELECT_TASK} {where} ORDER BY t.updated_at LIMIT :limit"),
         params,
@@ -404,7 +418,7 @@ async def get_task(
     db: AsyncSession = Depends(get_db),
 ):
     where = "WHERE t.id = :tid"
-    params: dict = {"tid": task_id}
+    params: dict = {"tid": task_id, "viewer_id": current_user["id"]}
     if is_restricted(current_user):
         where += f" AND {project_access_exists_sql('t.project_id')}"
         params["access_uid"] = current_user["id"]
@@ -480,7 +494,7 @@ async def update_task(
     # Near-real-time: đổi status/deadline có thể khiến task quá hạn -> quét lại project.
     background_tasks.add_task(RiskAlertService.trigger_for_project, row[10])
 
-    return await _fetch_task_dict(row[0], db)
+    return await _fetch_task_dict(row[0], db, current_user["id"])
 
 
 @router.delete("/{task_id}", status_code=204)
@@ -546,7 +560,7 @@ async def transition_task(
 
     await db.commit()
     background_tasks.add_task(RiskAlertService.trigger_for_project, updated[10])
-    return await _fetch_task_dict(updated[0], db)
+    return await _fetch_task_dict(updated[0], db, current_user["id"])
 
 
 @router.get("/{task_id}/blockers")
@@ -606,4 +620,44 @@ async def create_blocker(
     return {
         "id": row[0], "taskId": row[1], "severity": row[2], "description": row[3],
         "resolvedAt": row[4], "createdAt": row[5].isoformat(),
+    }
+
+
+@router.patch("/blockers/{blocker_id}/resolve")
+async def resolve_blocker(
+    blocker_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Đánh dấu một blocker đã được gỡ (resolved_at = NOW())."""
+    blocker = (await db.execute(
+        text("""
+            SELECT b.id, b.resolved_at, t.assignee_id, t.project_id
+            FROM task_blockers b JOIN tasks t ON t.id = b.task_id
+            WHERE b.id = :bid
+        """),
+        {"bid": blocker_id},
+    )).fetchone()
+    if not blocker:
+        raise HTTPException(status_code=404, detail="Blocker không tồn tại")
+    await _ensure_can_modify_task(db, current_user, blocker[2])
+    if blocker[1] is not None:
+        raise HTTPException(status_code=409, detail="Blocker này đã được gỡ rồi")
+
+    row = (await db.execute(
+        text("""
+            UPDATE task_blockers SET resolved_at = NOW()
+            WHERE id = :bid AND resolved_at IS NULL
+            RETURNING id, task_id, severity, description, resolved_at, created_at
+        """),
+        {"bid": blocker_id},
+    )).fetchone()
+    await db.commit()
+    # Gỡ blocker -> rủi ro project có thể giảm: quét lại near-real-time.
+    background_tasks.add_task(RiskAlertService.trigger_for_project, blocker[3])
+    return {
+        "id": row[0], "taskId": row[1], "severity": row[2], "description": row[3],
+        "resolvedAt": row[4].isoformat() if row[4] else None,
+        "createdAt": row[5].isoformat(),
     }

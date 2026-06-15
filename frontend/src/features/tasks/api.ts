@@ -15,6 +15,8 @@ export type TaskListItem = {
   project: { id: number; name: string; code: string | null };
   tags: { id: number; name: string; color: string }[];
   _count: { worklogs: number; backlogs?: number };
+  /** Số blocker chưa gỡ (BE: open_blockers). >0 => task đang kẹt. */
+  blockerCount: number;
 };
 
 export type TaskListParams = {
@@ -77,12 +79,13 @@ export async function listTasks(params: TaskListParams = {}) {
 
 /** Shape thô từ BE trước khi normalize: các scalar luôn có (BE trả đủ); chỉ nested
  * object & _count là optional vì normalize sẽ điền. An toàn hơn `any`. */
-type RawTask = Omit<TaskListItem, "project" | "assignee" | "milestone" | "tags" | "_count"> & {
+type RawTask = Omit<TaskListItem, "project" | "assignee" | "milestone" | "tags" | "_count" | "blockerCount"> & {
   project?: TaskListItem["project"] | null;
   assignee?: TaskListItem["assignee"];
   milestone?: TaskListItem["milestone"];
   tags?: TaskListItem["tags"];
   _count?: TaskListItem["_count"];
+  blockerCount?: number;
   projectId?: number;
   worklogCount?: number;
   backlogCount?: number;
@@ -126,5 +129,25 @@ function normalizeTask(task: RawTask): TaskListItem {
     milestone: task.milestone ?? null,
     tags: task.tags ?? [],
     _count: task._count ?? { worklogs: task.worklogCount ?? task.backlogCount ?? 0 },
+    blockerCount: task.blockerCount ?? 0,
   };
+}
+
+export type Blocker = {
+  id: number;
+  taskId: number;
+  severity: string;
+  description: string;
+  resolvedAt: string | null;
+  createdAt: string;
+};
+
+export async function listBlockers(taskId: number) {
+  const { data } = await apiClient.get<Blocker[]>(`/tasks/${taskId}/blockers`);
+  return data;
+}
+
+export async function resolveBlocker(blockerId: number) {
+  const { data } = await apiClient.patch<Blocker>(`/tasks/blockers/${blockerId}/resolve`);
+  return data;
 }

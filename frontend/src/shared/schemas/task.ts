@@ -5,8 +5,10 @@ export const taskCreateSchema = z.object({
   name: z.string().min(1).max(200),
   status: z.nativeEnum(TaskStatus).default(TaskStatus.TODO),
   priority: z.nativeEnum(Priority).default(Priority.MEDIUM),
-  deadline: z.string().date().optional(),
-  endAt: z.string().date().optional(),
+  // Chuỗi rỗng (ô date trống/nhập dở) -> undefined, để field optional không bị
+  // .date() reject làm kẹt submit. Chỉ validate định dạng khi thực sự có giá trị.
+  deadline: z.preprocess((v) => (v === "" ? undefined : v), z.string().date().optional()),
+  endAt: z.preprocess((v) => (v === "" ? undefined : v), z.string().date().optional()),
   description: z.string().optional(),
   result: z.string().optional(),
   issues: z.string().optional(),

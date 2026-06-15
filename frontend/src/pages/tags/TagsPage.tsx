@@ -36,6 +36,7 @@ export function TagsPage() {
 
   const [name, setName] = useState("");
   const [color, setColor] = useState("#3b82f6");
+  const [personal, setPersonal] = useState(false);
   const [editId, setEditId] = useState<number | null>(null);
   const [editName, setEditName] = useState("");
   const [editColor, setEditColor] = useState("#3b82f6");
@@ -43,7 +44,7 @@ export function TagsPage() {
   const invalidate = () => qc.invalidateQueries({ queryKey: ["tags"] });
 
   const create = useMutation({
-    mutationFn: () => createTag({ name: name.trim(), color }),
+    mutationFn: () => createTag({ name: name.trim(), color, personal }),
     onSuccess: () => { invalidate(); setName(""); },
   });
   const update = useMutation({
@@ -84,6 +85,10 @@ export function TagsPage() {
           >
             {name.trim() || "Xem trước"}
           </span>
+          <label className="flex items-center gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+            <input type="checkbox" checked={personal} onChange={(e) => setPersonal(e.target.checked)} />
+            🔒 Nhãn riêng của tôi
+          </label>
           <button
             className="btn-primary"
             disabled={!name.trim() || create.isPending}
@@ -92,6 +97,9 @@ export function TagsPage() {
             Thêm nhãn
           </button>
         </div>
+        <p className="text-xs text-slate-400">
+          Nhãn riêng chỉ mình bạn thấy và gắn được. Nhãn chung cả công ty dùng chung.
+        </p>
         {create.isError && (
           <p className="text-sm text-red-600">Không tạo được nhãn (có thể trùng tên).</p>
         )}
@@ -139,6 +147,7 @@ export function TagsPage() {
                         className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
                         style={{ backgroundColor: `${tag.color}22`, color: tag.color, border: `1px solid ${tag.color}55` }}
                       >
+                        {tag.isPersonal && <span className="mr-1" title="Nhãn riêng của bạn">🔒</span>}
                         {tag.name}
                       </span>
                     </td>
