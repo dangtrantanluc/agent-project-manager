@@ -5,11 +5,18 @@ CÙNG company của người gửi, và khung xử lý 3 nhánh kết quả (kh�
 tên / đúng 1). Trước đây nằm trong TaskCreateService; tách ra để add_member và
 mọi luồng ghi sau dùng lại, sửa một chỗ là mọi nơi hưởng.
 """
+import re
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Chỉ các vai trò này được thực hiện thao tác ghi cấp dự án qua chat (giống POST /tasks, /members).
 PRIVILEGED_ROLES = {"MANAGER", "ADMIN", "SUPER_ADMIN"}
+# Mã task có 2 dạng: Jira-style thật của hệ thống ("GAP-T0003", "MTL-T001" — xem
+# code_gen) và dạng số trong ngoặc ("[3.2]") đôi khi người dùng gõ. Ưu tiên bắt
+# mã Jira-style trước (cụ thể hơn) rồi mới tới dạng số.
+_TASK_CODE_JIRA = re.compile(r"\b([A-Z]+\d*-[A-Za-z]\d+)\b", re.IGNORECASE)
+_TASK_CODE_NUM = re.compile(r"\[(\d+(?:\.\d+)*)\]")
 
 
 def is_privileged(role: str | None) -> bool:
@@ -42,6 +49,64 @@ async def resolve_projects(db: AsyncSession, name: str, sender_id: int) -> list[
         ORDER BY (p.status::text IN ('PLANNED','IN_PROGRESS')) DESC, p.name
     """), {"sender": sender_id, "like": like})).fetchall()
     return [{"id": r[0], "name": r[1], "company_id": r[2]} for r in rows]
+
+
+def _task_row(row) -> dict:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "code": row[2],
+        "project_id": row[3],
+        "assignee_id": row[4],
+    }
+
+
+async def resolve_tasks(db: AsyncSession, ref: str, sender_id: int | None) -> list[dict]:
+    """Tìm task theo mã ([3.2]/code) hoặc tên, trong phạm vi quyền người gọi.
+
+    Scope gồm dự án người gọi là owner/account manager/member, hoặc dự án có task
+    đang giao cho người gọi. Ưu tiên khớp mã chính xác trước, rồi mới fallback
+    tìm gần đúng theo tên các task chưa DONE/CANCELLED.
+    """
+    ref = (ref or "").strip()
+    if not ref or sender_id is None:
+        return []
+
+    scope = """
+      AND t.project_id IN (
+        SELECT p.id FROM projects p WHERE p.owner_id = :s OR p.account_manager_id = :s
+        UNION SELECT m.project_id FROM members m WHERE m.user_id = :s
+        UNION SELECT t2.project_id FROM tasks t2 WHERE t2.assignee_id = :s
+      )
+    """
+
+    # Bắt mã: Jira-style ("GAP-T0003") ưu tiên, rồi dạng số trong ngoặc ("[3.2]").
+    jira = _TASK_CODE_JIRA.search(ref)
+    num = _TASK_CODE_NUM.search(ref)
+    code = None
+    if jira:
+        code = jira.group(1).upper()
+    elif num:
+        code = num.group(1)
+    if code:
+        rows = (await db.execute(text(f"""
+            SELECT t.id, t.name, t.code, t.project_id, t.assignee_id
+            FROM tasks t
+            WHERE upper(t.code) = :code {scope}
+        """), {"code": code, "s": sender_id})).fetchall()
+        if rows:
+            return [_task_row(r) for r in rows]
+
+    like = f"%{ref.lower()}%"
+    rows = (await db.execute(text(f"""
+        SELECT t.id, t.name, t.code, t.project_id, t.assignee_id
+        FROM tasks t
+        WHERE lower(t.name) LIKE :like {scope}
+          AND t.status::text NOT IN ('DONE', 'CANCELLED')
+        ORDER BY t.updated_at DESC
+        LIMIT 10
+    """), {"like": like, "s": sender_id})).fetchall()
+    return [_task_row(r) for r in rows]
 
 
 def resolve_one(

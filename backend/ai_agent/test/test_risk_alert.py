@@ -107,7 +107,8 @@ def test_build_draft_message_template_no_confirm_question():
     )
     msg = _svc().build_draft_message(risk)
     assert "Alpha" in msg and "MEDIUM" in msg
-    assert "quá hạn" in msg and "Đề xuất hành động" in msg
+    assert "quá hạn" in msg          # lý do (gộp 1 dòng) vẫn nêu số liệu
+    assert "→" in msg                # có dòng đề xuất hành động (định dạng gọn)
     # KHÔNG còn câu hỏi duyệt/bỏ qua.
     assert "OK/duyệt" not in msg
     assert "bỏ qua" not in msg
@@ -120,8 +121,8 @@ def _alert_responses(*, pm_thread=None, pm_user="900", exists=False):
         "from projects p": [(1, "Alpha", 10, None, 4, 0, 0, 0, 0, 0, 0)],
         # dedup check
         "from risk_alerts where correlation_id": [(1,)] if exists else [],
-        # _resolve_pm_channel
-        "from gapo_user_maps": [(pm_thread, pm_user)] if (pm_thread or pm_user) else [],
+        # _resolve_pm_channel: (gapo_thread_id, gapo_user_id, full_name)
+        "left join gapo_user_maps": [(pm_thread, pm_user, "PM Test")] if (pm_thread or pm_user) else [(None, None, "PM Test")],
     }
 
 

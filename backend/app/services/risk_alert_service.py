@@ -32,26 +32,6 @@ _ACTION_HINTS = [
     ("unassigned", "Phân công người phụ trách cho các task chưa có owner."),
 ]
 
-# Nhãn ngắn cho từng loại rủi ro của task (hiển thị cạnh tên task).
-_TASK_REASON_LABEL = {
-    "blocked": "đang bị blocker",
-    "overdue": "quá hạn",
-    "due_soon_low": "sắp đến hạn, tiến độ thấp",
-    "stale": "lâu không cập nhật",
-    "unassigned": "chưa có người phụ trách",
-}
-
-# Mẫu hành động cá nhân hoá theo loại rủi ro của TỪNG task (điền tên task + người).
-def _task_action(reason: str, name: str, assignee: str | None) -> str:
-    who = assignee or "team"
-    return {
-        "blocked":      f"Gỡ blocker cho '{name}' (hỏi {who} vướng gì, hỗ trợ ngay).",
-        "overdue":      f"Chốt deadline mới hoặc giao lại '{name}' (đang trễ — {who}).",
-        "due_soon_low": f"Đốc thúc {who} đẩy nhanh '{name}' (sắp đến hạn, tiến độ thấp).",
-        "unassigned":   f"Phân công người phụ trách cho '{name}'.",
-        "stale":        f"Yêu cầu {who} cập nhật tiến độ '{name}' (lâu không động).",
-    }.get(reason, f"Rà soát '{name}'.")
-
 class RiskAlertService:
     def __init__(self, gapo: GapoClient | None = None, llm=_LLM_UNSET):
         self.gapo = gapo or GapoClient()
@@ -94,8 +74,8 @@ class RiskAlertService:
                 skipped += 1
                 continue
 
-            thread_id, gapo_user_id = await self._resolve_pm_channel(db, pm_id)
-            draft = self.build_draft_message(risk)
+            thread_id, gapo_user_id, pm_name = await self._resolve_pm_channel(db, pm_id)
+            draft = self.build_draft_message(risk, pm_name=pm_name)
 
             await db.execute(text("""
                 INSERT INTO risk_alerts
@@ -179,67 +159,78 @@ class RiskAlertService:
         return total
 
     async def _resolve_pm_channel(self, db, pm_id):
+        """Trả (thread_id, gapo_user_id, full_name) của PM để định tuyến DM + chào tên."""
         row = (await db.execute(text("""
-            SELECT gapo_thread_id, gapo_user_id FROM gapo_user_maps WHERE user_id = :uid
+            SELECT g.gapo_thread_id, g.gapo_user_id, u.full_name
+            FROM users u
+            LEFT JOIN gapo_user_maps g ON g.user_id = u.id
+            WHERE u.id = :uid
         """), {"uid": pm_id})).fetchone()
         if not row:
-            return None, None
-        return row[0], row[1]
+            return None, None, None
+        return row[0], row[1], row[2]
 
-    def build_draft_message(self, risk: ProjectRisk) -> str:
-        """Soạn nội dung cảnh báo + đề xuất. Dùng template tất định (LLM tuỳ chọn)."""
-        # Đề xuất CÁ NHÂN HOÁ theo từng task cụ thể (đích danh + người); nếu không
-        # có task chi tiết thì rơi về gợi ý tổng quát theo loại tín hiệu.
-        if risk.top_tasks:
-            actions = [_task_action(t.reason, t.name, t.assignee) for t in risk.top_tasks]
-            if risk.extra_tasks:
-                actions.append(f"Rà soát {risk.extra_tasks} task rủi ro còn lại.")
-        else:
-            counts = {"overdue": risk.overdue, "due_soon_low": risk.due_soon_low,
-                      "stale": risk.stale, "unassigned": risk.unassigned}
-            actions = [hint for key, hint in _ACTION_HINTS if counts.get(key)]
+    # Số task nêu đích danh trong cảnh báo (giữ NGẮN; phần còn lại gộp "…và N khác").
+    _MAX_LISTED_TASKS = 3
 
-        # Liệt kê TASK CỤ THỂ (đích danh) thay vì chỉ nêu con số tổng quát.
+    def build_draft_message(self, risk: ProjectRisk, pm_name: str | None = None) -> str:
+        """Soạn cảnh báo NGẮN GỌN đủ ý: chào + mức + vài task gấp + nút thắt + 1-2 hành động.
+
+        Cố ý KHÔNG liệt kê task hai lần (một ở 'task chú ý', một ở 'đề xuất'): đề
+        xuất gộp THEO LOẠI rủi ro, không mỗi task một dòng. Dùng template tất định
+        (LLM tuỳ chọn, chỉ để mượt câu — bị ép giữ ngắn). pm_name để chào đích danh.
+        """
+        listed = risk.top_tasks[: self._MAX_LISTED_TASKS]
+        # extra = task không liệt kê chi tiết (phần bị cắt khỏi top_tasks + extra_tasks gốc).
+        extra = risk.extra_tasks + max(0, len(risk.top_tasks) - len(listed))
+
+        # Top task: chỉ tên + hạn (bỏ nhãn lý do dài dòng — đã gói trong dòng "Lý do").
         task_lines = []
-        for t in risk.top_tasks:
-            label = _TASK_REASON_LABEL.get(t.reason, t.reason or "")
-            meta = []
-            if t.deadline:
-                meta.append(f"hạn {t.deadline}")
-            meta.append(t.assignee or "chưa giao")
-            task_lines.append(f"- {t.name} ({label} — {', '.join(meta)})")
-        if risk.extra_tasks:
-            task_lines.append(f"- …và {risk.extra_tasks} task rủi ro khác")
+        for t in listed:
+            suffix = f" (hạn {t.deadline})" if t.deadline else ""
+            task_lines.append(f"- {t.name}{suffix}")
+        if extra:
+            task_lines.append(f"- …và {extra} task khác")
 
+        # Người chịu phần lớn rủi ro: chỉ nêu khi mọi task đích danh cùng 1 người.
+        owners = {t.assignee for t in listed if t.assignee}
+        owner_note = f" Phần lớn do {next(iter(owners))} phụ trách." if len(owners) == 1 else ""
+
+        # Đề xuất GỘP THEO LOẠI (1 dòng/loại có mặt), KHÔNG mỗi task một dòng.
+        counts = {"overdue": risk.overdue, "due_soon_low": risk.due_soon_low,
+                  "stale": risk.stale, "unassigned": risk.unassigned}
+        actions = [hint for key, hint in _ACTION_HINTS if counts.get(key)]
+
+        # Dòng chào đích danh PM (fallback "Chào bạn," khi chưa có tên).
+        greeting = f"Chào {pm_name.strip()}," if pm_name and pm_name.strip() else "Chào bạn,"
         lines = [
-            f"⚠️ **Cảnh báo rủi ro dự án: {risk.project_name}**",
-            f"Mức độ: {risk.level} (điểm rủi ro {risk.score})",
+            greeting,
             "",
-            "Lý do:",
-            *[f"- {r}" for r in risk.reasons],
+            f"⚠️ Rủi ro {risk.level} — {risk.project_name} ({risk.score}đ)",
+            "",
+            # Lý do gộp 1 dòng (· ngăn cách) thay cho bullet rời từng số liệu.
+            " · ".join(risk.reasons) + "." + owner_note,
         ]
         if task_lines:
-            lines += ["", "Task cần chú ý:", *task_lines]
-        # Nút thắt phụ thuộc: task đang chặn nhiều task nhất -> ưu tiên gỡ trước.
+            lines += ["", "Task gấp nhất:", *task_lines]
+        # Nút thắt phụ thuộc: task chặn nhiều task nhất -> ưu tiên gỡ trước (ý giá trị cao).
         if risk.bottleneck:
             b = risk.bottleneck
             code = f"{b['code']} " if b.get("code") else ""
-            lines += ["", f"🔗 Nút thắt: {code}**{b['name']}** đang chặn {b['blocks_count']} task khác — ưu tiên hoàn thành trước để gỡ cả chuỗi."]
-        lines += [
-            "",
-            "Đề xuất hành động:",
-            *[f"- {a}" for a in actions],
-            "",
-            "Bạn rà soát và xử lý sớm giúp nhé.",
-        ]
+            lines += ["", f"🔗 Ưu tiên gỡ {code}{b['name']} trước — đang chặn {b['blocks_count']} task khác."]
+        if actions:
+            lines += ["", "→ " + " ".join(actions)]
         template = "\n".join(lines)
+
         if self.llm is None:
             return template
         try:
             prompt = (
-                "Bạn là trợ lý PM. Viết lại cảnh báo rủi ro dưới đây cho mạch lạc, "
-                "thân thiện, GIỮ NGUYÊN số liệu và các đề xuất. KHÔNG bịa thêm số "
-                "liệu. KHÔNG hỏi xác nhận (đây là thông báo, không cần PM duyệt).\n\n" + template
+                "Bạn là trợ lý PM. Viết lại cảnh báo rủi ro dưới đây cho mượt nhưng "
+                "PHẢI NGẮN GỌN (tối đa ~9 dòng). GIỮ dòng chào đầu tiên (1 dòng, ngắn). "
+                "GIỮ NGUYÊN số liệu, tên task, tên người. KHÔNG bịa số liệu. KHÔNG "
+                "thêm xã giao dài dòng. KHÔNG liệt kê lại task ở phần đề xuất. "
+                "KHÔNG hỏi xác nhận.\n\n" + template
             )
             resp = self.llm.invoke(prompt)
             return (resp.content or "").strip() or template

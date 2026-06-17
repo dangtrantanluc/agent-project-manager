@@ -49,20 +49,25 @@ flowchart LR
     D -.song song.-> A3[planning]
     D -.song song.-> A4[notification]
     D -.song song.-> A8[conversation]
-    subgraph ACT[Action agent — thao tác ghi dữ liệu]
-        A5[task_update]
+    D -.song song.-> A5[task_update]
+    subgraph ACT[ActionAgent registry — write-action]
         A6[create_task]
         A7[add_member]
+        A9[change_assignee]
+        A10["delete_task ⚠️"]
+        A11["remove_member ⚠️"]
     end
-    D -.song song.-> A5
-    D -.song song.-> A6
-    D -.song song.-> A7
-    A1 & A2 & A3 & A4 & A8 --> C[Gộp kết quả]
-    A5 & A6 & A7 --> C
+    D -.song song.-> ACT
+    A1 & A2 & A3 & A4 & A8 & A5 --> C[Gộp kết quả]
+    ACT --> C
     C --> U
 ```
 
-> **Action agent** không phải một node định tuyến riêng: router vẫn phân loại và phát ra **3 intent độc lập** (`task_update`, `create_task`, `add_member`). Nhóm này được vẽ chung vì chúng cùng họ "thao tác ghi dữ liệu" và đã được **gom ở tầng service** — khác với các agent còn lại chỉ đọc/soạn nội dung.
+> **ActionAgent registry** ([action_registry.py](backend/ai_agent/router/action_registry.py)): các write-action cùng kế thừa [ActionAgentBase](backend/ai_agent/shared/action_base.py) (gom init LLM + bóc tách + gate quyền), đăng ký vào một bảng `name → class`. Thêm tool ghi mới = thêm **1 dòng** vào registry — `VALID_AGENTS` và prompt phân loại của router tự cập nhật, không sửa router/dispatcher.
+>
+> Router vẫn phát **tên tool con trực tiếp** (không có tầng LLM phân loại con) nên độ trễ không đổi. `task_update` **KHÔNG** ở trong registry: nó có phiên Redis + menu nút bấm + verify service riêng nên giữ nhánh xử lý độc quyền.
+>
+> ⚠️ `delete_task` / `remove_member` là thao tác **phá huỷ** → đi luồng **xác nhận 2 bước**: lượt 1 trả nút "Xác nhận / Huỷ" (payload `ACTDEL|kind|id`), lượt 2 mới thực thi xoá (kiểm quyền lại). Cơ chế dùng chung bảng `_PAYLOAD_GATES`.
 
 **Lợi ích của hướng này:**
 - **Prompt nhỏ, tập trung** → chất lượng cao hơn, ít lệch hơn so với một prompt "vạn năng".
@@ -150,7 +155,7 @@ Mã nguồn: [backend/ai_agent/](backend/ai_agent/). Xem thêm [DESIGN.md](backe
 
 ### 4.1 Router & dispatcher
 
-- **[router/router.py](backend/ai_agent/router/router.py)** (`PMMultiAgentRouter`): phân loại ý định bằng LLM (model nhẹ qua `ROUTER_MODEL_NAME`, fail-fast `timeout=10s`), trả về mảng tên agent từ tập hợp lệ: `report, text2sql, planning, conversation, notification, task_update, create_task, add_member`.
+- **[router/router.py](backend/ai_agent/router/router.py)** (`PMMultiAgentRouter`): phân loại ý định bằng LLM (model nhẹ qua `ROUTER_MODEL_NAME`, fail-fast `timeout=10s`), trả về mảng tên agent từ `VALID_AGENTS = READ_AGENTS ∪ ACTION_NAMES`. Các agent đọc/soạn cố định: `report, text2sql, planning, conversation, notification, task_update`; các write-action lấy từ [ActionAgent registry](backend/ai_agent/router/action_registry.py): `create_task, add_member, change_assignee, delete_task, remove_member`. Phần mô tả write-action trong prompt phân loại **sinh tự động** từ `intent_desc` của mỗi service.
 - **[router/message_router.py](backend/ai_agent/router/message_router.py)** (`AgentMessageRouter`): điều phối chính. Trong `handle_message()` nó chạy **song song** (`asyncio.gather`): chọn agent + nạp bộ nhớ hội thoại (5 lượt gần nhất + tóm tắt) + nạp hồ sơ người dùng (tên, phòng ban, số task quá hạn, deadline gần nhất, dự án). Sau đó chạy các agent đã chọn song song và gộp kết quả: 1 agent → trả prose trực tiếp; ≥2 agent → nối các đoạn (không gọi lại LLM, không gắn nhãn).
 
 ### 4.2 Các agent chuyên biệt
@@ -164,7 +169,17 @@ Mã nguồn: [backend/ai_agent/](backend/ai_agent/). Xem thêm [DESIGN.md](backe
 | **notification** | [notification/notification_agent.py](backend/ai_agent/notification/notification_agent.py) | Sinh nội dung nhắc deadline; có template fallback (thông báo không được "im lặng"). |
 | **task_update** | [task_update/](backend/ai_agent/task_update/) | Khi người dùng khẳng định đã làm xong/cập nhật một task; bắt **kết quả/khó khăn** và lưu vào task. |
 
-> `task_update`, `create_task` và `add_member` cùng họ **"action agent"** (thao tác ghi dữ liệu): mỗi intent được điều phối qua service tương ứng ([task_progress_service](backend/app/services/task_progress_service.py), [task_create_service](backend/app/services/task_create_service.py), [add_member_service](backend/app/services/add_member_service.py)) sau khi router nhận diện ý định. `create_task`/`add_member` dùng chung [shared/entity_resolver.py](backend/ai_agent/shared/entity_resolver.py) để phân giải tên người/dự án (task_update resolve task qua `task_verify_service`). Đây là gom ở **tầng service**, không phải một intent định tuyến gộp.
+**Write-action** (kế thừa [ActionAgentBase](backend/ai_agent/shared/action_base.py), đăng ký trong [action_registry.py](backend/ai_agent/router/action_registry.py)):
+
+| Action | File | Mô tả | Confirm? |
+|---|---|---|:-:|
+| **create_task** | [task_create_service.py](backend/app/services/task_create_service.py) | Giao việc / tạo task mới cho người khác. | — |
+| **add_member** | [add_member_service.py](backend/app/services/add_member_service.py) | Thêm thành viên vào dự án. | — |
+| **change_assignee** | [change_assignee_service.py](backend/app/services/change_assignee_service.py) | Giao lại task đã có cho người khác; báo cho người nhận mới + quét lại rủi ro dự án. | — |
+| **delete_task** | [delete_task_service.py](backend/app/services/delete_task_service.py) | Xoá task (giảm `task_count`, đồng bộ milestone). | ✅ 2 bước |
+| **remove_member** | [remove_member_service.py](backend/app/services/remove_member_service.py) | Gỡ thành viên khỏi dự án (giảm `member_count`). | ✅ 2 bước |
+
+> Mọi write-action: **chỉ MANAGER/ADMIN/SUPER_ADMIN** (gate `is_privileged` ở `ActionAgentBase.run`, kiểm lại ở bước thực thi với tool có confirm); resolve người/dự án/task mơ hồ → **hỏi lại, không đoán** ([shared/entity_resolver.py](backend/ai_agent/shared/entity_resolver.py): `resolve_users`/`resolve_projects`/`resolve_tasks`). `resolve_tasks` nhận mã task Jira-style (`GAP-T0003`) lẫn dạng số (`[3.2]`), giới hạn trong các dự án người gọi có quyền.
 
 ### 4.3 Hạ tầng agent
 

@@ -21,6 +21,15 @@ _OUTBOUND_RE = re.compile(r"\b(?:push|nhắn|nhắc|giục|đốc thúc|thúc)\b
 
 # Câu GIAO VIỆC / tạo task mới -> agent create_task.
 CREATE_TASK_KEYWORDS = ("giao task", "giao việc", "tạo task", "tạo việc", "assign task", "thêm task")
+CHANGE_ASSIGNEE_KEYWORDS = (
+    "chuyển task", "chuyển việc", "giao lại", "đổi người", "đổi assignee",
+    "đổi người phụ trách",
+)
+DELETE_TASK_KEYWORDS = ("xoá task", "xóa task", "huỷ task", "hủy task", "delete task", "xoá việc", "xóa việc")
+REMOVE_MEMBER_KEYWORDS = (
+    "gỡ thành viên", "xoá thành viên", "xóa thành viên",
+    "remove member", "loại khỏi dự án", "khỏi dự án",
+)
 
 # Mã task hiện hữu "[2.4]" -> thao tác trên task ĐÃ CÓ, không phải tạo mới.
 _TASK_CODE_RE = re.compile(r"\[\d+(?:\.\d+)*\]")
@@ -42,6 +51,14 @@ def keyword_agent(message: str) -> str:
     # (data) lẫn 'làm xong' (task_update) — ưu tiên xác minh hoàn thành.
     if any(keyword in lowered for keyword in task_update_keywords):
         return "task_update"
+    if any(keyword in lowered for keyword in DELETE_TASK_KEYWORDS):
+        return "delete_task"
+    if any(keyword in lowered for keyword in REMOVE_MEMBER_KEYWORDS):
+        return "remove_member"
+    if any(keyword in lowered for keyword in CHANGE_ASSIGNEE_KEYWORDS):
+        return "change_assignee"
+    if any(keyword in lowered for keyword in CREATE_TASK_KEYWORDS):
+        return "create_task"
     if any(keyword in lowered for keyword in planning_keywords):
         return "planning"
     if any(keyword in lowered for keyword in report_keywords):
@@ -63,12 +80,27 @@ def resolve_agents(message: str, selected: list[str]) -> list[str]:
 
     lowered = message.lower()
 
-    # Câu nêu MÃ task "[x.y]" -> thao tác trên task ĐÃ CÓ, ép task_update.
-    if _TASK_CODE_RE.search(message):
-        return ["task_update"]
-
     has_create = any(kw in lowered for kw in CREATE_TASK_KEYWORDS)
     has_update = any(kw in lowered for kw in TASK_UPDATE_KEYWORDS)
+    has_delete = any(kw in lowered for kw in DELETE_TASK_KEYWORDS)
+    has_remove_member = any(kw in lowered for kw in REMOVE_MEMBER_KEYWORDS)
+    has_change = any(kw in lowered for kw in CHANGE_ASSIGNEE_KEYWORDS) or (
+        "chuyển" in lowered and bool(_TASK_CODE_RE.search(message))
+    )
+
+    if has_delete:
+        return ["delete_task"]
+
+    if has_remove_member:
+        return ["remove_member"]
+
+    if has_change and ("task" in lowered or _TASK_CODE_RE.search(message)):
+        return ["change_assignee"]
+
+    # Câu nêu MÃ task "[x.y]" -> thao tác cập nhật task ĐÃ CÓ, trừ các action
+    # delete/change đã bắt phía trên.
+    if _TASK_CODE_RE.search(message):
+        return ["task_update"]
 
     # Có CẢ hai loại từ khoá: ưu tiên create khi có " cho " (giao cho ai đó).
     if has_create and (not has_update or " cho " in lowered):

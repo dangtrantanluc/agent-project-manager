@@ -14,17 +14,20 @@ from ai_agent.shared.llm_factory import make_llm
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Tên agent hợp lệ — dùng để validate output của LLM, tránh agent "ảo".
-VALID_AGENTS = {
+from ai_agent.router.action_registry import ACTION_NAMES, ACTION_INTENT_DESCS
+
+# Agent chỉ-đọc/soạn (cố định). Write-action lấy từ ACTION_REGISTRY -> thêm tool
+# ghi mới chỉ cần đăng ký ở registry, KHÔNG sửa router.
+READ_AGENTS = {
     "report",
     "text2sql",
     "planning",
     "conversation",
     "notification",
     "task_update",
-    "create_task",
-    "add_member",
 }
+# Tên agent hợp lệ — dùng để validate output của LLM, tránh agent "ảo".
+VALID_AGENTS = READ_AGENTS | ACTION_NAMES
 DEFAULT_AGENT = "conversation"
 
 
@@ -83,6 +86,9 @@ class PMMultiAgentRouter:
         # LƯU Ý: ví dụ JSON trong prompt dùng dấu ngoặc vuông [] nên an toàn với
         # f-string. TUYỆT ĐỐI KHÔNG đặt ví dụ chứa {} trong f-string của prompt
         # (gây lỗi runtime "Invalid format specifier").
+        # Mô tả các write-action SINH từ ACTION_REGISTRY (mỗi intent_desc đã ở dạng
+        # "- name: ..."), nên thêm tool ghi mới tự xuất hiện ở đây.
+        action_lines = "\n".join(ACTION_INTENT_DESCS.values())
         prompt = f"""Bạn là bộ phân loại ý định. Hãy phân loại câu hỏi của người dùng vào MỘT hoặc NHIỀU danh mục dưới đây.
 
 Danh mục:
@@ -92,8 +98,7 @@ Danh mục:
 - conversation: chào hỏi, giao tiếp, cảm xúc, câu hỏi chung chung không thuộc nhóm trên.
 - notification: tạo nội dung thông báo, nhắc nhở, reminder.
 - task_update: người dùng KHẲNG ĐỊNH đã làm xong / đã cập nhật một task đã nhắc trước đó (vd: "tôi update rồi", "xong rồi", "done", "đã hoàn thành", "task X xong 80%").
-- create_task: người dùng GIAO VIỆC / tạo task MỚI cho người khác (vd: "giao task X cho Thảo deadline mai", "tạo task ... cho Nam"). Khác task_update (báo task cũ) và notification (chỉ nhắc, không tạo).
-- add_member: người dùng THÊM THÀNH VIÊN vào DỰ ÁN (vd: "thêm Thảo vào dự án Logistics", "add Nam vào project CRM vai trò dev"). KHÁC create_task: add_member gắn người vào DỰ ÁN (không tạo task); create_task tạo CÔNG VIỆC giao cho người.
+{action_lines}
 
 Quy tắc:
 - CHỈ trả về một JSON array các tên danh mục, KHÔNG giải thích, KHÔNG markdown.
