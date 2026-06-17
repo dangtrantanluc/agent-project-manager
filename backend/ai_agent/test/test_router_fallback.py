@@ -143,6 +143,21 @@ def test_fallback_create_task_routes(router):
         "tạo task kiểm thử cho Nam", ["text2sql"]) == ["create_task"]
 
 
+def test_fallback_delete_task_routes_before_task_code(router):
+    assert router._fallback_agent_for_message("xoá task [3.2]", ["conversation"]) == ["delete_task"]
+    assert router._fallback_agent_for_message("huỷ task Fix login", ["text2sql"]) == ["delete_task"]
+
+
+def test_fallback_change_assignee_routes_before_task_code(router):
+    assert router._fallback_agent_for_message("chuyển task [3.2] cho Thảo", ["conversation"]) == ["change_assignee"]
+    assert router._fallback_agent_for_message("chuyển [3.2] cho Nam", ["text2sql"]) == ["change_assignee"]
+
+
+def test_fallback_remove_member_routes(router):
+    assert router._fallback_agent_for_message(
+        "gỡ Nam khỏi dự án Logistics", ["conversation"]) == ["remove_member"]
+
+
 def test_fallback_create_vs_update_heuristic(router):
     # Câu có CẢ create lẫn update keyword: " cho " (giao cho ai) -> create_task.
     assert router._fallback_agent_for_message(
@@ -179,6 +194,20 @@ def test_notification_push_without_recipient_asks_back():
         "10", "gapo", "t1", {},
     ))
     assert "ai" in out.lower()
+
+
+def test_dispatch_actdel_payload_routes_delete(monkeypatch):
+    import asyncio
+
+    class _FakeDelete:
+        async def _do_delete(self, entity_id, user_id):
+            return {"message": f"deleted {entity_id} by {user_id}"}
+
+    monkeypatch.setattr("ai_agent.router.message_router.get_action", lambda name: _FakeDelete())
+    r = object.__new__(AgentMessageRouter)
+    out = asyncio.run(r._dispatch_task_payload("ACTDEL|task|12", "10", None, {}))
+    assert out.agent == "delete_task"
+    assert out.answer == "deleted 12 by 10"
 
 
 def test_fallback_drops_extra_conversation(router):  # 3a

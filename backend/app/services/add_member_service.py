@@ -13,15 +13,14 @@ ro thêm nhầm thấp; cơ chế confirm chung để dành cho ActionAgent sau 
 """
 import json
 import logging
-import os
 from dataclasses import dataclass
 
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from database import AsyncSessionLocal
+from ai_agent.shared.action_base import ActionAgentBase, ActionContext, ActionResult
 from ai_agent.shared.entity_resolver import (
     is_privileged,
     resolve_users,
@@ -60,22 +59,27 @@ class AddMemberResult:
     member_id: int | None = None
 
 
-class AddMemberService:
-    def __init__(self, llm: ChatOpenAI | None = None):
-        self._llm = None
-        model, api_key, base_url = (
-            os.getenv("MODEL_NAME"), os.getenv("API_KEY"), os.getenv("BASE_URL"),
+class AddMemberService(ActionAgentBase):
+    # Khai báo cho ActionAgentBase / registry (router đọc intent_desc qua class).
+    name = "add_member"
+    purpose = "add_member"
+    extraction_model = AddMemberExtraction
+    system_prompt = _EXTRACT_SYSTEM_PROMPT
+    intent_desc = (
+        "- add_member: người dùng THÊM THÀNH VIÊN vào DỰ ÁN (vd: "
+        '"thêm Thảo vào dự án Logistics", "add Nam vào project CRM vai trò dev"). '
+        "KHÁC create_task: add_member gắn người vào DỰ ÁN (không tạo task)."
+    )
+
+    async def _handle(self, extraction, ctx: ActionContext) -> ActionResult:
+        """Adapter ActionAgentBase: uỷ thẳng sang add_from_chat (giữ logic & test cũ)."""
+        r = await self.add_from_chat(
+            message=ctx.message, sender_user_id=ctx.sender_user_id,
+            user_profile=ctx.user_profile, memory_context=ctx.memory_context,
         )
-        if llm is not None:
-            self._llm = llm.with_structured_output(AddMemberExtraction, method="function_calling")
-        elif model and api_key and base_url:
-            from ai_agent.shared.llm_factory import make_llm
-            base = make_llm(purpose="add_member", timeout=15, max_retries=1,
-                            temperature=0.1, reasoning_effort="none",
-                            model=model, api_key=api_key, base_url=base_url)
-            self._llm = base.with_structured_output(AddMemberExtraction, method="function_calling")
-        else:
-            logger.warning("AddMemberService LLM chưa cấu hình; không thêm thành viên qua chat được.")
+        # status 'added' của add_member -> 'done' chuẩn của ActionResult.
+        status = "done" if r.status == "added" else r.status
+        return ActionResult(status=status, message=r.message, entity_id=r.member_id)
 
     async def add_from_chat(
         self,
@@ -99,7 +103,7 @@ class AddMemberService:
             )
 
         # 2. Bóc tách.
-        extraction = await self._extract(message, memory_context)
+        extraction = await self._extract_member(message, memory_context)
         if extraction is None or not extraction.member.strip() or not extraction.project.strip():
             return AddMemberResult(
                 status="need_info",
@@ -163,7 +167,8 @@ class AddMemberService:
                      f"với vai trò {role}. Bạn cần thêm ai nữa cứ nhắn mình nhé!"),
         )
 
-    async def _extract(self, message: str, memory_context: str) -> AddMemberExtraction | None:
+    async def _extract_member(self, message: str, memory_context: str) -> AddMemberExtraction | None:
+        # Tên KHÁC base._extract(ctx) để không override nó (base.run dùng chữ ký khác).
         memory_block = f"Ngữ cảnh trước:\n{memory_context}\n\n" if memory_context else ""
         try:
             return await self._llm.ainvoke([

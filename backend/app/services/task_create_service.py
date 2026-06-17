@@ -12,12 +12,10 @@ Quy tắc an toàn:
 """
 import asyncio
 import logging
-import os
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import pytz
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -25,6 +23,7 @@ from sqlalchemy import text
 from database import AsyncSessionLocal
 from app.core.code_gen import next_task_code
 from app.services.task_assignment_notifier import notify_task_assigned, notify_group_new_task
+from ai_agent.shared.action_base import ActionAgentBase, ActionContext, ActionResult
 from ai_agent.shared.entity_resolver import (
     is_privileged,
     resolve_users,
@@ -99,24 +98,31 @@ def _parse_deadline(s: str) -> date | None:
         return None
 
 
-class TaskCreateService:
-    def __init__(self, llm: ChatOpenAI | None = None):
-        self._llm = None
-        model, api_key, base_url = (
-            os.getenv("MODEL_NAME"), os.getenv("API_KEY"), os.getenv("BASE_URL"),
+class TaskCreateService(ActionAgentBase):
+    # Khai báo cho ActionAgentBase / registry (router đọc intent_desc qua class).
+    name = "create_task"
+    purpose = "create_task"
+    extraction_model = TaskCreateExtraction
+    system_prompt = _EXTRACT_SYSTEM_PROMPT
+    intent_desc = (
+        "- create_task: người dùng GIAO VIỆC / tạo task MỚI cho người khác (vd: "
+        '"giao task X cho Thảo deadline mai", "tạo task ... cho Nam"). Khác '
+        "task_update (báo task cũ) và notification (chỉ nhắc, không tạo)."
+    )
+
+    async def _handle(self, extraction, ctx: ActionContext) -> ActionResult:
+        """Adapter ActionAgentBase: uỷ thẳng sang create_from_chat (giữ logic & test cũ).
+
+        Quyền + LLM đã được base.run() gate trước; create_from_chat tự gate lại
+        (an toàn idempotent) rồi trả TaskCreateResult, map về ActionResult."""
+        r = await self.create_from_chat(
+            message=ctx.message, sender_user_id=ctx.sender_user_id,
+            user_profile=ctx.user_profile, memory_context=ctx.memory_context,
+            timezone_name=ctx.timezone_name,
         )
-        if llm is not None:
-            self._llm = llm.with_structured_output(TaskCreateExtraction, method="function_calling")
-        elif model and api_key and base_url:
-            # timeout ngắn + 1 retry: LLM chậm KHÔNG được treo cả luồng reply
-            # (trước đây 60s×retry -> ~180s như log đã thấy).
-            from ai_agent.shared.llm_factory import make_llm
-            base = make_llm(purpose="create_task", timeout=15, max_retries=1,
-                            temperature=0.1, reasoning_effort="none",
-                            model=model, api_key=api_key, base_url=base_url)
-            self._llm = base.with_structured_output(TaskCreateExtraction, method="function_calling")
-        else:
-            logger.warning("TaskCreateService LLM chưa cấu hình; không giao việc qua chat được.")
+        # status 'created' của create_task -> 'done' chuẩn của ActionResult.
+        status = "done" if r.status == "created" else r.status
+        return ActionResult(status=status, message=r.message, entity_id=r.task_id)
 
     async def create_from_chat(
         self,
@@ -142,7 +148,7 @@ class TaskCreateService:
             )
 
         # 2. Bóc tách thông tin.
-        extraction = await self._extract(message, memory_context)
+        extraction = await self._extract_create(message, memory_context)
         has_assignee = bool(extraction and (extraction.assignee.strip() or extraction.assign_to_self))
         if extraction is None or not extraction.task_name.strip() or not has_assignee:
             return TaskCreateResult(
@@ -243,7 +249,8 @@ class TaskCreateService:
                      f"**{project['name']}**, ưu tiên {priority}. Mình đã báo cho bạn ấy rồi nhé!"),
         )
 
-    async def _extract(self, message: str, memory_context: str) -> TaskCreateExtraction | None:
+    async def _extract_create(self, message: str, memory_context: str) -> TaskCreateExtraction | None:
+        # Tên KHÁC base._extract(ctx) để không override nó (base.run dùng chữ ký khác).
         # Lấy "hôm nay" theo giờ VN, KHÔNG theo TZ container (UTC): 6h sáng VN vẫn
         # là hôm qua theo UTC -> LLM tính "deadline ngày mai" lệch 1 ngày.
         today = datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).date().isoformat()

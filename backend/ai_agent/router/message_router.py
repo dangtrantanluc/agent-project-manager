@@ -24,8 +24,8 @@ from app.services.task_progress_service import (
 )
 from app.services.outbound_message_service import OutboundMessageService
 from app.services.risk_alert_service import RiskAlertService
-from app.services.task_create_service import TaskCreateService
-from app.services.add_member_service import AddMemberService
+from ai_agent.shared.action_base import ActionContext
+from ai_agent.router.action_registry import ACTION_NAMES, get_action
 
 logger = logging.getLogger(__name__)
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
@@ -105,6 +105,17 @@ def _parse_id_days_args(message: str):
     return (tid, days)
 
 
+def _parse_actdel(message: str):
+    """ACTDEL|task|12 / ACTDEL|member|34 -> (kind, id)."""
+    parts = message.split("|", 2)
+    if len(parts) != 3 or parts[1] not in {"task", "member"}:
+        return None
+    try:
+        return (parts[1], int(parts[2]))
+    except ValueError:
+        return None
+
+
 class AgentMessageRouter:
     # Bảng KHAI BÁO cho payload nút bấm task (xem _dispatch_task_payload). Mỗi dòng:
     #   prefix  -> tiền tố payload cần khớp
@@ -114,6 +125,8 @@ class AgentMessageRouter:
     #   reply   -> 'menu' (kèm nút bấm) | 'message' (lấy res['message']) | 'extract'
     # TASKUPD| KHÔNG ở đây vì apply_payload có thứ tự tham số khác (message trước user_id).
     _PAYLOAD_GATES = [
+        {"prefix": "ACTDEL|", "method": None, "parse": _parse_actdel,
+         "session": None, "reply": "confirm_delete"},
         {"prefix": "TASKPAGE|", "method": "menu_my_tasks", "parse": _parse_page_args,
          "session": "touch", "reply": "menu"},
         {"prefix": "TASKPICK|", "method": "menu_status", "parse": _parse_id_args,
@@ -141,8 +154,8 @@ class AgentMessageRouter:
         from app.services.task_outcome_service import TaskOutcomeService
         self.task_outcome_service = TaskOutcomeService(verify_service=self.task_verify_service)
         self.risk_alert_service = RiskAlertService()
-        self.task_create_service = TaskCreateService()
-        self.add_member_service = AddMemberService()
+        # create_task / add_member (và mọi write-action) chạy qua ACTION_REGISTRY
+        # (lazy-init). Xem _run_single_action (single intent) và _run_agent (gộp).
 
     async def handle_message(
         self,
@@ -206,11 +219,13 @@ class AgentMessageRouter:
             # Trả lời câu hỏi KẾT QUẢ/KHÓ KHĂN (follow-up RESULT_ISSUES/BLOCKER_REASON)
             # -> ghi thẳng, KHÔNG route như update thường. Đặt TRƯỚC "đang trong phiên".
             if db is not None and msg_stripped and not msg_stripped.startswith(("/", "TASK")):
-                fu = await self.task_outcome_service.find_pending(db, user_id, thread_id)
-                if fu is not None:
-                    res = await self.task_outcome_service.apply_reply(db, fu, msg_stripped, user_id, {})
-                    return AgentReply(answer=self._extract_message(res),
-                                      agent="task_update", metadata=metadata)
+                outcome_service = getattr(self, "task_outcome_service", None)
+                if outcome_service is not None:
+                    fu = await outcome_service.find_pending(db, user_id, thread_id)
+                    if fu is not None:
+                        res = await outcome_service.apply_reply(db, fu, msg_stripped, user_id, {})
+                        return AgentReply(answer=self._extract_message(res),
+                                          agent="task_update", metadata=metadata)
 
             # ĐANG TRONG PHIÊN + câu gõ thẳng (không phải payload) -> coi là TÌM task.
             if msg_stripped and await is_in_session(user_id):
@@ -255,6 +270,15 @@ class AgentMessageRouter:
                 return AgentReply(
                     answer=self._extract_message(res),
                     agent="task_update", metadata=md,
+                )
+
+            # Write-action chạy ĐƠN LẺ (chỉ 1 intent) -> đường riêng để nhận
+            # ActionResult đầy đủ + đính 'menu' xác nhận (vd xoá). KHÔNG qua _run_agent
+            # (đường gộp ép kết quả về str, nuốt mất nút bấm — xem _run_single_action).
+            if len(agent_names) == 1 and agent_names[0] in ACTION_NAMES:
+                return await self._run_single_action(
+                    agent_names[0], message, user_id, channel, thread_id,
+                    metadata, memory_context, user_profile,
                 )
 
             logger.info(
@@ -349,6 +373,15 @@ class AgentMessageRouter:
             args = gate["parse"](message)
             if args is None:
                 res = {"message": "Lựa chọn không hợp lệ."}
+            elif gate["reply"] == "confirm_delete":
+                kind, entity_id = args
+                if kind == "task":
+                    res = await get_action("delete_task")._do_delete(entity_id, user_id)
+                    agent = "delete_task"
+                else:
+                    res = await get_action("remove_member")._do_remove(entity_id, user_id)
+                    agent = "remove_member"
+                return AgentReply(answer=res.get("message", ""), agent=agent, metadata=metadata)
             else:
                 method = getattr(self.task_progress_service, gate["method"])
                 # needs_ctx: method nhận thêm thread_id/channel (vd apply_blocker tạo follow-up).
@@ -489,24 +522,14 @@ class AgentMessageRouter:
             )
             return self._extract_message(result)
 
-        if agent_name == "create_task":
-            result = await self.task_create_service.create_from_chat(
-                message=message,
-                sender_user_id=user_id,
-                user_profile=user_profile or {},
-                memory_context=memory_context,
-                timezone_name=self._timezone_name(metadata),
-            )
-            return result.message
-
-        if agent_name == "add_member":
-            result = await self.add_member_service.add_from_chat(
-                message=message,
-                sender_user_id=user_id,
-                user_profile=user_profile or {},
-                memory_context=memory_context,
-            )
-            return result.message
+        # Write-action ĐI CHUNG agent khác (đường gộp): chạy nhưng CHỈ lấy .message
+        # (str) vì _combine_results ép str — nút bấm confirm (nếu có) bị bỏ ở đây.
+        # Action đơn lẻ đi đường _run_single_action (giữ được nút bấm).
+        if agent_name in ACTION_NAMES:
+            res = await get_action(agent_name).run(self._action_ctx(
+                message, user_id, channel, thread_id, metadata, memory_context, user_profile,
+            ))
+            return res.message
 
         result = await self.conversation_agent.process_message_async(
             message,
@@ -515,6 +538,33 @@ class AgentMessageRouter:
             timezone_name=self._timezone_name(metadata),
         )
         return self._extract_message(result)
+
+    def _action_ctx(
+        self, message, user_id, channel, thread_id, metadata, memory_context, user_profile,
+    ) -> ActionContext:
+        """Đóng gói tham số cho ActionAgentBase.run() (dùng chung 2 đường gọi action)."""
+        return ActionContext(
+            message=message, sender_user_id=user_id, user_profile=user_profile or {},
+            memory_context=memory_context, timezone_name=self._timezone_name(metadata),
+            thread_id=thread_id, channel=channel,
+        )
+
+    async def _run_single_action(
+        self, agent_name, message, user_id, channel, thread_id,
+        metadata, memory_context, user_profile,
+    ) -> "AgentReply":
+        """Chạy MỘT write-action đơn lẻ và trả AgentReply (giữ nút bấm confirm).
+
+        Khác _run_agent (đường gộp trả str): ở đây nhận ActionResult đầy đủ, đính
+        ``menu`` (nếu need_confirm) vào metadata để render nút bấm xác nhận.
+        """
+        res = await get_action(agent_name).run(self._action_ctx(
+            message, user_id, channel, thread_id, metadata, memory_context, user_profile,
+        ))
+        md = {**metadata}
+        if res.menu:
+            md["menu"] = res.menu
+        return AgentReply(answer=res.message, agent=agent_name, metadata=md)
 
     async def _load_memory_context_new_session(self, conversation_id: str, message: str = "") -> str:
         t = time.perf_counter()
@@ -867,4 +917,3 @@ class AgentMessageRouter:
         if isinstance(value, list):
             return [self._jsonable(item) for item in value]
         return value
-
