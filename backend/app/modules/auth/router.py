@@ -3,6 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_db
+from app.core.rate_limit import LOGIN_LIMIT, LOGIN_WINDOW, rate_limit_ip
 from app.core.security import (
     create_access_token,
     verify_password,
@@ -45,7 +46,11 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.post("/login", response_model=AuthResponse)
+@router.post(
+    "/login",
+    response_model=AuthResponse,
+    dependencies=[Depends(rate_limit_ip("login", LOGIN_LIMIT, LOGIN_WINDOW))],
+)
 async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
     row = (await db.execute(
         text("""

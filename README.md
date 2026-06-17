@@ -1,12 +1,29 @@
 # AI Agent — PM-Bot
 
-Trợ lý AI cho hệ thống quản lý dự án (Project Management). Người dùng trò chuyện bằng **tiếng Việt** qua Gapo (hoặc HTTP API), và bot trả lời các câu hỏi về dự án, task, worklog, tiến độ — đồng thời tự động nhắc deadline, xác minh hoàn thành công việc, và thu thập check-in hằng ngày.
+Trợ lý AI cho hệ thống quản lý dự án (Project Management). Người dùng trò chuyện bằng **tiếng Việt** qua Gapo (hoặc HTTP API), và bot trả lời các câu hỏi về dự án, task, worklog, tiến độ — đồng thời tự động nhắc deadline, xác minh hoàn thành công việc, giao task, thêm thành viên, và thu thập **check-in** hằng ngày.
 
-Tài liệu này giải thích **kiến trúc**, **tại sao chọn cách làm đó**, **công nghệ sử dụng**, và **luồng dữ liệu chi tiết** từ một tin nhắn người dùng đến câu trả lời. Các sơ đồ dưới đây dùng [Mermaid](https://mermaid.js.org/) — GitHub render trực tiếp.
+Tài liệu này giải thích **kiến trúc**, **tại sao chọn cách làm đó**, **công nghệ sử dụng**, và **luồng dữ liệu chi tiết** từ một tin nhắn người dùng đến câu trả lời. Sơ đồ dùng [Mermaid](https://mermaid.js.org/) — GitHub render trực tiếp.
 
 ---
 
-## 1. Tổng quan thiết kế: tại sao là "multi-agent router"?
+## Mục lục
+
+1. [Tổng quan thiết kế: multi-agent router](#1-tổng-quan-thiết-kế-multi-agent-router)
+2. [Kiến trúc hệ thống](#2-kiến-trúc-hệ-thống)
+3. [Backend: API & module](#3-backend-api--module)
+4. [Hệ thống AI Agent](#4-hệ-thống-ai-agent)
+5. [Dịch vụ nghiệp vụ (services)](#5-dịch-vụ-nghiệp-vụ-services)
+6. [Tích hợp Gapo](#6-tích-hợp-gapo)
+7. [Frontend](#7-frontend)
+8. [Mô hình dữ liệu](#8-mô-hình-dữ-liệu)
+9. [Luồng dữ liệu: tin nhắn → câu trả lời](#9-luồng-dữ-liệu-tin-nhắn--câu-trả-lời)
+10. [Công nghệ sử dụng](#10-công-nghệ-sử-dụng)
+11. [Chạy dự án](#11-chạy-dự-án)
+12. [Biến môi trường](#12-biến-môi-trường)
+
+---
+
+## 1. Tổng quan thiết kế: multi-agent router
 
 Một câu hỏi PM có thể rất khác nhau về bản chất:
 
@@ -16,337 +33,313 @@ Một câu hỏi PM có thể rất khác nhau về bản chất:
 | "Báo cáo tiến độ tuần này" | Tổng hợp nhiều truy vấn + diễn giải | `report` |
 | "Giúp tôi lập kế hoạch dự án X" | Sinh nội dung có cấu trúc | `planning` |
 | "Tạo thông báo nhắc deadline thứ 6" | Sinh nội dung thông báo | `notification` |
+| "Tôi update task ABC xong 80% rồi" | Cập nhật task + bắt kết quả/khó khăn | `task_update` |
+| "Giao task X cho Thảo deadline mai" | Tạo task mới cho người khác | `create_task` |
+| "Thêm Nam vào dự án Logistics" | Gắn thành viên vào dự án | `add_member` |
 | "Chào bạn" | Hội thoại tự nhiên | `conversation` |
 
-Thay vì nhồi tất cả vào **một** prompt khổng lồ (vừa chậm, vừa khó kiểm soát, vừa dễ "ảo giác"), hệ thống chia thành **các agent chuyên biệt**, mỗi agent có prompt + logic riêng. Một **router** đứng trước phân loại ý định và chọn **một hoặc nhiều** agent phù hợp; nếu chọn nhiều, chúng chạy **song song** rồi gộp kết quả.
+Thay vì nhồi tất cả vào **một** prompt khổng lồ (vừa chậm, vừa khó kiểm soát, vừa dễ "ảo giác"), hệ thống chia thành **các agent chuyên biệt**, mỗi agent có prompt + logic riêng. Một **router** đứng trước phân loại ý định và trả về **một hoặc nhiều** tên agent; nếu chọn nhiều, chúng chạy **song song** rồi gộp kết quả.
 
 ```mermaid
 flowchart LR
-    U([Người dùng]) --> R{{Router<br/>phân loại ý định}}
-    R -->|trả về list tên agent| D[Dispatcher]
+    U([Người dùng]) --> R{{Router<br/>LLM phân loại ý định}}
+    R -->|list tên agent| D[Dispatcher]
     D -.song song.-> A1[text2sql]
     D -.song song.-> A2[report]
     D -.song song.-> A3[planning]
     D -.song song.-> A4[notification]
-    D -.song song.-> A5[conversation]
-    A1 & A2 & A3 & A4 & A5 --> C[Gộp kết quả]
+    D -.song song.-> A8[conversation]
+    subgraph ACT[Action agent — thao tác ghi dữ liệu]
+        A5[task_update]
+        A6[create_task]
+        A7[add_member]
+    end
+    D -.song song.-> A5
+    D -.song song.-> A6
+    D -.song song.-> A7
+    A1 & A2 & A3 & A4 & A8 --> C[Gộp kết quả]
+    A5 & A6 & A7 --> C
     C --> U
 ```
+
+> **Action agent** không phải một node định tuyến riêng: router vẫn phân loại và phát ra **3 intent độc lập** (`task_update`, `create_task`, `add_member`). Nhóm này được vẽ chung vì chúng cùng họ "thao tác ghi dữ liệu" và đã được **gom ở tầng service** — khác với các agent còn lại chỉ đọc/soạn nội dung.
 
 **Lợi ích của hướng này:**
 - **Prompt nhỏ, tập trung** → chất lượng cao hơn, ít lệch hơn so với một prompt "vạn năng".
 - **Cô lập rủi ro** → agent `text2sql` có lớp kiểm tra an toàn SQL riêng; agent khác không cần.
 - **Dễ test & thay thế** → mỗi agent là một class độc lập, có file test riêng trong [test/](backend/ai_agent/test/).
 - **LLM-agnostic** → mọi agent (kể cả router) đọc model/endpoint từ biến môi trường, nên đổi nhà cung cấp LLM chỉ là đổi `.env`.
-- **Đa nhãn (multi-label)** → một câu vừa cần dữ liệu vừa cần báo cáo có thể kích hoạt nhiều agent cùng lúc.
+
+> Router **không** dùng điểm tin cậy (confidence). Nó yêu cầu LLM trả về **mảng tên agent** dưới dạng structured output; mọi tên không thuộc tập hợp lệ đều bị loại. Khi LLM chỉ trả về `["conversation"]`, một lưới từ khoá tiếng Việt (`_keyword_agent`) đóng vai trò lưới an toàn để bắt các ý định rõ ràng bị bỏ sót.
 
 ---
 
-## 2. Công nghệ sử dụng & lý do
+## 2. Kiến trúc hệ thống
 
-| Thành phần | Công nghệ | Tại sao |
+```mermaid
+flowchart TB
+    subgraph client[Kênh người dùng]
+        GAPO[Gapo Work]
+        WEB[Web SPA - React]
+    end
+
+    subgraph backend[Backend - FastAPI / Python 3.12]
+        WH[Gapo Webhook] --> ADP[GapoAdapter<br/>xác thực + dedup + rate limit]
+        API[REST API /api/v1]
+        ADP --> CHK[CheckinFlowService<br/>FSM check-in]
+        CHK --> MR[AgentMessageRouter]
+        API --> MR
+        MR --> AGENTS[Multi-agent]
+        SVC[App Services<br/>risk, task, member...]
+        API --> SVC
+        SCHED[APScheduler<br/>check-in + deadline]
+    end
+
+    subgraph infra[Hạ tầng]
+        PG[(PostgreSQL 16<br/>asyncpg)]
+        RDS[(Redis 7<br/>cache + dedup + FSM)]
+        MIN[(MinIO<br/>avatar)]
+        LLM[9router proxy → LLM]
+    end
+
+    GAPO --> WH
+    WEB --> API
+    AGENTS --> LLM
+    AGENTS --> PG
+    SVC --> PG
+    MR --> RDS
+    API --> MIN
+    SCHED --> AGENTS
+```
+
+Backend là một ứng dụng **FastAPI async** (entry [backend/main.py](backend/main.py), prefix `/api/v1`). Tất cả I/O — truy vấn DB, gọi LLM, gửi tin Gapo — đều `async/await` để tận dụng concurrency cho hệ thống nặng I/O.
+
+---
+
+## 3. Backend: API & module
+
+Mỗi module trong [backend/app/modules/](backend/app/modules/) có một `router.py` (APIRouter) cùng models/services hỗ trợ, được gắn vào app dưới prefix `/api/v1`.
+
+| Module | Vai trò |
+|---|---|
+| [auth](backend/app/modules/auth/) | Đăng nhập JWT, refresh/logout token |
+| [users](backend/app/modules/users/) | Hồ sơ người dùng, tuỳ chọn cá nhân |
+| [projects](backend/app/modules/projects/) | CRUD dự án, lọc, metadata |
+| [tasks](backend/app/modules/tasks/) | Vòng đời task: tạo, chuyển trạng thái, blocker, phụ thuộc, import |
+| [milestones](backend/app/modules/milestones/) | Giai đoạn dự án, % hoàn thành |
+| [worklogs](backend/app/modules/worklogs/) | Ghi nhận giờ làm việc theo ngày/người/task |
+| [backlogs](backend/app/modules/backlogs/) | Hàng đợi worklog chờ duyệt |
+| [members](backend/app/modules/members/) | Thành viên & vai trò trong dự án |
+| [tags](backend/app/modules/tags/) | Nhãn cho task |
+| [scopes](backend/app/modules/scopes/) | Phạm vi / ước lượng dự án |
+| [dashboard](backend/app/modules/dashboard/) | Số liệu tổng quan, thống kê team |
+| [notifications](backend/app/modules/notifications/) | Thông báo in-app (chuông + trang) |
+| [agent](backend/app/modules/agent/) | Cổng vào AI agent (`POST /agent/message`), trạng thái check-in, backlog |
+| [agent_audit](backend/app/modules/agent_audit/) | Nhật ký hành động của agent |
+| [admin](backend/app/modules/admin/) | Quản trị người dùng, cấu hình công ty |
+| [uploads](backend/app/modules/uploads/) | Upload avatar (MinIO) |
+| [customers](backend/app/modules/customers/) · [rates](backend/app/modules/rates/) · [meetings](backend/app/modules/meetings/) | Khách hàng, đơn giá, lịch họp |
+
+**Truy cập DB** ([backend/database.py](backend/database.py)): SQLAlchemy async + `asyncpg` tới **PostgreSQL 16**. Pool cấu hình qua env (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_RECYCLE`, `DB_POOL_TIMEOUT`) với fail-fast khi cạn kết nối.
+
+---
+
+## 4. Hệ thống AI Agent
+
+Mã nguồn: [backend/ai_agent/](backend/ai_agent/). Xem thêm [DESIGN.md](backend/ai_agent/DESIGN.md).
+
+### 4.1 Router & dispatcher
+
+- **[router/router.py](backend/ai_agent/router/router.py)** (`PMMultiAgentRouter`): phân loại ý định bằng LLM (model nhẹ qua `ROUTER_MODEL_NAME`, fail-fast `timeout=10s`), trả về mảng tên agent từ tập hợp lệ: `report, text2sql, planning, conversation, notification, task_update, create_task, add_member`.
+- **[router/message_router.py](backend/ai_agent/router/message_router.py)** (`AgentMessageRouter`): điều phối chính. Trong `handle_message()` nó chạy **song song** (`asyncio.gather`): chọn agent + nạp bộ nhớ hội thoại (5 lượt gần nhất + tóm tắt) + nạp hồ sơ người dùng (tên, phòng ban, số task quá hạn, deadline gần nhất, dự án). Sau đó chạy các agent đã chọn song song và gộp kết quả: 1 agent → trả prose trực tiếp; ≥2 agent → nối các đoạn (không gọi lại LLM, không gắn nhãn).
+
+### 4.2 Các agent chuyên biệt
+
+| Agent | File | Mô tả |
 |---|---|---|
-| LLM client | **LangChain `ChatOpenAI`** (`langchain-openai`) | Giao diện OpenAI-compatible cho phép trỏ tới Google Gemini, OpenAI, hoặc bất kỳ endpoint tương thích nào chỉ bằng `base_url` + `api_key`. Không khoá vào một nhà cung cấp. |
-| LLM model (hiện tại) | **Google Gemini** qua proxy `9router` (`MODEL_NAME` từ env) | Flash rẻ + nhanh, đủ tốt cho phân loại ý định và sinh SQL. Quan trọng với UX chat realtime. |
-| Web framework | **FastAPI** (async) | Toàn bộ pipeline là I/O-bound (gọi LLM, query DB, gọi Gapo). Async cho phép chạy song song các bước (xem mục 6). |
-| DB driver (đọc của agent) | **`asyncpg`** + connection pool | Driver PostgreSQL async nhanh nhất, dùng pool để tái sử dụng kết nối. |
-| ORM (profile / memory / task verify) | **SQLAlchemy async** | Dùng cho các truy vấn có sẵn trong app (user profile, agent_memory, xác minh task). |
-| Cache | **Redis** (`redis[asyncio]`) | Cache SQL đã sinh và câu trả lời đã diễn giải → tránh gọi LLM lặp cho cùng câu hỏi. |
-| Lập lịch | **APScheduler** | Chạy job check-in (11:50 & 17:50 giờ VN) và nhắc deadline. |
-| Validation / structured output | **Pydantic v2** | Ép LLM trả JSON đúng schema cho PlanningAgent (`ProjectPlan`) và ReportAgent (`ReportPlan`, `TemplateSelection`). |
+| **text2sql** | [text_to_sql/text2sql.py](backend/ai_agent/text_to_sql/text2sql.py) | NL → SQL → tóm tắt. Cache SQL + cache kết quả (Redis). Lớp an toàn `is_safe_sql`: chỉ `SELECT`/`WITH`, chặn mọi mutation và hàm nguy hiểm. Chạy qua **role DB read-only** riêng (`DB_AGENT_USER`) với statement timeout. |
+| **report** | [report_generator/report_agent.py](backend/ai_agent/report_generator/report_agent.py) | Ưu tiên template SQL dựng sẵn (`project_progress`, `period_progress`, `overdue_upcoming`, `workload_by_person`); fallback lập kế hoạch truy vấn động. Dùng structured output. |
+| **planning** | [planning/planning_agent.py](backend/ai_agent/planning/planning_agent.py) | Sinh `ProjectPlan` có cấu trúc (Pydantic, ép `function_calling`). |
+| **conversation** | [coversation/conversation.py](backend/ai_agent/coversation/conversation.py) | Chào hỏi, trợ giúp, hỏi đáp chung; temperature cao hơn. |
+| **notification** | [notification/notification_agent.py](backend/ai_agent/notification/notification_agent.py) | Sinh nội dung nhắc deadline; có template fallback (thông báo không được "im lặng"). |
+| **task_update** | [task_update/](backend/ai_agent/task_update/) | Khi người dùng khẳng định đã làm xong/cập nhật một task; bắt **kết quả/khó khăn** và lưu vào task. |
 
-> **Cấu hình LLM thống nhất:** router và mọi agent đều khởi tạo `ChatOpenAI` với `model=os.getenv("MODEL_NAME")`, `api_key=os.getenv("API_KEY")`, `base_url=os.getenv("BASE_URL")` — đều đi qua proxy `9router`. Không còn hard-code key/model trong code ([router.py:34-42](backend/ai_agent/router/router.py#L34-L42)).
->
-> **Structured output:** dùng `with_structured_output(..., method="function_calling")` — `json_mode` fail khi đi qua proxy nên chọn function_calling.
+> `task_update`, `create_task` và `add_member` cùng họ **"action agent"** (thao tác ghi dữ liệu): mỗi intent được điều phối qua service tương ứng ([task_progress_service](backend/app/services/task_progress_service.py), [task_create_service](backend/app/services/task_create_service.py), [add_member_service](backend/app/services/add_member_service.py)) sau khi router nhận diện ý định. `create_task`/`add_member` dùng chung [shared/entity_resolver.py](backend/ai_agent/shared/entity_resolver.py) để phân giải tên người/dự án (task_update resolve task qua `task_verify_service`). Đây là gom ở **tầng service**, không phải một intent định tuyến gộp.
 
----
+### 4.3 Hạ tầng agent
 
-## 3. Cấu trúc thư mục
-
-```
-backend/ai_agent/
-├── router/                  # Tầng định tuyến & điều phối
-│   ├── router.py            # PMMultiAgentRouter — phân loại ý định → list agent
-│   └── message_router.py    # AgentMessageRouter — điều phối + chạy song song + gộp
-│
-├── text_to_sql/text2sql.py  # Text2SQLAgent — NL → SQL → kết quả → diễn giải
-├── report_generator/        # ReportAgent — template-first, sinh báo cáo
-├── planning/planning_agent.py  # PlanningAgent — sinh kế hoạch (structured output)
-├── coversation/conversation.py # ConversationAgent — chào hỏi & trợ giúp [sic: thư mục viết sai chính tả]
-├── notification/            # NotificationAgent — sinh nội dung nhắc nhở + in-app repo
-│
-├── memory/memory.py         # Bộ nhớ hội thoại + tóm tắt định kỳ
-├── context/                 # Phân giải tham chiếu (pronoun/tên → entity)
-├── checkin/                 # Luồng check-in worklog theo lịch
-│   ├── service.py           # CheckinFlowService — chặn tin nhắn trong phiên check-in
-│   ├── scheduler.py         # APScheduler trigger
-│   └── worklog_parser/      # Bóc tách số giờ từ ngôn ngữ tự nhiên
-│
-├── prompt/prompt.py         # SCHEMA_COMPACT — schema DB dạng nén cho prompt
-├── schemas.py               # Pydantic models dùng chung
-└── test/                    # Unit test cho từng agent
-```
+- **[shared/llm_factory.py](backend/ai_agent/shared/llm_factory.py)** — `make_llm()` thống nhất, tạo `ChatOpenAI` (LangChain) trỏ về proxy **9router** (tương thích OpenAI API). Đổi model/nhà cung cấp = đổi `.env`. Dùng `with_structured_output(method="function_calling")` cho structured output (json_mode fail qua proxy).
+- **[memory/memory.py](backend/ai_agent/memory/memory.py)** — bảng `agent_memory`; nạp 5 lượt gần nhất + tóm tắt; mỗi 4 lượt nén lịch sử bằng LLM để chống "phình" context.
+- **[context/](backend/ai_agent/context/)** — phân giải đại từ/tên → entity thật (user/project/task).
+- **[checkin/](backend/ai_agent/checkin/)** — `CheckinFlowService` chặn tin nhắn **trước** router; FSM: `IDLE → AWAITING_PROJECT → AWAITING_TASK → AWAITING_HOURS → CONFIRMING → COMPLETED/CANCELLED`. Scheduler (APScheduler) kích hoạt 11:50 & 17:50 giờ VN; `WorklogParserService` trích số giờ từ ngôn ngữ tự nhiên.
 
 ---
 
-## 4. Các agent chi tiết
+## 5. Dịch vụ nghiệp vụ (services)
 
-### 4.1 Router — `PMMultiAgentRouter` ([router/router.py](backend/ai_agent/router/router.py))
+[backend/app/services/](backend/app/services/) — logic dùng chung giữa REST API và agent:
 
-**Nhiệm vụ:** phân loại ý định và trả về **một danh sách tên agent** (multi-label), không còn chấm điểm tin cậy hay ngưỡng.
-
-```mermaid
-flowchart TD
-    Q[Câu hỏi người dùng] --> P[Prompt phân loại đa nhãn]
-    P --> L[[LLM ainvoke<br/>timeout=10, retries=1]]
-    L --> PA[_parse_agent_list]
-    PA --> J{Parse được<br/>JSON array?}
-    J -->|có| V[Lọc theo VALID_AGENTS<br/>khử trùng lặp, giữ thứ tự]
-    J -->|không / cắt cụt| S[Quét tên agent<br/>trong text thô]
-    S --> V
-    V --> E{Có agent nào?}
-    E -->|có| OUT[/list tên agent/]
-    E -->|rỗng| DEF["['conversation']"]
-    L -.lỗi/timeout.-> DEF
-    DEF --> OUT
-```
-
-**Cách hoạt động:**
-1. Gửi 1 prompt phân loại đa nhãn tới LLM, yêu cầu trả về **một JSON array** tên danh mục ([router.py:85-102](backend/ai_agent/router/router.py#L85-L102)): ví dụ `["text2sql"]` hoặc `["report", "planning"]`.
-2. **Parser chịu lỗi** (`_parse_agent_list`, [router.py:45-78](backend/ai_agent/router/router.py#L45-L78)): bóc ```` ```json ```` fence, tìm `[...]` rồi `json.loads`; nếu thất bại thì **quét tên agent** ngay trong text thô. Mọi tên ngoài `VALID_AGENTS` đều bị loại để tránh "agent ảo".
-3. **Fail-fast:** `timeout=10, max_retries=1` — phân loại phải nhanh; nếu LLM lỗi/timeout thì trả list rỗng để tầng trên fallback ([router.py:116-126](backend/ai_agent/router/router.py#L116-L126)).
-4. **Mặc định:** nếu không trích được agent nào → `["conversation"]` (`DEFAULT_AGENT`).
-
-`VALID_AGENTS = {report, text2sql, planning, conversation, notification, task_update}` ([router.py:16-23](backend/ai_agent/router/router.py#L16-L23)). Trong đó `task_update` là một intent nội bộ — khi user báo đã hoàn thành task đã được nhắc, hệ thống xác minh lại trạng thái trong DB rồi diễn giải bằng LLM (verify-then-narrate). Phần xử lý là một **service tất định** (`TaskVerifyService`, [task_update/task_verify_service.py](backend/ai_agent/task_update/task_verify_service.py)), không phải agent LLM tự quyết — nên không liệt kê ở danh sách agent §4.
-
-### 4.2 Điều phối — `AgentMessageRouter` ([router/message_router.py](backend/ai_agent/router/message_router.py))
-
-Đây là "bộ não" điều phối. `handle_message()` ([message_router.py:40](backend/ai_agent/router/message_router.py#L40)) là entry point của mọi tin nhắn sau khi đã qua tầng check-in.
-
-```mermaid
-flowchart TD
-    M[handle_message] --> G[["asyncio.gather (SONG SONG)"]]
-    G --> G1[selected_agents — LLM phân loại]
-    G --> G2[load_memory_context — 5 lượt + tóm tắt]
-    G --> G3[load_user_profile — tên, dự án, task quá hạn]
-    G1 & G2 & G3 --> F[_fallback_agent_for_message]
-    F --> FK{"selected == ['conversation']?"}
-    FK -->|có| KW[_keyword_agent — lưới từ khoá VN]
-    FK -->|không| BUS[Loại 'conversation' thừa,<br/>giữ agent nghiệp vụ]
-    KW --> RUN
-    BUS --> RUN[["asyncio.gather các _run_agent<br/>(return_exceptions=True)"]]
-    RUN --> CB[_combine_results]
-    CB --> CBN{Bao nhiêu agent<br/>chạy thành công?}
-    CBN -->|0| ERR[Câu xin lỗi tiếng Việt]
-    CBN -->|1| ONE[Trả thẳng prose]
-    CBN -->|≥2| MANY["Nối các đoạn bằng dòng trống<br/>(KHÔNG gọi LLM lại)"]
-    ONE & MANY --> REPLY["AgentReply{answer, agent='a+b', metadata}"]
-    ERR --> REPLY
-```
-
-- **Chạy song song** việc phân loại ý định, nạp memory, và nạp user profile bằng `asyncio.gather` ([message_router.py:61-66](backend/ai_agent/router/message_router.py#L61-L66)) — cả ba đều I/O-bound.
-- **Fallback bằng từ khoá** ([message_router.py:140-199](backend/ai_agent/router/message_router.py#L140-L199)): chỉ kích hoạt khi LLM trả về **đúng** `["conversation"]` (tức "không chắc"). Lưới từ khoá tiếng Việt đoán lại intent theo thứ tự ưu tiên: `planning` → `report` → `notification` → `text2sql`.
-- **Loại `conversation` thừa**: nếu LLM chọn nhiều agent gồm cả `conversation`, bỏ `conversation` vì agent nghiệp vụ đã tự chào + trả lời đủ ngữ cảnh.
-- **Chạy mọi agent song song** với `return_exceptions=True` — lỗi 1 agent không làm hỏng cả reply ([message_router.py:87-102](backend/ai_agent/router/message_router.py#L87-L102)).
-- **Gộp kết quả** (`_combine_results`, [message_router.py:201-229](backend/ai_agent/router/message_router.py#L201-L229)): bỏ agent lỗi/rỗng; 1 agent → trả thẳng; ≥2 agent → nối prose bằng dòng trống, **không** gọi LLM lần nữa và **không** thêm nhãn.
-- Field `agent` của `AgentReply` là chuỗi nối bằng `+` (vd `"text2sql+report"`) để JSON-serializable cho audit.
-
-### 4.3 Text-to-SQL — `Text2SQLAgent` ([text_to_sql/text2sql.py](backend/ai_agent/text_to_sql/text2sql.py))
-
-Agent quan trọng và "nguy hiểm" nhất, vì nó sinh SQL chạy thẳng trên DB.
-
-```mermaid
-flowchart TD
-    Q[Câu hỏi] --> CK{SQL cache hit?<br/>md5 câu hỏi + user_id}
-    CK -->|có & không phải câu thời-gian-tương-đối| RUN
-    CK -->|không| GEN[generate_sql<br/>SCHEMA_COMPACT + quy tắc PostgreSQL<br/>+ memory_context + user_id]
-    GEN --> SAFE{is_safe_sql?}
-    SAFE -->|"SELECT/WITH, đúng 1 ';',<br/>không mutation, không placeholder"| RUN[execute_sql<br/>qua asyncpg pool]
-    SAFE -->|không an toàn| RAISE[[raise ValueError<br/>KHÔNG CHẠY]]
-    RUN --> SUM[summarize_result<br/>LLM lần 2 → tiếng Việt tự nhiên]
-    SUM --> AC{Answer cache?<br/>md5 sql + kết quả}
-    AC --> OUT[/Câu trả lời/]
-```
-
-**Bước 1 — Sinh SQL** (`generate_sql`): prompt nhúng **`SCHEMA_COMPACT`** + quy tắc cú pháp PostgreSQL rất cụ thể (cấm `INTERVAL n DAY` kiểu MySQL, bắt dùng `date_trunc('week', ...)`...), kèm **ngữ cảnh hội thoại** và **user_id hiện tại** để xử lý "task của tôi".
-
-**Bước 1.5 — Kiểm tra an toàn** (`is_safe_sql`) — lớp phòng thủ cốt lõi:
-- Phải bắt đầu bằng `SELECT` hoặc `WITH`.
-- Phải kết thúc bằng đúng **một** dấu `;` (chặn multi-statement injection).
-- Regex chặn mọi từ khoá mutation: `INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|MERGE|GRANT|REVOKE|VACUUM|CALL|DO`.
-- Chặn placeholder `:field` chưa bind.
-- Không an toàn → `raise ValueError`, **không bao giờ chạy**.
-
-> Điểm thiết kế then chốt: LLM **chỉ được phép đọc**. Mọi câu lệnh ghi đều bị từ chối trước khi chạm DB.
-
-**Bước 2 — Thực thi**: qua `asyncpg` pool, trả `list[dict]`.
-
-**Bước 3 — Diễn giải** (`summarize_result`): gọi LLM lần 2 biến dòng dữ liệu thô thành câu tiếng Việt — giấu SQL/JSON, "nói ý nghĩa" (đúng hạn/trễ) chứ không chỉ đọc số.
-
-**Caching (Redis):** SQL cache (key = `md5(câu hỏi chuẩn hoá + user_id)`, TTL `SQL_CACHE_TTL` mặc định 3600s) + Answer cache (key = `md5(sql + kết quả)`). **Bỏ cache** cho câu hỏi thời gian tương đối ("hôm nay", "tuần này", "mới nhất"...).
-
-### 4.4 Report — `ReportAgent` ([report_generator/report_agent.py](backend/ai_agent/report_generator/report_agent.py))
-
-**Template-first.** Dùng structured output (`TemplateSelection`, `ReportPlan`) để khớp yêu cầu với mẫu có sẵn; nếu khớp → chạy SQL viết sẵn (an toàn, nhanh, đoán trước được), nếu không → fallback sinh query động. Khác `text2sql` ở chỗ nó **chạy nhiều truy vấn** rồi tổng hợp.
-
-```mermaid
-flowchart TD
-    R[Yêu cầu báo cáo] --> T[select_template<br/>structured: TemplateSelection]
-    T --> M{Khớp template?}
-    M -->|project_progress| Q1[SQL viết sẵn]
-    M -->|period_progress| Q2[SQL viết sẵn]
-    M -->|overdue_upcoming| Q3[SQL viết sẵn]
-    M -->|workload_by_person| Q4[SQL viết sẵn]
-    M -->|không khớp| PL[_plan_queries<br/>structured: ReportPlan → query động]
-    Q1 & Q2 & Q3 & Q4 & PL --> EX[execute_report_queries<br/>nhiều truy vấn]
-    EX --> GR[generate_report_result<br/>LLM tổng hợp → tiếng Việt]
-    GR --> OUT[/Báo cáo/]
-```
-
-### 4.5 Planning — `PlanningAgent` ([planning/planning_agent.py](backend/ai_agent/planning/planning_agent.py))
-
-Sinh **structured output** (`ProjectPlan` Pydantic): tối đa 3 milestone, 2 task/milestone. Pydantic ép LLM trả JSON đúng schema, tránh văn bản tự do.
-
-### 4.6 Conversation — `ConversationAgent` ([coversation/conversation.py](backend/ai_agent/coversation/conversation.py))
-
-Chào hỏi, trợ giúp, câu xã giao. `temperature` cao hơn (sáng tạo hơn), prompt có ngữ cảnh thời gian trong ngày + profile người dùng.
-
-### 4.7 Notification — `NotificationAgent` ([notification/notification_agent.py](backend/ai_agent/notification/notification_agent.py))
-
-Sinh nội dung nhắc deadline thân thiện. **Có fallback template tất định** nếu LLM lỗi — thông báo cần đáng tin, không được "im lặng" khi LLM down. Kèm `inapp_repository.py` để ghi notification in-app song song với nhắc qua Gapo.
+| Service | Vai trò |
+|---|---|
+| [task_create_service.py](backend/app/services/task_create_service.py) | Tạo task + auto-assign + thông báo |
+| [task_progress_service.py](backend/app/services/task_progress_service.py) | Cập nhật %, trạng thái, ước lượng; kích hoạt thông báo |
+| [task_outcome_service.py](backend/app/services/task_outcome_service.py) | Đóng task, xác minh kết quả |
+| [task_assignment_notifier.py](backend/app/services/task_assignment_notifier.py) | Báo khi được giao task |
+| [add_member_service.py](backend/app/services/add_member_service.py) | Thêm người vào dự án (resolve tên → user) |
+| [dependency_service.py](backend/app/services/dependency_service.py) | Kiểm tra phụ thuộc task & phát hiện chu trình |
+| [risk_detector.py](backend/app/services/risk_detector.py) | Chấm điểm rủi ro: trễ hạn, độ nặng blocker, quá hạn |
+| [risk_alert_service.py](backend/app/services/risk_alert_service.py) | Phát cảnh báo rủi ro/chậm tiến độ |
+| [outbound_message_service.py](backend/app/services/outbound_message_service.py) | Gửi DM cho người thứ ba (resolve tên → gửi qua Gapo) |
 
 ---
 
-## 5. Bộ nhớ & ngữ cảnh
+## 6. Tích hợp Gapo
 
-### Memory ([memory/memory.py](backend/ai_agent/memory/memory.py))
-- Lưu mỗi lượt hội thoại vào bảng `agent_memory`.
-- **Tóm tắt định kỳ** (mỗi 4 lượt) bằng LLM để nén lịch sử dài.
-- Khi xử lý tin mới: nạp **5 lượt gần nhất + bản tóm tắt mới nhất** làm ngữ cảnh.
+[Gapo Work](https://gapowork.vn) là nền tảng chat doanh nghiệp — kênh chính người dùng nhắn với bot. [backend/gapo/](backend/gapo/):
 
-### User profile
-Nạp sẵn cho mỗi tin nhắn: tên, vai trò, phòng ban, **số task quá hạn**, **deadline gần nhất**, **dự án đang tham gia**. Nhờ vậy bot trả lời "task của tôi" mà không cần hỏi lại "bạn là ai".
+- **gapo_webhook.py** — route nhận webhook (ngoài `/api/v1`).
+- **gapo_adapter.py** (`GapoAdapter`) — xác thực chữ ký HMAC-SHA256 (`GAPO_WEBHOOK_SECRET`), **dedup hai lớp** (Redis + LRU in-process) theo `message_id`, **rate limit** theo user, ánh xạ người gửi qua bảng `gapo_user_maps`, rồi đẩy qua check-in → router; gửi trả lời về Gapo + ghi audit.
+- **gapo_client.py** / **gapo_schema.py** — HTTP client gửi tin & Pydantic schema cho payload.
 
-> Các truy vấn profile dùng `CAST`-style enum của PostgreSQL. Lưu ý: trong asyncpg KHÔNG dùng cú pháp `:param::"Type"` — dùng `CAST(:param AS "Type")`. Bind Python `date` object (không phải ISO string) cho cột DATE.
+> Webhook vào qua router NAT WAN:3637 → host:8000 (**không** qua nginx). Backend phải publish `8000:8000` nếu không inbound bị drop im lặng.
 
 ---
 
-## 6. Luồng dữ liệu đầy đủ: tin nhắn → câu trả lời
+## 7. Frontend
 
-Điểm quan trọng: với kênh Gapo, **check-in được chặn ở [gapo_adapter.py](backend/gapo/gapo_adapter.py) TRƯỚC khi vào router** — không phải bên trong `handle_message`. Adapter cũng **từ chối user chưa liên kết** (`gapo_user_maps`) để chống giả mạo `from_user_id`.
+SPA React + TypeScript trong [frontend/](frontend/), build bằng **Vite**.
+
+**Stack:** React 18 · React Router 6 · TanStack React Query 5 (server state) · Zustand 5 (global state) · React Hook Form 7 + Zod 3 · Tailwind CSS 3 · Recharts · i18next · Lucide icons.
+
+**Cấu trúc** [frontend/src/](frontend/src/):
+- `app/` — providers, định nghĩa route
+- `pages/` — trang theo route (dashboard, login, projects, tasks, tags, worklogs, profile, notifications, settings)
+- `features/` — module nghiệp vụ kèm gọi API (auth, projects, tasks, worklogs, chat, notifications, agent-audit, ...)
+- `components/` — `AppShell` + `ui/` tái sử dụng
+- `lib/`, `i18n/`, `shared/schemas/`, `test/`
+
+Tính năng **chat** (`features/chat/`) có ô nhập tin, slash command + autocomplete.
+
+---
+
+## 8. Mô hình dữ liệu
+
+PostgreSQL 16; schema khởi tạo từ các script trong [init/](init/) (chạy theo thứ tự khi container DB lần đầu lên): `init.sql` (core) · `seed.sql` (demo) · `agent_role.sql` (role read-only) · `notifications.sql` · `gapo_link_codes.sql` · `agent_features.sql` · `tags.sql` · `deadline_quickactions.sql` · `entity_codes*.sql` · `task_dependencies.sql` · `checkin_edit_worklog.sql` · `followup_kind.sql`. Sơ đồ tổng quan: [schema.dbml](schema.dbml).
+
+**Entity chính:** `users`, `companies`, `projects`, `tasks`, `milestones`, `worklogs`, `backlogs`, `members`, `tags`, `task_blockers`, `task_dependencies`, `notifications`, `gapo_user_maps`, `channel_identities`, `checkin_sessions`, `agent_memory`, `agent_audit_log`, `project_counters`, `refresh_tokens`.
+
+**Mã entity (Jira-style):** mỗi dự án có `code` (vd `MTL`); task = `MTL-T001`, milestone = `MTL-M001`, cấp tuần tự per-project qua bảng `project_counters` và helper [core/code_gen.py](backend/core/code_gen.py). Mọi INSERT task/milestone phải sinh mã.
+
+**Phụ thuộc task:** quan hệ A→B (`task_dependencies`), người dùng đặt thủ công, agent quét cảnh báo mềm — khác với `task_blockers`.
+
+---
+
+## 9. Luồng dữ liệu: tin nhắn → câu trả lời
 
 ```mermaid
 sequenceDiagram
-    actor U as Người dùng (Gapo)
-    participant GW as gapo_webhook
-    participant GA as GapoAdapter
-    participant CK as CheckinFlowService
-    participant MR as AgentMessageRouter
-    participant AG as Agents (song song)
-    participant MEM as Memory
+    participant U as Người dùng (Gapo)
+    participant W as Gapo Webhook
+    participant A as GapoAdapter
+    participant C as CheckinFlowService
+    participant R as AgentMessageRouter
+    participant L as Agents + LLM
+    participant DB as PostgreSQL
 
-    U->>GW: Tin nhắn / webhook
-    GW->>GA: handle event
-    GA->>GA: _lookup_gapo_user (gapo_user_maps)
-    alt User chưa liên kết
-        GA-->>U: Từ chối — chưa được cấp quyền
-    else Đã liên kết
-        GA->>CK: handle_message (check-in?)
-        alt Đang trong phiên check-in / lệnh check-in
-            CK-->>GA: câu trả lời check-in
-            GA-->>U: Gửi reply (handled_by=checkin)
-        else Không phải check-in
-            GA->>MR: handle_message(message, user_id, ...)
-            par asyncio.gather
-                MR->>MR: selected_agents (LLM phân loại)
-            and
-                MR->>MEM: load memory (5 lượt + tóm tắt)
-            and
-                MR->>MR: load user profile
-            end
-            MR->>MR: _fallback_agent_for_message (lưới từ khoá)
-            MR->>AG: _run_agent x N (song song, return_exceptions)
-            AG-->>MR: kết quả từng agent
-            MR->>MR: _combine_results (gộp prose)
-            MR-->>GA: AgentReply{answer, agent="a+b"}
-            GA-->>U: Gửi reply (handled_by=agent)
-            GA->>MEM: save_memory (nếu không lỗi)
+    U->>W: POST webhook (body + chữ ký)
+    W->>A: verify HMAC + dedup + rate limit
+    A->>A: lookup gapo_user_maps
+    A->>C: handle_message()
+    alt đang trong check-in
+        C-->>U: bước FSM tiếp theo (project→task→hours)
+    else tin thường
+        C->>R: handle_message()
+        par chạy song song
+            R->>L: phân loại ý định (router LLM)
+            R->>DB: nạp memory (5 lượt + tóm tắt)
+            R->>DB: nạp hồ sơ người dùng
         end
+        R->>L: chạy các agent đã chọn (song song)
+        L->>DB: truy vấn / cập nhật (read-only cho text2sql)
+        R->>R: gộp kết quả
+        R-->>A: AgentReply{answer, agent, metadata}
+        A-->>U: gửi trả lời + ghi notification + lưu memory
     end
 ```
 
-Tóm tắt các bước:
+---
 
-1. **Webhook Gapo** nhận tin → `GapoAdapter`.
-2. **Xác thực user**: `_lookup_gapo_user` — user chưa map trong `gapo_user_maps` bị từ chối ([gapo_adapter.py:163-183](backend/gapo/gapo_adapter.py#L163-L183)).
-3. **Check-in intercept**: `CheckinFlowService.handle_message` — nếu đang trong phiên check-in hoặc là lệnh check-in thì xử lý & trả sớm ([gapo_adapter.py:185-212](backend/gapo/gapo_adapter.py#L185-L212)).
-4. **Vào router**: `AgentMessageRouter.handle_message` ([gapo_adapter.py:215-231](backend/gapo/gapo_adapter.py#L215-L231)).
-5. **Song song**: phân loại ý định + nạp memory + nạp profile.
-6. **Chuẩn hoá agent**: `_fallback_agent_for_message` (lưới từ khoá khi không chắc).
-7. **Chạy song song** mọi agent đã chọn → **gộp** kết quả.
-8. **Gửi reply** về Gapo, kèm audit (`reply_kind`, `agent`).
-9. **Lưu memory** (async) nếu reply không phải lỗi; mỗi 4 lượt thì tóm tắt lại.
+## 10. Công nghệ sử dụng
+
+| Lớp | Công nghệ |
+|---|---|
+| Backend | Python 3.12 · FastAPI · SQLAlchemy 2 (async) · asyncpg |
+| AI/LLM | LangChain · `ChatOpenAI` qua proxy **9router** (mặc định Google Gemini) · Pydantic structured output |
+| CSDL | PostgreSQL 16 |
+| Cache / state | Redis 7 (cache SQL, dedup webhook, FSM check-in) |
+| Lập lịch | APScheduler (check-in 11:50/17:50, nhắc deadline) |
+| Lưu file | MinIO (S3-compatible, avatar) |
+| Auth | JWT |
+| Frontend | React 18 · TypeScript · Vite · React Query · Zustand · Tailwind |
+| Triển khai | Docker Compose |
 
 ---
 
-## 7. Tính năng theo lịch (không cần người dùng nhắn)
+## 11. Chạy dự án
 
-```mermaid
-flowchart LR
-    subgraph APScheduler
-        S1[11:50 & 17:50 VN] --> CK[Check-in worklog]
-        S2["DEADLINE_NOTIFY_HOUR/MINUTE"] --> ND[Nhắc deadline]
-    end
-    CK --> FSM["Máy trạng thái:<br/>chọn dự án → chọn task → nhập giờ"]
-    FSM --> WP[worklog_parser<br/>bóc số giờ từ câu tự do]
-    ND --> NA[NotificationAgent]
-    NA --> GP[Gửi qua Gapo]
-    NA --> IA[Ghi notification in-app]
-```
-
-- **Check-in worklog** ([checkin/scheduler.py](backend/ai_agent/checkin/scheduler.py)): APScheduler chạy 11:50 & 17:50 (giờ VN). Máy trạng thái: chọn dự án → chọn task → nhập giờ. `worklog_parser` bóc số giờ từ câu trả lời tự do.
-- **Nhắc deadline**: `NotificationAgent` + scheduler gửi nhắc qua Gapo + ghi in-app vào giờ cấu hình (`DEADLINE_NOTIFY_HOUR/MINUTE`).
-
----
-
-## 8. Cấu hình (biến môi trường)
-
-| Biến | Mặc định | Ý nghĩa |
-|---|---|---|
-| `API_KEY` | — | Khoá LLM (qua proxy 9router) — dùng cho **mọi** agent kể cả router |
-| `BASE_URL` | endpoint 9router | Endpoint LLM OpenAI-compatible |
-| `MODEL_NAME` | `gemini-...-flash` | Model dùng chung cho router + agent |
-| `DB_HOST/PORT/NAME/USER/PASSWORD` | localhost / postgres | PostgreSQL |
-| `REDIS_HOST/PORT` | localhost:6379 | Cache SQL & answer |
-| `SQL_CACHE_TTL` | 3600 | TTL cache (giây) |
-| `CHECKIN_SCHEDULER_ENABLED` | true | Bật lịch check-in |
-| `DEADLINE_NOTIFY_HOUR/MINUTE` | 9 / 0 | Giờ nhắc deadline |
-| `GAPO_API_URL`, `GAPO_BOT_TOKEN` | — | Kênh nhắn tin Gapo |
-
----
-
-## 9. Chạy & test
+### Docker Compose (khuyến nghị)
 
 ```bash
-# Test text-to-SQL độc lập (file có sẵn __main__)
-python -m ai_agent.text_to_sql.text2sql
-
-# Test router phân loại ý định
-python -m ai_agent.router.router
-
-# Unit tests
-pytest ai_agent/test/
-
-# Test trực tiếp trong Gapowork: phải thêm user id & thread id vào DB
-docker exec -it db psql -U postgres -d agent_pm -c "
-INSERT INTO gapo_user_maps (user_id, gapo_user_id, gapo_thread_id, gapo_full_name)
-VALUES (<USER_ID>, <GAPO_USER_ID>, <GAPO_THREAD_ID>, '<FULL_NAME>')
-ON CONFLICT (user_id) DO UPDATE SET
-  gapo_user_id = EXCLUDED.gapo_user_id,
-  gapo_thread_id = EXCLUDED.gapo_thread_id,
-  gapo_full_name = EXCLUDED.gapo_full_name,
-  last_seen_at = NOW();
-"
+cp .env.example .env          # rồi sửa các secret bên dưới
+docker compose up -d
 ```
 
-Entry point qua app: `POST /api/v1/agent/message` (FastAPI, xem [app/modules/agent/router.py](backend/app/modules/agent/router.py)).
+Dịch vụ ([docker-compose.yml](docker-compose.yml)):
+
+| Service | Cổng | Vai trò |
+|---|---|---|
+| `backend` | `8000:8000` | REST API + webhook |
+| `frontend` | `8090:80` (hoặc `FE_PORT`) | React SPA (Nginx) |
+| `db` | `127.0.0.1:5432` | PostgreSQL 16 (chỉ host) |
+| `redis` | nội bộ | cache / dedup / FSM |
+| `9router` | nội bộ | proxy LLM |
+| `minio` (+ `minio-init`) | `9000:9000` | object storage avatar |
+
+- Backend: http://localhost:8000 · API docs: http://localhost:8000/docs
+- Frontend: http://localhost:8090
+
+### Chạy thủ công (dev)
+
+```bash
+# Backend (cần Postgres + Redis sẵn)
+cd backend && pip install -r requirements.txt && uvicorn main:app --reload
+
+# Frontend
+cd frontend && npm install && npm run dev
+```
+
+### Test
+
+```bash
+cd backend && pytest ai_agent/test/    # test agent
+cd frontend && npm test                # Vitest
+```
+
+---
+
+## 12. Biến môi trường
+
+Sao chép [.env.example](.env.example) → `.env`. Các nhóm chính:
+
+| Nhóm | Biến tiêu biểu |
+|---|---|
+| Bảo mật | `JWT_SECRET`, `CORS_ORIGIN`, `AGENT_API_TOKEN` |
+| DB pool | `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_RECYCLE`, `DB_POOL_TIMEOUT` |
+| Rate limit | `RATE_LIMIT_AGENT(_WINDOW)`, `RATE_LIMIT_LOGIN(_WINDOW)` |
+| LLM | `LLM_PROVIDER`, `NINE_ROUTER_BASE_URL`, `NINE_ROUTER_MODEL`, `ROUTER_MODEL_NAME`, `API_KEY`/`BASE_URL`/`MODEL_NAME` |
+| Agent DB read-only | `DB_AGENT_USER`, `DB_AGENT_PASSWORD`, `AGENT_STATEMENT_TIMEOUT_MS` |
+| Gapo | `GAPO_API_URL`, `GAPO_BOT_TOKEN`, `GAPO_BOT_ID`, `GAPO_SEND_TOKEN`, `GAPO_DRY_RUN`, `GAPO_WEBHOOK_SECRET`, `GAPO_SIGNATURE_HEADER` |
+| MinIO | `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `MINIO_BUCKET`, `MINIO_PUBLIC_URL` |
+| Check-in / nhắc | `CHECKIN_SCHEDULER_ENABLED`, `DEADLINE_NOTIFY_HOUR`, `DEADLINE_NOTIFY_MINUTE` |
+
+> **Trước khi lên production:** đổi tất cả `change-me*`, đặt `GAPO_DRY_RUN=false`, set `GAPO_WEBHOOK_SECRET`, dùng `DB_AGENT_USER` read-only riêng (không fallback về `DB_USER`).

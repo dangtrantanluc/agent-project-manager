@@ -162,7 +162,12 @@ export function TasksPage() {
                 className={`cursor-pointer border-b border-slate-100 dark:border-slate-800 ${rowClass}`}
                 onClick={() => setEditing(t)}
               >
-                <td className="p-3 font-medium">{t.name}</td>
+                <td className="p-3 font-medium">
+                  {t.code && (
+                    <span className="mr-2 font-mono text-xs text-slate-400">{t.code}</span>
+                  )}
+                  {t.name}
+                </td>
                 <td className="p-3">
                   <Link
                     to={`/projects/${t.project.id}?tab=tasks`}

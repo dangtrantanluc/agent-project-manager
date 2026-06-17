@@ -25,6 +25,11 @@ import { useAuth } from "@/features/auth/store";
 
 const COLUMNS: TaskStatus[] = ["TODO", "IN_PROGRESS", "DONE", "CANCELLED"];
 
+// Số task tối đa nạp một lần lên board. Không ảo hoá DOM nên cap để tránh
+// render hàng nghìn node (jank). Khi project vượt cap, hiển thị cảnh báo (KHÔNG
+// cắt im lặng) để user lọc cho chính xác. Nâng cap khi đã có virtualization.
+const KANBAN_PAGE_SIZE = 300;
+
 export function TaskKanbanBoard({ projectId }: { projectId: number }) {
   const qc = useQueryClient();
   const user = useAuth((s) => s.user);
@@ -33,7 +38,7 @@ export function TaskKanbanBoard({ projectId }: { projectId: number }) {
 
   const tasksQ = useQuery({
     queryKey: ["tasks", { projectId }],
-    queryFn: () => listTasks({ projectId, pageSize: 500 }),
+    queryFn: () => listTasks({ projectId, pageSize: KANBAN_PAGE_SIZE }),
   });
 
   const [view, setView] = useState<"list" | "kanban">("list");
@@ -56,6 +61,8 @@ export function TaskKanbanBoard({ projectId }: { projectId: number }) {
   });
 
   const all = tasksQ.data?.data ?? [];
+  // Project có nhiều task hơn cap → đang chỉ hiển thị một phần.
+  const truncated = (tasksQ.data?.meta?.total ?? all.length) > all.length;
 
   // Danh sách assignee/milestone duy nhất để đổ vào dropdown (rút từ chính các task hiện có).
   const { assignees, milestones } = useMemo(() => {
@@ -138,6 +145,12 @@ export function TaskKanbanBoard({ projectId }: { projectId: number }) {
 
   return (
     <div className="space-y-3">
+      {truncated && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200">
+          Đang hiển thị {all.length} task đầu tiên (tối đa {KANBAN_PAGE_SIZE}). Hãy
+          dùng bộ lọc để xem chính xác các task còn lại.
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <p className="text-sm text-slate-500">
           {filtered.length === all.length
@@ -386,10 +399,15 @@ function TaskListView({
             return (
             <tr
               key={t.id}
-              className={`group border-t border-slate-100 dark:border-slate-800 ${rowClass}`}
+              className={`group border-t border-slate-100 dark:border-slate-800 ${rowClass} ${canEdit ? "cursor-pointer" : ""}`}
+              onClick={canEdit ? () => onEdit(t) : undefined}
             >
-              <td className="px-3 py-2 font-medium text-slate-900 dark:text-slate-100">{t.name}</td>
-              <td className="px-3 py-2">
+              <td className="px-3 py-2 font-medium text-slate-900 dark:text-slate-100">
+                {t.code && <span className="mr-2 font-mono text-xs text-slate-400">{t.code}</span>}
+                {t.name}
+              </td>
+              {/* stopPropagation: thao tác đổi trạng thái không mở modal sửa. */}
+              <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
                 <div className="flex flex-wrap items-center gap-1.5">
                   {canEdit ? (
                     <StatusSelect value={t.status} onChange={(s) => onChangeStatus(t, s)} />
@@ -424,12 +442,12 @@ function TaskListView({
                 );
               })()}
               {canEdit && (
-                <td className="px-3 py-2 text-right">
+                <td className="px-3 py-2 text-right" onClick={(e) => e.stopPropagation()}>
                   <div className="flex justify-end opacity-0 group-hover:opacity-100">
-                    <button className="rounded p-1 hover:bg-slate-100 dark:hover:bg-slate-700" onClick={() => onEdit(t)}>
+                    <button title="Sửa" className="rounded p-1 hover:bg-slate-100 dark:hover:bg-slate-700" onClick={() => onEdit(t)}>
                       <Pencil className="h-3.5 w-3.5" />
                     </button>
-                    <button className="rounded p-1 text-red-600 hover:bg-red-50" onClick={() => onDelete(t)}>
+                    <button title="Xóa" className="rounded p-1 text-red-600 hover:bg-red-50" onClick={() => onDelete(t)}>
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
                   </div>
@@ -508,7 +526,10 @@ function TaskCard({
   return (
     <div className="group rounded-md bg-white p-3 shadow-sm dark:bg-slate-800">
       <div className="flex items-start justify-between">
-        <p className="flex-1 font-medium text-slate-900 dark:text-slate-100">{task.name}</p>
+        <p className="flex-1 font-medium text-slate-900 dark:text-slate-100">
+          {task.code && <span className="mr-1.5 font-mono text-xs text-slate-400">{task.code}</span>}
+          {task.name}
+        </p>
         {canEdit && (
           <div className="flex opacity-0 group-hover:opacity-100">
             <button

@@ -10,6 +10,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
+from ai_agent.shared.llm_factory import make_llm
+
 load_dotenv()
 log = logging.getLogger(__name__)
 
@@ -68,11 +70,9 @@ class NotificationAgent:
                     "will use deterministic fallback messages."
                 )
             else:
-                self.llm = ChatOpenAI(
-                    model=model,
-                    timeout=60,
-                    api_key=api_key,
-                    base_url=base_url,
+                self.llm = make_llm(
+                    purpose="notification", timeout=60,
+                    model=model, api_key=api_key, base_url=base_url,
                 )
 
     async def generate_notification_message(self, raw_message: str, memory_context: str = "") -> str:
@@ -165,7 +165,7 @@ class NotificationAgent:
             reminder_note = self._reminder_note(task)
             task_lines.append(
                 "\n".join([
-                    f"{index}. Task: {task.get('task_name') or task.get('name')}",
+                    f"{index}. Task: {self._task_label(task)}",
                     f"   Project: {task.get('project_name')}",
                     f"   Deadline: {self._format_date(task.get('deadline'))}",
                     f"   Độ ưu tiên: {task.get('priority') or 'N/A'}",
@@ -186,7 +186,8 @@ class NotificationAgent:
             "Nếu có nhiều task, gom thành danh sách đánh số, ưu tiên cao liệt kê trước.\n"
             "Giọng văn thân thiện, rõ hành động: cập nhật tiến độ, hoàn thành task hoặc báo blocker.\n"
             "Nếu loại nhắc là đến hạn hôm nay, nhấn mạnh task cần hoàn thành trong hôm nay.\n"
-            "Nếu loại nhắc là sắp đến hạn, nhắc còn khoảng 2 ngày.\n\n"
+            "Nếu loại nhắc là sắp đến hạn, nhắc còn khoảng 2 ngày.\n"
+            "Nếu loại nhắc là còn 1 tuần, nhắc nhẹ còn khoảng 1 tuần, gợi ý chủ động lên kế hoạch (chưa gấp).\n\n"
             f"Người nhận: {recipient_name or 'bạn'}\n"
             f"Ngày gửi nhắc: {self._format_date(notify_date)}\n"
             f"Tổng số task đến hạn: {total if total is not None else len(tasks)} "
@@ -221,7 +222,7 @@ class NotificationAgent:
             return (
                 "Nhắc deadline\n\n"
                 f"Project: {task.get('project_name')}\n"
-                f"Task: {task.get('task_name') or task.get('name')}\n"
+                f"Task: {self._task_label(task)}\n"
                 f"Deadline: {self._format_date(task.get('deadline'))}\n\n"
                 f"{reminder_text}"
             )
@@ -237,7 +238,7 @@ class NotificationAgent:
         for index, task in enumerate(tasks, start=1):
             prio = task.get("priority")
             lines.extend([
-                f"{index}. {task.get('task_name') or task.get('name')}"
+                f"{index}. {self._task_label(task)}"
                 + (f" [{prio}]" if prio else ""),
                 f"   Project: {task.get('project_name')}",
                 f"   Deadline: {self._format_date(task.get('deadline'))}",
@@ -255,14 +256,26 @@ class NotificationAgent:
             return value.isoformat()
         return str(value)
 
+    def _task_label(self, task: dict[str, Any]) -> str:
+        """Tên task kèm mã dễ đọc nếu có, vd "MTL-T001 Sửa login"."""
+        name = task.get("task_name") or task.get("name") or ""
+        code = task.get("task_code") or task.get("code")
+        return f"{code} {name}".strip() if code else name
+
     def _reminder_note(self, task: dict[str, Any]) -> str:
-        if task.get("reminder_type") == "due_today":
+        rt = task.get("reminder_type")
+        if rt == "due_today":
             return "Đến hạn hôm nay"
+        if rt == "upcoming_week":
+            return "Còn khoảng 1 tuần đến hạn"
         return "Còn khoảng 2 ngày đến hạn"
 
     def _fallback_reminder_text(self, task: dict[str, Any]) -> str:
-        if task.get("reminder_type") == "due_today":
+        rt = task.get("reminder_type")
+        if rt == "due_today":
             return "Task đến hạn hôm nay. Bạn hoàn thành trong hôm nay hoặc báo blocker nếu cần hỗ trợ nhé."
+        if rt == "upcoming_week":
+            return "Task còn khoảng 1 tuần nữa đến hạn. Bạn chủ động lên kế hoạch giúp mình nhé."
         return "Task còn khoảng 2 ngày nữa đến hạn. Bạn cập nhật tiến độ giúp mình nhé."
 
     def _fallback_digest_summary(self, due_today_count: int, upcoming_count: int) -> str:

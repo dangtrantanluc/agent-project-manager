@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_db, is_restricted, project_access_exists_sql
+from app.core.code_gen import next_worklog_code
 
 router = APIRouter(prefix="/worklogs", tags=["worklogs"])
 
@@ -127,14 +128,15 @@ async def create_worklog(
     if target_user_id != current_user["id"] and not is_privileged:
         raise HTTPException(status_code=403, detail="Không có quyền tạo worklog cho người khác")
 
+    seq, code = await next_worklog_code(body["projectId"], db)
     row = (await db.execute(
         text("""
             INSERT INTO worklogs (
                 work_date, description, hours, task_id, project_id,
-                user_id, company_id, updated_at
+                user_id, company_id, seq, code, updated_at
             ) VALUES (
                 :work_date, :description, :hours, :task_id, :project_id,
-                :user_id, :company_id, NOW()
+                :user_id, :company_id, :seq, :code, NOW()
             )
             RETURNING id, work_date, hours, description,
                       task_id, project_id, user_id,
@@ -148,6 +150,7 @@ async def create_worklog(
             "project_id": body["projectId"],
             "user_id": target_user_id,
             "company_id": proj[1],
+            "seq": seq, "code": code,
         },
     )).fetchone()
     await db.commit()

@@ -7,11 +7,11 @@ services:
       POSTGRES_DB: agent_pm
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-    # Chỉ phơi trong mạng Docker nội bộ (backend gọi qua hostname `db`).
-    # KHÔNG map ra host để tránh phơi DB ra ngoài. Cần truy cập từ host khi
-    # debug? Tạm thêm: ports: ["127.0.0.1:5432:5432"].
-    expose:
-      - "5432"
+    # Backend gọi qua hostname `db` trong mạng Docker nội bộ.
+    # Publish ra host chỉ trên loopback (127.0.0.1) để DBeaver/debug nối vào,
+    # KHÔNG phơi ra mạng ngoài.
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Schema hợp nhất (source of truth) + seed demo. Init chỉ chạy khi volume rỗng.
@@ -25,6 +25,12 @@ services:
       - ./init/agent_features.sql:/docker-entrypoint-initdb.d/006-agent-features.sql:ro
       - ./init/tags.sql:/docker-entrypoint-initdb.d/007-tags.sql:ro
       - ./init/deadline_quickactions.sql:/docker-entrypoint-initdb.d/008-deadline-quickactions.sql:ro
+      # Mã hiển thị Jira-style cho task/milestone (seq/code + project_counters + backfill).
+      - ./init/entity_codes.sql:/docker-entrypoint-initdb.d/009-entity-codes.sql:ro
+      # Phụ thuộc công việc (task A phụ thuộc task B).
+      - ./init/task_dependencies.sql:/docker-entrypoint-initdb.d/010-task-dependencies.sql:ro
+      # Sửa worklog vừa lưu trong check-in (thêm state AWAITING_EDIT).
+      - ./init/checkin_edit_worklog.sql:/docker-entrypoint-initdb.d/011-checkin-edit-worklog.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d agent_pm"]
       interval: 10s
@@ -90,8 +96,15 @@ services:
       minio:
         condition: service_healthy
     volumes:
-      - uploads_data:/app/uploads
+      # Bind source để dev hot-reload. ./backend overlay toàn bộ /app, nên mount
+      # ./agent vào /app/agent SAU đó để code agent (ngoài thư mục backend) vẫn
+      # thấy trong container. uploads là named volume (giữ ảnh qua rebuild).
       - ./backend:/app
+      - ./agent:/app/agent
+      - uploads_data:/app/uploads
+    # Dev: uvicorn --reload tự nạp lại khi sửa code (nhờ bind mount ở trên).
+    # Ghi đè CMD của Dockerfile. BỎ command này khi build image production.
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
   frontend:
     build:

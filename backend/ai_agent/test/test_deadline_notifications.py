@@ -3,6 +3,7 @@ from datetime import date
 
 from ai_agent.checkin.scheduler import (
     _deadline_notify_date,
+    _deadline_notify_date_week,
     _deadline_reminder_type,
     _group_due_deadline_tasks,
 )
@@ -27,12 +28,35 @@ def test_deadline_reminder_type_includes_two_days_before_and_deadline_day():
     assert _deadline_reminder_type(date(2026, 5, 29), date(2026, 5, 28)) is None
 
 
+def test_deadline_notify_date_week_keeps_weekday_minus_seven():
+    # 2026-05-29 (Thứ Sáu) - 7 = 2026-05-22 (Thứ Sáu) -> giữ nguyên.
+    assert _deadline_notify_date_week(date(2026, 5, 29)) == date(2026, 5, 22)
+
+
+def test_deadline_notify_date_week_moves_weekend_to_friday():
+    # 2026-05-31 (CN) - 7 = 2026-05-24 (CN) -> dời về Thứ Sáu 2026-05-22.
+    assert _deadline_notify_date_week(date(2026, 5, 31)) == date(2026, 5, 22)
+
+
+def test_deadline_reminder_type_includes_one_week_before():
+    # Trước 1 tuần -> upcoming_week.
+    assert _deadline_reminder_type(date(2026, 5, 29), date(2026, 5, 22)) == "upcoming_week"
+    # Ưu tiên mốc GẦN hơn: due_today/upcoming thắng upcoming_week.
+    assert _deadline_reminder_type(date(2026, 5, 29), date(2026, 5, 29)) == "due_today"
+
+
+def test_reminder_note_one_week():
+    agent = NotificationAgent(llm=None)
+    assert "1 tuần" in agent._reminder_note({"reminder_type": "upcoming_week"})
+    assert "1 tuần" in agent._fallback_reminder_text({"reminder_type": "upcoming_week"})
+
+
 def test_group_due_deadline_tasks_batches_by_assignee_and_thread():
     rows = [
-        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM"),
-        (2, "Task B", date(2026, 5, 29), 10, "Project X", 1000, "User A", "IN_PROGRESS", "HIGH"),
-        (3, "Task C", date(2026, 6, 2), 11, "Project Y", 2000, "User B", "PLANNED", "LOW"),
-        (4, "Task D", date(2026, 6, 9), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM"),
+        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM", "PX-T001"),
+        (2, "Task B", date(2026, 5, 29), 10, "Project X", 1000, "User A", "IN_PROGRESS", "HIGH", "PX-T002"),
+        (3, "Task C", date(2026, 6, 2), 11, "Project Y", 2000, "User B", "PLANNED", "LOW", "PY-T001"),
+        (4, "Task D", date(2026, 6, 9), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM", "PX-T003"),
     ]
 
     grouped, skipped = _group_due_deadline_tasks(rows, date(2026, 5, 27))
@@ -45,8 +69,8 @@ def test_group_due_deadline_tasks_batches_by_assignee_and_thread():
 
 def test_group_due_deadline_tasks_includes_deadline_day_reminder():
     rows = [
-        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM"),
-        (2, "Task B", date(2026, 5, 30), 10, "Project X", 1000, "User A", "IN_PROGRESS", "MEDIUM"),
+        (1, "Task A", date(2026, 5, 29), 10, "Project X", 1000, "User A", "PLANNED", "MEDIUM", "PX-T001"),
+        (2, "Task B", date(2026, 5, 30), 10, "Project X", 1000, "User A", "IN_PROGRESS", "MEDIUM", "PX-T002"),
     ]
 
     grouped, skipped = _group_due_deadline_tasks(rows, date(2026, 5, 29))

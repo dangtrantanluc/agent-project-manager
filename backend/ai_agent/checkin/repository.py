@@ -4,6 +4,8 @@ import pytz
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.code_gen import next_worklog_code
+
 from ai_agent.checkin.constants import (
     CheckinState, SLOT_EXPIRE_TIME, MANUAL_EXPIRE_DELTA,
     REMINDER_COOLDOWN_MINUTES, MAX_REMINDERS_PER_SLOT,
@@ -420,7 +422,7 @@ async def list_task_candidates(
         q_clause = "AND name ILIKE :q"
         params["q"] = f"%{q}%"
     rows = (await db.execute(text(f"""
-        SELECT id, name, status, deadline, assignee_id
+        SELECT id, name, status, deadline, assignee_id, code
         FROM tasks
         WHERE project_id = :pid
           AND status::text <> 'DONE'
@@ -433,7 +435,8 @@ async def list_task_candidates(
     """), params)).fetchall()
     return [
         {"id": r[0], "name": r[1], "status": r[2],
-         "deadline": r[3].isoformat() if r[3] else None, "assignee_id": r[4]}
+         "deadline": r[3].isoformat() if r[3] else None, "assignee_id": r[4],
+         "code": r[5]}
         for r in rows
     ]
 
@@ -485,10 +488,13 @@ async def get_project_name(db: AsyncSession, project_id: int) -> str:
 
 async def get_task_name(db: AsyncSession, task_id: int) -> str:
     row = (await db.execute(
-        text("SELECT name FROM tasks WHERE id = :tid LIMIT 1"),
+        text("SELECT name, code FROM tasks WHERE id = :tid LIMIT 1"),
         {"tid": task_id},
     )).fetchone()
-    return row[0] if row else f"#{task_id}"
+    if not row:
+        return f"#{task_id}"
+    # Ưu tiên mã dễ đọc khi có tên ngắn/thiếu; trả tên là chính, fallback code.
+    return row[0] or row[1] or f"#{task_id}"
 
 
 # ── Worklog ───────────────────────────────────────────────────────────────────
@@ -525,24 +531,90 @@ async def insert_worklog(
         "(SELECT id FROM companies ORDER BY id LIMIT 1)), "
         if has_company_id else ""
     )
+    wl_seq, wl_code = await next_worklog_code(project_id, db)
     row = (await db.execute(text("""
         INSERT INTO worklogs
             (work_date, description, hours, task_id, project_id,
              {company_col}user_id, source, raw_message, parsed_json,
-             checkin_session_id, slot, created_at, updated_at)
+             checkin_session_id, slot, seq, code, created_at, updated_at)
         VALUES
             (:work_date, :description, :hours, :task_id, :project_id,
              {company_val}:user_id, 'GAPO_CHECKIN', :raw_message, CAST(:parsed_json AS jsonb),
-             :session_id, :slot, NOW(), NOW())
+             :session_id, :slot, :seq, :code, NOW(), NOW())
         RETURNING id
     """.format(company_col=company_col, company_val=company_val)), {
         "work_date": work_date, "description": description, "hours": hours,
         "task_id": task_id, "project_id": project_id, "user_id": user_id, "raw_message": raw_message,
         "parsed_json": json.dumps(parsed_json),
         "session_id": checkin_session_id, "slot": slot,
+        "seq": wl_seq, "code": wl_code,
     })).fetchone()
     await db.commit()
     return row[0]
+
+
+async def get_worklog(db: AsyncSession, worklog_id: int) -> dict | None:
+    """Fetch a worklog needed to rebuild the confirm message and recompute side-effects."""
+    row = (await db.execute(text("""
+        SELECT id, work_date, description, hours, task_id, project_id, user_id
+        FROM worklogs
+        WHERE id = :id
+        LIMIT 1
+    """), {"id": worklog_id})).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "work_date": row[1], "description": row[2],
+        "hours": float(row[3]) if row[3] is not None else None,
+        "task_id": row[4], "project_id": row[5], "user_id": row[6],
+    }
+
+
+async def update_worklog(
+    db: AsyncSession, *,
+    worklog_id: int,
+    work_date: date,
+    description: str | None,
+    hours: float,
+    raw_message: str,
+    parsed_json: dict,
+) -> None:
+    """Overwrite content of an existing worklog (giờ/mô tả). Không đổi task/project.
+
+    Caller PHẢI gọi lại apply_worklog_side_effects sau đó để recompute total_hours.
+    """
+    await db.execute(text("""
+        UPDATE worklogs
+        SET work_date   = :work_date,
+            description = :description,
+            hours       = :hours,
+            raw_message = :raw_message,
+            parsed_json = CAST(:parsed_json AS jsonb),
+            updated_at  = NOW()
+        WHERE id = :id
+    """), {
+        "id": worklog_id,
+        "work_date": work_date,
+        "description": description,
+        "hours": hours,
+        "raw_message": raw_message,
+        "parsed_json": json.dumps(parsed_json),
+    })
+    await db.commit()
+
+
+async def set_session_editing(db: AsyncSession, session_id: int, worklog_id: int) -> None:
+    """User bấm 'Sửa' từ màn CONFIRMING -> chờ nhập lại; lưu worklog_id vào pending_parsed."""
+    mapping = json.dumps({"type": "edit", "worklog_id": worklog_id})
+    await db.execute(text("""
+        UPDATE checkin_sessions
+        SET state          = CAST('AWAITING_EDIT' AS "CheckinState"),
+            pending_parsed = CAST(:mapping AS json),
+            pending_text   = NULL,
+            updated_at     = NOW()
+        WHERE id = :sid
+    """), {"sid": session_id, "mapping": mapping})
+    await db.commit()
 
 
 async def apply_worklog_side_effects(

@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from database import AsyncSessionLocal
+from app.core.code_gen import next_task_code
 from app.services.task_assignment_notifier import notify_task_assigned, notify_group_new_task
 from ai_agent.shared.entity_resolver import (
     is_privileged,
@@ -36,20 +37,47 @@ _VALID_PRIORITIES = {"LOW", "MEDIUM", "HIGH", "URGENT"}
 _EXTRACT_SYSTEM_PROMPT = """\
 Bạn bóc tách yêu cầu GIAO VIỆC (tạo task mới) trong hệ thống quản lý dự án.
 Từ câu của người dùng, trích:
-- task_name: tên/nội dung công việc cần giao (bắt buộc).
-- assignee: TÊN người được giao (bỏ kính ngữ anh/chị/em, chỉ giữ tên). Bắt buộc.
+- task_name: NỘI DUNG công việc cần làm (vd "Viết tài liệu API", "Fix bug login").
+  QUAN TRỌNG: đây là việc CẦN LÀM, KHÔNG phải câu lệnh.
+  Nếu câu chỉ là lệnh tạo task mà KHÔNG mô tả việc gì (vd "tạo thêm task",
+  "tạo task cho tôi", "thêm 1 task nữa"), để task_name RỖNG — TUYỆT ĐỐI không
+  chép lại cụm lệnh ("tạo task...", "thêm task...") làm tên.
+  Bỏ các cụm lệnh/khách sáo ("tạo", "thêm", "giúp/cho tôi", "nhé") khỏi tên.
+- assignee: TÊN người được giao (bỏ kính ngữ anh/chị/em, chỉ giữ tên).
+  Nếu không nhắc tới ai, để rỗng.
+- assign_to_self: true NẾU người dùng tự nhận task ("cho tôi/mình/em", "tôi làm",
+  "giao cho tôi"); khi đó assignee để RỖNG (hệ thống tự dùng người gửi). Mặc định false.
 - project: tên dự án nếu có nhắc tới, rỗng nếu không.
 - deadline: hạn chót dạng YYYY-MM-DD nếu suy ra được (dựa trên ngày hôm nay được
   cung cấp); rỗng nếu không nhắc.
 - priority: một trong LOW/MEDIUM/HIGH/URGENT nếu có nhắc (vd "ưu tiên cao"=HIGH,
   "gấp/khẩn"=URGENT); rỗng nếu không.
-Nếu câu KHÔNG phải giao việc, để task_name và assignee rỗng.
+
+Nếu câu KHÔNG phải giao việc, để tất cả các trường rỗng.
+
+Ví dụ (giả sử hôm nay là 2026-06-16):
+1) "tạo thêm task trong dự án agent cho tôi"
+   -> task_name="", assignee="", assign_to_self=true, project="agent", deadline="", priority=""
+   (chỉ là lệnh, chưa nói việc gì -> task_name rỗng để hệ thống hỏi lại)
+2) "tạo task thứ 5 demo cho team dự án agent cho tôi"
+   -> task_name="", assignee="", assign_to_self=true, project="agent", deadline="", priority=""
+   ("thứ 5 demo cho team" không phải nội dung việc rõ ràng -> để rỗng, hỏi lại)
+3) "giao task Viết tài liệu API cho Thảo, dự án Logistics, deadline 20/06, ưu tiên cao"
+   -> task_name="Viết tài liệu API", assignee="Thảo", assign_to_self=false,
+      project="Logistics", deadline="2026-06-20", priority="HIGH"
+4) "nhờ Thảo fix bug đăng nhập dự án MTL gấp"
+   -> task_name="Fix bug đăng nhập", assignee="Thảo", assign_to_self=false,
+      project="MTL", deadline="", priority="URGENT"
+5) "task demo cho dự án pm deadline 2 ngày nữa nha task cho tôi"
+   -> task_name="Demo", assignee="", assign_to_self=true, project="pm",
+      deadline="2026-06-18", priority=""
 """
 
 
 class TaskCreateExtraction(BaseModel):
     task_name: str = Field(default="")
     assignee: str = Field(default="")
+    assign_to_self: bool = Field(default=False)
     project: str = Field(default="")
     deadline: str = Field(default="")
     priority: str = Field(default="")
@@ -82,8 +110,10 @@ class TaskCreateService:
         elif model and api_key and base_url:
             # timeout ngắn + 1 retry: LLM chậm KHÔNG được treo cả luồng reply
             # (trước đây 60s×retry -> ~180s như log đã thấy).
-            base = ChatOpenAI(model=model, timeout=15, max_retries=1, temperature=0.1,
-                              api_key=api_key, base_url=base_url, reasoning_effort="none")
+            from ai_agent.shared.llm_factory import make_llm
+            base = make_llm(purpose="create_task", timeout=15, max_retries=1,
+                            temperature=0.1, reasoning_effort="none",
+                            model=model, api_key=api_key, base_url=base_url)
             self._llm = base.with_structured_output(TaskCreateExtraction, method="function_calling")
         else:
             logger.warning("TaskCreateService LLM chưa cấu hình; không giao việc qua chat được.")
@@ -113,7 +143,8 @@ class TaskCreateService:
 
         # 2. Bóc tách thông tin.
         extraction = await self._extract(message, memory_context)
-        if extraction is None or not extraction.task_name.strip() or not extraction.assignee.strip():
+        has_assignee = bool(extraction and (extraction.assignee.strip() or extraction.assign_to_self))
+        if extraction is None or not extraction.task_name.strip() or not has_assignee:
             return TaskCreateResult(
                 status="need_info",
                 message=("Bạn cho mình rõ hơn: **giao task gì**, **cho ai**, thuộc **dự án nào** "
@@ -128,19 +159,27 @@ class TaskCreateService:
 
         async with AsyncSessionLocal() as db:
             # 3. Resolve người được giao (cùng company).
-            assignees = await self._resolve_users(db, extraction.assignee.strip(), sender_id)
-            if not assignees:
-                return TaskCreateResult(
-                    status="not_found",
-                    message=f"Mình chưa tìm thấy ai tên \"{extraction.assignee}\" trong hệ thống. "
-                            "Bạn cho mình tên đầy đủ giúp nhé.")
-            if len(assignees) > 1:
-                names = ", ".join(a["full_name"] for a in assignees)
-                return TaskCreateResult(
-                    status="ambiguous",
-                    message=f"Có nhiều người tên \"{extraction.assignee}\": {names}. "
-                            "Bạn nói rõ giúp mình là ai nhé.")
-            assignee = assignees[0]
+            if extraction.assign_to_self and not extraction.assignee.strip():
+                # "cho tôi/mình" -> tự giao cho chính người gửi (không tìm theo tên).
+                assignee = await self._resolve_self(db, sender_id)
+                if assignee is None:
+                    return TaskCreateResult(
+                        status="error",
+                        message="Mình chưa xác định được tài khoản của bạn, bạn thử lại nhé.")
+            else:
+                assignees = await self._resolve_users(db, extraction.assignee.strip(), sender_id)
+                if not assignees:
+                    return TaskCreateResult(
+                        status="not_found",
+                        message=f"Mình chưa tìm thấy ai tên \"{extraction.assignee}\" trong hệ thống. "
+                                "Bạn cho mình tên đầy đủ giúp nhé.")
+                if len(assignees) > 1:
+                    names = ", ".join(a["full_name"] for a in assignees)
+                    return TaskCreateResult(
+                        status="ambiguous",
+                        message=f"Có nhiều người tên \"{extraction.assignee}\": {names}. "
+                                "Bạn nói rõ giúp mình là ai nhé.")
+                assignee = assignees[0]
 
             # 4. Resolve dự án (cùng company).
             if not extraction.project.strip():
@@ -165,11 +204,12 @@ class TaskCreateService:
             priority = extraction.priority.strip().upper()
             priority = priority if priority in _VALID_PRIORITIES else "MEDIUM"
             deadline = _parse_deadline(extraction.deadline)
+            seq, code = await next_task_code(project["id"], db)
             row = (await db.execute(text("""
                 INSERT INTO tasks (name, status, priority, deadline, project_id,
-                                   assignee_id, company_id, updated_at)
+                                   assignee_id, company_id, seq, code, updated_at)
                 VALUES (:name, 'TODO'::"TaskStatus", CAST(:priority AS "Priority"),
-                        :deadline, :project_id, :assignee_id, :company_id, NOW())
+                        :deadline, :project_id, :assignee_id, :company_id, :seq, :code, NOW())
                 RETURNING id
             """), {
                 "name": extraction.task_name.strip(),
@@ -178,6 +218,7 @@ class TaskCreateService:
                 "project_id": project["id"],
                 "assignee_id": assignee["user_id"],
                 "company_id": project["company_id"],
+                "seq": seq, "code": code,
             })).fetchone()
             task_id = row[0]
             await db.execute(text("""
@@ -222,6 +263,14 @@ class TaskCreateService:
 
     async def _resolve_projects(self, db, name: str, sender_id: int) -> list[dict]:
         return await resolve_projects(db, name, sender_id)
+
+    async def _resolve_self(self, db, sender_id: int) -> dict | None:
+        """Người gửi tự nhận task: dựng assignee từ chính sender_id (shape giống resolve_users)."""
+        row = (await db.execute(
+            text("SELECT id, full_name FROM users WHERE id = :id"),
+            {"id": sender_id},
+        )).fetchone()
+        return {"user_id": row[0], "full_name": row[1]} if row else None
 
     def _ask_project_message(self, profile: dict) -> str:
         projects = profile.get("active_projects") or []

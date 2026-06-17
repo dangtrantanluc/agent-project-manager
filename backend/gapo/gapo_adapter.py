@@ -43,15 +43,10 @@ class GapoAdapter:
     def __init__(self):
         self.client = GapoClient()
         self.router = AgentMessageRouter()
-        llm = ChatOpenAI(
-            model=os.getenv("MODEL_NAME"),
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
-            # Không có timeout thì default SDK là 600s/lần + 2 retry — endpoint
-            # chết sẽ block webhook hàng chục phút (user thấy bot "treo").
-            timeout=30,
-            max_retries=1,
-        )
+        # Không có timeout thì default SDK là 600s/lần + 2 retry — endpoint chết
+        # sẽ block webhook hàng chục phút (user thấy bot "treo").
+        from ai_agent.shared.llm_factory import make_llm
+        llm = make_llm(purpose="gapo_checkin", timeout=30, max_retries=1)
         self.checkin = CheckinFlowService(
             gapo=self.client,
             worklog_parser=WorklogParserService(llm=llm),
@@ -147,6 +142,20 @@ class GapoAdapter:
                 if _seen_recently(dk):
                     logger.info("gapo duplicate event (in-process) message_id=%s — bỏ qua", dk)
                     return {"ok": True, "deduped": True, "via": "in_process"}
+
+        # RATE LIMIT theo người gửi: chặn 1 user spam bot (mỗi tin = nhiều lần gọi
+        # LLM → tốn tiền). Vượt ngưỡng thì báo nhẹ nhàng thay vì xử lý.
+        if payload.from_user_id:
+            from app.core.rate_limit import AGENT_LIMIT, AGENT_WINDOW, check_rate_limit
+            from fastapi import HTTPException
+
+            try:
+                await check_rate_limit(
+                    "gapo", str(payload.from_user_id), AGENT_LIMIT, AGENT_WINDOW
+                )
+            except HTTPException:
+                logger.info("gapo rate limit hit for user=%s", payload.from_user_id)
+                return {"ok": True, "rate_limited": True}
 
         if not payload.thread_id or not bot_id:
             logger.warning("gapo missing thread_id or bot_id")
@@ -266,7 +275,14 @@ class GapoAdapter:
         # Lệnh/nút bấm cập nhật task HOẶC đang trong PHIÊN /update -> KHÔNG để checkin
         # nuốt (kể cả câu gõ thẳng để tìm task); đẩy thẳng xuống router.
         from app.services.task_progress_service import is_in_session as _taskupd_in_session
-        skip_checkin = self._is_task_update_cmd(user_text) or await _taskupd_in_session(mapped_user["user_id"])
+        # /risk, /deadline (kích hoạt thủ công) cũng là lệnh router thuần — không để check-in nuốt.
+        _first = user_text.strip().split(maxsplit=1)[0].lower()
+        _is_manual_cmd = _first in ("/risk", "/ruiro", "/deadline", "/nhachan", "/nhacdeadline")
+        skip_checkin = (
+            self._is_task_update_cmd(user_text)
+            or _is_manual_cmd
+            or await _taskupd_in_session(mapped_user["user_id"])
+        )
         if mapped_user and not skip_checkin:
             async with AsyncSessionLocal() as db:
                 checkin_answer = await self.checkin.handle_message(

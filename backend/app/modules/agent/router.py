@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_agent_user, get_db
+from app.core.code_gen import next_worklog_code
 from ai_agent.checkin import repository as checkin_repo
 from ai_agent.router.message_router import AgentMessageRouter
 from ai_agent.text_to_sql.text2sql import Text2SQLAgent
@@ -261,14 +262,15 @@ async def import_checkin(
         "(SELECT id FROM companies ORDER BY id LIMIT 1)), "
         if has_company_id else ""
     )
+    seq, code = await next_worklog_code(body["projectId"], db)
     row = (await db.execute(
         text("""
             INSERT INTO worklogs (
                 source, work_date, description, hours, task_id, project_id,
-                {company_col}user_id, updated_at
+                {company_col}user_id, seq, code, updated_at
             ) VALUES (
                 'MANUAL_CHECKIN', :work_date, :description, :hours,
-                :task_id, :project_id, {company_val}:user_id, NOW()
+                :task_id, :project_id, {company_val}:user_id, :seq, :code, NOW()
             )
             RETURNING id
         """.format(company_col=company_col, company_val=company_val)),
@@ -276,6 +278,7 @@ async def import_checkin(
             "work_date": body["workDate"], "description": body.get("description"),
             "hours": body["hours"], "task_id": body.get("taskId"),
             "project_id": body["projectId"], "user_id": body["userId"],
+            "seq": seq, "code": code,
         },
     )).fetchone()
     await db.commit()

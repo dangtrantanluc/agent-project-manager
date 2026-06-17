@@ -29,6 +29,12 @@ export const useAuth = create<State>()(
       setUser: (user) => set({ user }),
       clear: () => set({ accessToken: null, user: null }),
     }),
-    { name: "bb-pm-auth" },
+    {
+      name: "bb-pm-auth",
+      // BẢO MẬT: KHÔNG lưu accessToken vào localStorage (chống XSS exfiltrate).
+      // Token chỉ sống trong memory của store; chỉ persist `user` để giữ UI khi F5.
+      // F5 sẽ mất token → interceptor 401 đưa về /login (đánh đổi chấp nhận được).
+      partialize: (state) => ({ user: state.user }),
+    },
   ),
 );

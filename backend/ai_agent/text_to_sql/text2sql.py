@@ -64,6 +64,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from ai_agent.prompt.prompt import SCHEMA_COMPACT
+from ai_agent.shared.llm_factory import make_llm
 load_dotenv()
 
 SQL_SCHEMA = BACKEND_ROOT.parent / "init" / "init.sql"
@@ -112,6 +113,9 @@ Lưu ý quan trọng:
 - Câu truy vấn phải trả về dữ liệu phù hợp để trả lời câu hỏi, không được trả về dữ liệu thừa hoặc thiếu
 - Cố gắng tối ưu câu truy vấn để trả về kết quả nhanh nhất có thể, tránh sử dụng các phép toán phức tạp hoặc subquery không cần thiết
 - Viết câu truy vấn bằng tiếng Việt nếu có thể, nhưng vẫn phải tuân thủ cú pháp SQL chuẩn
+- Định danh dự án: tên user gõ thường là TÊN GỌI TẮT, KHÔNG phải giá trị code chính xác. Luôn lọc dự án bằng `(p.code ILIKE '<kw>%' OR p.name ILIKE '%<kw>%')` — TUYỆT ĐỐI KHÔNG dùng `p.code = '<kw>'`. Nếu nhiều dự án cùng khớp <kw>, trả kết quả của TẤT CẢ dự án khớp (đừng tự chọn một).
+  Ví dụ — "work log trong dự án mtl của tôi":
+  SELECT wl.work_date, wl.hours, wl.description, t.name AS task_name, p.name AS project_name FROM worklogs wl JOIN projects p ON wl.project_id = p.id LEFT JOIN tasks t ON wl.task_id = t.id WHERE wl.user_id = <id_user_hiện_tại> AND (p.code ILIKE 'MTL%' OR p.name ILIKE '%MTL%') ORDER BY wl.work_date DESC;
 - Nếu kết quả rỗng, nói rõ không tìm thấy và gợi ý hỏi lại cụ thể hơn
 - ĐỊNH DẠNG ĐẦU RA (BẮT BUỘC): CHỈ trả về DUY NHẤT câu lệnh SQL, bắt đầu bằng SELECT hoặc WITH và kết thúc bằng dấu chấm phẩy. TUYỆT ĐỐI KHÔNG kèm lời giải thích, KHÔNG văn xuôi dẫn nhập ("Để trả lời..."), KHÔNG markdown, KHÔNG khối ```sql. Ký tự đầu tiên của câu trả lời phải là chữ S (SELECT) hoặc W (WITH).
 
@@ -132,17 +136,8 @@ class Text2SQLAgent:
         """
         self.db = db
         self.top_k = top_k
-        # Sinh SQL là tác vụ xác định, KHÔNG cần "thinking" của Gemini Flash đời mới
-        # (thinking ngầm sinh hàng nghìn token suy luận ẩn → chậm 5-15s vô ích).
-        # reasoning_effort="none" tắt thinking qua lớp OpenAI-compat của Google.
-        # timeout siết về 20s + max_retries=2 để fail nhanh khi endpoint trả 503.
-        self.llm = ChatOpenAI(
-            model=os.getenv("MODEL_NAME"),
-            timeout=20,
-            max_retries=2,
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
-            reasoning_effort="none"
+        self.llm = make_llm(
+            purpose="text2sql", timeout=20, max_retries=2, reasoning_effort="none",
         ) if llm is None else llm
 
     def _schema_context(self) -> str:

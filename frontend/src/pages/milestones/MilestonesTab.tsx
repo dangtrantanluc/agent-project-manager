@@ -102,6 +102,7 @@ export function MilestonesTab({ projectId }: { projectId: number }) {
             <li key={m.id} className="flex items-center justify-between p-4">
               <div className="flex-1">
                 <div className="flex items-center gap-2">
+                  {m.code && <span className="font-mono text-xs text-slate-400">{m.code}</span>}
                   <p className="font-medium">{m.name}</p>
                   {m.status && <span className="text-xs text-slate-500">({m.status})</span>}
                 </div>

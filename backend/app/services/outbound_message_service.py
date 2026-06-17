@@ -66,8 +66,9 @@ class OutboundMessageService:
         elif model and api_key and base_url:
             # timeout ngắn + 1 retry: bóc recipient là tác vụ nhẹ; LLM chậm KHÔNG
             # được treo cả luồng reply (trước đây 60s×retry -> ~200s ReadTimeout).
-            base = ChatOpenAI(model=model, timeout=15, max_retries=1, temperature=0.3,
-                              api_key=api_key, base_url=base_url)
+            from ai_agent.shared.llm_factory import make_llm
+            base = make_llm(purpose="outbound", timeout=15, max_retries=1,
+                            temperature=0.3, model=model, api_key=api_key, base_url=base_url)
             self._llm = base.with_structured_output(OutboundExtraction, method="function_calling")
         else:
             log.warning("OutboundMessageService LLM chưa cấu hình; không bóc tách được recipient.")

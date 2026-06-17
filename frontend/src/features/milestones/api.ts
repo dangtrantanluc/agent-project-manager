@@ -3,6 +3,8 @@ import type { MilestoneCreateInput } from "@bb-pm/shared";
 
 export type Milestone = {
   id: number;
+  /** Mã hiển thị dễ đọc, vd "MTL-M001". Null cho dữ liệu chưa backfill. */
+  code: string | null;
   name: string;
   status: string | null;
   dueDate: string | null;

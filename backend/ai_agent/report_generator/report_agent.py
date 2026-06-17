@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 from ai_agent.prompt.prompt import SCHEMA_COMPACT
 from ai_agent.text_to_sql.text2sql import Text2SQLAgent
 from ai_agent.report_generator import report_templates
+from ai_agent.shared.llm_factory import make_llm
+from ai_agent.prompt import fragments
 
 load_dotenv()
 
@@ -53,10 +55,7 @@ Schema compact:
 Tạo tối đa 2 SQL query.
 
 Rule:
-- Chỉ SELECT/WITH
-- MỖI câu SQL PHẢI kết thúc bằng dấu chấm phẩy (;)
-- Không markdown
-- Không giải thích
+{fragments.sql_rules_block()}
 """
 
 REPORT_RESULT_PROMPT = """
@@ -91,12 +90,8 @@ Quy tắc:
 
 class ReportAgent:
     def __init__(self, llm: ChatOpenAI | None = None, sql_agent: Text2SQLAgent | None = None):
-        self.llm = ChatOpenAI(
-            model=os.getenv("MODEL_NAME"),
-            timeout=60,
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
-            reasoning_effort="none",
+        self.llm = make_llm(
+            purpose="report", timeout=60, reasoning_effort="none",
         ) if llm is None else llm
         self.sql_agent = sql_agent or Text2SQLAgent(llm=self.llm)
         # Structured output (function_calling) cho 2 schema lập kế hoạch báo cáo —

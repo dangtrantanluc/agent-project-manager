@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Plus, Pencil, Trash2, Search, X } from "lucide-react";
 import { deleteWorklog, listWorklogs, type Worklog } from "@/features/worklogs/api";
-import { formatDate, formatHours } from "@/lib/format";
+import { formatDate, formatDateTime, formatHours } from "@/lib/format";
 import { useAuth } from "@/features/auth/store";
 import { WorklogFormModal } from "./WorklogFormModal";
 import { QuickLogRow } from "./QuickLogRow";
@@ -145,7 +145,15 @@ export function WorklogsTab({ projectId }: { projectId: number }) {
                   key={w.id}
                   className="border-b border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50 align-top"
                 >
-                  <td className="p-3 whitespace-nowrap">{formatDate(w.workDate)}</td>
+                  <td className="p-3 whitespace-nowrap">
+                    <div>{formatDate(w.workDate)}</div>
+                    <div className="text-xs text-slate-400">
+                      🕒 {formatDateTime(w.createdAt)}
+                      {w.updatedAt && w.updatedAt !== w.createdAt && (
+                        <span className="ml-1 text-amber-600" title={`Sửa lúc ${formatDateTime(w.updatedAt)}`}>· đã sửa</span>
+                      )}
+                    </div>
+                  </td>
                   <td className="p-3">{w.task?.name ?? "—"}</td>
                   <td className="p-3 font-medium">{formatHours(Number(w.hours))}</td>
                   <td className="p-3 text-slate-500">{w.user.fullName}</td>

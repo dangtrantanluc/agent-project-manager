@@ -4,6 +4,7 @@ import { I18nextProvider } from "react-i18next";
 import { Toaster } from "sonner";
 import i18n from "@/i18n/i18n";
 import { useAuth } from "@/features/auth/store";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 export function Providers({ children }: { children: ReactNode }) {
   const [qc] = useState(
@@ -24,7 +25,7 @@ export function Providers({ children }: { children: ReactNode }) {
     <I18nextProvider i18n={i18n}>
       <QueryClientProvider client={qc}>
         <Toaster position="top-right" richColors closeButton />
-        {children}
+        <ErrorBoundary>{children}</ErrorBoundary>
       </QueryClientProvider>
     </I18nextProvider>
   );

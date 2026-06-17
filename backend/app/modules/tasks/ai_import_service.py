@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_agent.planning.planning_agent import PlanningAgent
+from app.core.code_gen import next_milestone_code, next_task_code
 from app.modules.tasks.import_service import MAX_FILE_SIZE, normalize_priority, normalize_status
 
 try:
@@ -134,10 +135,11 @@ async def confirm_ai_import(
         if milestone.skip:
             continue
         try:
+            ms_seq, ms_code = await next_milestone_code(project_id, db)
             row = (await db.execute(
                 text("""
-                    INSERT INTO milestones (name, status, due_date, description, project_id, updated_at)
-                    VALUES (:name, :status, :due_date, :description, :project_id, NOW())
+                    INSERT INTO milestones (name, status, due_date, description, project_id, seq, code, updated_at)
+                    VALUES (:name, :status, :due_date, :description, :project_id, :seq, :code, NOW())
                     RETURNING id
                 """),
                 {
@@ -146,6 +148,7 @@ async def confirm_ai_import(
                     "due_date": _date_or_none(milestone.dueDate),
                     "description": milestone.description,
                     "project_id": project_id,
+                    "seq": ms_seq, "code": ms_code,
                 },
             )).fetchone()
             milestone_id_by_temp[milestone.tempId] = row[0]
@@ -159,14 +162,16 @@ async def confirm_ai_import(
         try:
             assignee_id = await _resolve_assignee(task.assigneeName, db) if task.assigneeName else None
             milestone_id = milestone_id_by_temp.get(task.tempMilestoneId or "")
+            task_seq, task_code = await next_task_code(project_id, db)
             await db.execute(
                 text("""
                     INSERT INTO tasks (
                         name, status, priority, deadline, description,
-                        project_id, assignee_id, milestone_id, company_id, updated_at
+                        project_id, assignee_id, milestone_id, company_id, seq, code, updated_at
                     ) VALUES (
                         :name, CAST(:status AS "TaskStatus"), CAST(:priority AS "Priority"),
-                        :deadline, :description, :project_id, :assignee_id, :milestone_id, :company_id, NOW()
+                        :deadline, :description, :project_id, :assignee_id, :milestone_id, :company_id,
+                        :seq, :code, NOW()
                     )
                 """),
                 {
@@ -179,6 +184,7 @@ async def confirm_ai_import(
                     "assignee_id": assignee_id,
                     "milestone_id": milestone_id,
                     "company_id": company_id,
+                    "seq": task_seq, "code": task_code,
                 },
             )
             created_tasks += 1

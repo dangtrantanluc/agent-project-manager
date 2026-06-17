@@ -10,6 +10,22 @@ export function formatDate(value: string | Date | null | undefined) {
   return new Date(value).toLocaleDateString("vi-VN");
 }
 
+/** Ngày + giờ (dd/MM/yyyy HH:mm) — dùng cho thời điểm log/cập nhật. */
+export function formatDateTime(value: string | Date | null | undefined) {
+  if (!value) return "—";
+  const d = new Date(value);
+  return `${d.toLocaleDateString("vi-VN")} ${d.toLocaleTimeString("vi-VN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  })}`;
+}
+
+/** Chỉ giờ:phút (HH:mm). */
+export function formatTime(value: string | Date | null | undefined) {
+  if (!value) return "";
+  return new Date(value).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+}
+
 export function formatHours(v: number | null | undefined) {
   if (v === null || v === undefined) return "—";
   return `${v.toLocaleString("vi-VN", { maximumFractionDigits: 1 })}h`;

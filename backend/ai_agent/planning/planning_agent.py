@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
+from ai_agent.shared.llm_factory import make_llm
 import asyncio
 import logging
 import time
@@ -49,12 +50,9 @@ class PlanningAgent:
         Args:
             llm (ChatOpenAI | None): Một instance của ChatOpenAI để tạo kế hoạch dự án. Nếu None, sẽ tạo một instance mới với cấu hình mặc định.
         """
-        base_llm = ChatOpenAI(model=os.getenv("MODEL_NAME"),
-                              timeout=25,
-                              temperature=0.4,
-                              max_retries=1,
-                              api_key=os.getenv("API_KEY"),
-                              base_url=os.getenv("BASE_URL")) if llm is None else llm
+        base_llm = make_llm(
+            purpose="planning", timeout=25, temperature=0.4, max_retries=1,
+        ) if llm is None else llm
         # Ép LLM trả thẳng đối tượng ProjectPlan đã validate (qua tool-calling).
         # Bỏ hẳn parse JSON thủ công — proxy đã xác nhận hỗ trợ function_calling.
         self.llm = base_llm.with_structured_output(ProjectPlan, method="function_calling")

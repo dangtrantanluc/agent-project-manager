@@ -9,6 +9,8 @@ from typing import List
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+from ai_agent.shared.llm_factory import make_llm
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -33,13 +35,10 @@ class PMMultiAgentRouter:
         Router dùng model nhẹ để phân loại intent (fail-fast). Credentials/model
         đọc từ env chung (như các agent khác) — KHÔNG hardcode.
         """
-        self.llm = ChatOpenAI(
-            timeout=10,
-            max_retries=1,
-            model=os.getenv("MODEL_NAME_ROUTER") or os.getenv("MODEL_NAME"),
-            api_key=os.getenv("API_KEY_ROUTER") or os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL_ROUTER") or os.getenv("BASE_URL"),
-            # Phân loại intent là tác vụ đơn giản, không cần thinking.
+        # Phân loại intent là tác vụ đơn giản, không cần thinking → router=True
+        # dùng model nhẹ (MODEL_NAME_ROUTER) nếu cấu hình.
+        self.llm = make_llm(
+            purpose="router", timeout=10, max_retries=1, router=True,
             reasoning_effort="none",
         )
         logger.info("PMMultiAgentRouter initialized with LLM: %s", self.llm.model_name)

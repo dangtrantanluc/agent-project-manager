@@ -5,8 +5,8 @@ currencies(id,code,symbol,rate)
 users(id,full_name,email,role,department,position,company_id,active,is_super_admin)
 projects(id,name,code,status,priority,start_date,end_date,description,total_hours,task_count,member_count,worklog_count,scope_count,milestone_count,customer_name,company_id,owner_id,account_manager_id,currency_id)
 members(id,project_id,user_id,role,joined_at)
-milestones(id,project_id,name,status,due_date,description,completion_pct,task_count,done_count)
-tasks(id,name,status,priority,deadline,end_at,description,issues,result,total_hours,project_id,company_id,assignee_id,milestone_id,currency_id)
+milestones(id,project_id,name,code,status,due_date,description,completion_pct,task_count,done_count)
+tasks(id,name,code,status,priority,deadline,end_at,description,issues,result,total_hours,project_id,company_id,assignee_id,milestone_id,currency_id)
 task_blockers(id,task_id,severity,description,resolved_at)
 scopes(id,project_id,task_id,assignee_id,sequence,name,notes,estimated_hours,currency_id)
 worklogs(id,work_date,description,hours,task_id,project_id,company_id,user_id,source,slot)
@@ -72,5 +72,7 @@ project_hours = projects.total_hours
 approved_backlog_hours = SUM(backlogs.hours) WHERE backlogs.status='APPROVED'
 pending_backlog = backlogs.status='PENDING'
 pending_follow_up = agent_follow_ups.status='PENDING'
+entity_code = mã hiển thị dạng PREFIX-Tnnn (task) / PREFIX-Mnnn (milestone); projects.code là PREFIX. Khi user nhắc mã như 'MTL-T001' thì lọc theo tasks.code; 'MTL-M002' thì milestones.code.
+project_ref = Khi user gọi tên/mã NGẮN của dự án (vd "dự án MTL", "project CRM", "MTL"): KHÔNG dùng so khớp chính xác p.code = 'MTL'. Phải khớp MỀM, không phân biệt hoa/thường, bao cả trường hợp code có hậu tố và khớp theo tên: (p.code ILIKE 'MTL%' OR p.name ILIKE '%MTL%'); thay 'MTL' bằng từ khoá user nêu. Nếu nhiều dự án cùng khớp thì trả kết quả của TẤT CẢ (đừng tự chọn một). Chỉ khi user đưa MÃ ĐẦY ĐỦ kiểu 'MTL-T001'/'MTL-M002' mới lọc tasks.code/milestones.code theo entity_code.
 cost/budget fields were removed; do not query budget,total_cost,budget_remaining,estimated_total_cost,estimated_cost,estimated_rate,cost_per_hour_snapshot,total_cost_snapshot,member_rates,estimated_total_hours.
 """

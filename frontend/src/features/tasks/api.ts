@@ -3,12 +3,18 @@ import type { TaskCreateInput, TaskStatus } from "@bb-pm/shared";
 
 export type TaskListItem = {
   id: number;
+  /** Mã hiển thị dễ đọc, vd "MTL-T001". Null cho dữ liệu chưa backfill. */
+  code: string | null;
   name: string;
   status: TaskStatus;
   priority: string;
   deadline: string | null;
   endAt: string | null;
   description: string | null;
+  /** Kết quả đạt được (điền tay hoặc agent bổ sung khi cập nhật/hoàn thành). */
+  result: string | null;
+  /** Khó khăn/vướng mắc gặp phải. */
+  issues: string | null;
   totalHours: number;
   assignee: { id: number; fullName: string; avatarUrl: string | null } | null;
   milestone: { id: number; name: string } | null;
@@ -17,7 +23,13 @@ export type TaskListItem = {
   _count: { worklogs: number; backlogs?: number };
   /** Số blocker chưa gỡ (BE: open_blockers). >0 => task đang kẹt. */
   blockerCount: number;
+  /** Task mà task này phụ thuộc (B) — phải xong trước. */
+  dependsOn?: { id: number; name: string; code: string | null; status: string }[];
+  /** Task phụ thuộc task này (A) — bị nó chặn. */
+  blocks?: { id: number; name: string; code: string | null }[];
 };
+
+export type TaskDependency = { id: number; name: string; code: string | null; status: string };
 
 export type TaskListParams = {
   projectId?: number;
@@ -79,13 +91,15 @@ export async function listTasks(params: TaskListParams = {}) {
 
 /** Shape thô từ BE trước khi normalize: các scalar luôn có (BE trả đủ); chỉ nested
  * object & _count là optional vì normalize sẽ điền. An toàn hơn `any`. */
-type RawTask = Omit<TaskListItem, "project" | "assignee" | "milestone" | "tags" | "_count" | "blockerCount"> & {
+type RawTask = Omit<TaskListItem, "project" | "assignee" | "milestone" | "tags" | "_count" | "blockerCount" | "result" | "issues"> & {
   project?: TaskListItem["project"] | null;
   assignee?: TaskListItem["assignee"];
   milestone?: TaskListItem["milestone"];
   tags?: TaskListItem["tags"];
   _count?: TaskListItem["_count"];
   blockerCount?: number;
+  result?: string | null;
+  issues?: string | null;
   projectId?: number;
   worklogCount?: number;
   backlogCount?: number;
@@ -116,6 +130,36 @@ export async function transitionTask(id: number, status: TaskStatus) {
   return normalizeTask(unwrap(data));
 }
 
+/** Đặt "task taskId phụ thuộc dependsOnTaskId" (taskId chỉ làm được sau khi kia xong). */
+export async function addDependency(taskId: number, dependsOnTaskId: number) {
+  const { data } = await apiClient.post<{ dependsOn: TaskDependency[] }>(
+    `/tasks/${taskId}/dependencies`, { dependsOnTaskId },
+  );
+  return data.dependsOn;
+}
+
+export async function removeDependency(taskId: number, depTaskId: number) {
+  await apiClient.delete(`/tasks/${taskId}/dependencies/${depTaskId}`);
+}
+
+/** Một sự kiện trong lịch sử hoạt động của task. */
+export type ActivityEvent = {
+  at: string;
+  type: "progress" | "outcome" | "transition" | "created" | "blocker_open" | "blocker_resolved" | "other";
+  icon: string;
+  source: string;            // chat | web | system | cron...
+  actor: string | null;
+  summary: string;
+};
+
+/** Lịch sử hoạt động task: đổi %/status, ghi kết quả/khó khăn, tạo/gỡ blocker. */
+export async function getTaskActivity(taskId: number) {
+  const { data } = await apiClient.get<{ events: ActivityEvent[]; truncated: boolean }>(
+    `/tasks/${taskId}/activity`,
+  );
+  return data;
+}
+
 function unwrap<T>(data: T | { data: T }): T {
   return data && typeof data === "object" && "data" in data ? data.data : data;
 }
@@ -130,6 +174,8 @@ function normalizeTask(task: RawTask): TaskListItem {
     tags: task.tags ?? [],
     _count: task._count ?? { worklogs: task.worklogCount ?? task.backlogCount ?? 0 },
     blockerCount: task.blockerCount ?? 0,
+    result: task.result ?? null,
+    issues: task.issues ?? null,
   };
 }
 

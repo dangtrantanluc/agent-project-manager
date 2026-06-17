@@ -65,9 +65,9 @@ class RiskAlertService:
             os.getenv("MODEL_NAME"), os.getenv("API_KEY"), os.getenv("BASE_URL"),
         )
         if model and api_key and base_url:
-            from langchain_openai import ChatOpenAI
-            return ChatOpenAI(model=model, timeout=30, api_key=api_key,
-                              base_url=base_url, reasoning_effort="none")
+            from ai_agent.shared.llm_factory import make_llm
+            return make_llm(purpose="risk_alert", timeout=30, reasoning_effort="none",
+                            model=model, api_key=api_key, base_url=base_url)
         return None
 
     # ── 1. QUÉT & GỬI CẢNH BÁO ────────────────────────────────────────────────
@@ -151,6 +151,33 @@ class RiskAlertService:
         logger.info("[Risk] scan_and_alert sent=%d skipped=%d", sent, skipped)
         return {"sent": sent, "skipped": skipped}
 
+    async def scan_and_alert_for_user(
+        self, db: AsyncSession, *, user_id: int, today_iso: str
+    ) -> dict:
+        """Quét at-risk các dự án mà USER liên quan (owner/AM/member) rồi gửi cảnh báo.
+
+        Dùng cho lệnh /risk thủ công: chỉ quét trong phạm vi quyền của user (không
+        lộ dự án ngoài quyền). Mỗi project chạy qua scan_and_alert (dedup theo ngày).
+        Trả {scanned, sent, skipped}.
+        """
+        project_ids = [r[0] for r in (await db.execute(text("""
+            SELECT p.id FROM projects p
+            WHERE p.status::text NOT IN ('DONE','CANCELLED')
+              AND (
+                  p.owner_id = :uid
+                  OR p.account_manager_id = :uid
+                  OR EXISTS (SELECT 1 FROM members m WHERE m.project_id = p.id AND m.user_id = :uid)
+                  OR EXISTS (SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.assignee_id = :uid)
+              )
+        """), {"uid": user_id})).fetchall()]
+
+        total = {"scanned": len(project_ids), "sent": 0, "skipped": 0}
+        for pid in project_ids:
+            stats = await self.scan_and_alert(db, today_iso=today_iso, project_id=pid)
+            total["sent"] += stats.get("sent", 0)
+            total["skipped"] += stats.get("skipped", 0)
+        return total
+
     async def _resolve_pm_channel(self, db, pm_id):
         row = (await db.execute(text("""
             SELECT gapo_thread_id, gapo_user_id FROM gapo_user_maps WHERE user_id = :uid
@@ -193,6 +220,11 @@ class RiskAlertService:
         ]
         if task_lines:
             lines += ["", "Task cần chú ý:", *task_lines]
+        # Nút thắt phụ thuộc: task đang chặn nhiều task nhất -> ưu tiên gỡ trước.
+        if risk.bottleneck:
+            b = risk.bottleneck
+            code = f"{b['code']} " if b.get("code") else ""
+            lines += ["", f"🔗 Nút thắt: {code}**{b['name']}** đang chặn {b['blocks_count']} task khác — ưu tiên hoàn thành trước để gỡ cả chuỗi."]
         lines += [
             "",
             "Đề xuất hành động:",

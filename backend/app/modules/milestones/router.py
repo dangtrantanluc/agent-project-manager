@@ -3,6 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user, get_db, require_role
+from app.core.code_gen import next_milestone_code
 
 router = APIRouter(tags=["milestones"])
 
@@ -14,6 +15,7 @@ def _row(r) -> dict:
         "description": r[4], "taskCount": r[5], "doneCount": r[6], "completionPct": r[7],
         "projectId": r[8],
         "createdAt": r[9].isoformat(), "updatedAt": r[10].isoformat(),
+        "code": (r[11] if len(r) > 11 else None),
     }
 
 
@@ -28,7 +30,7 @@ async def list_milestones(
         text("""
             SELECT m.id, m.name, m.status, m.due_date, m.description,
                    m.task_count, m.done_count, m.completion_pct, m.project_id,
-                   m.created_at, m.updated_at
+                   m.created_at, m.updated_at, m.code
             FROM milestones m
             JOIN projects p ON p.id = m.project_id
             WHERE m.project_id = :pid
@@ -54,17 +56,18 @@ async def create_milestone(
     if not proj:
         raise HTTPException(status_code=404, detail="Dự án không tồn tại")
 
+    seq, code = await next_milestone_code(project_id, db)
     row = (await db.execute(
         text("""
-            INSERT INTO milestones (name, status, due_date, description, project_id, updated_at)
-            VALUES (:name, :status, :due_date, :description, :pid, NOW())
+            INSERT INTO milestones (name, status, due_date, description, project_id, seq, code, updated_at)
+            VALUES (:name, :status, :due_date, :description, :pid, :seq, :code, NOW())
             RETURNING id, name, status, due_date, description,
-                      task_count, done_count, completion_pct, project_id, created_at, updated_at
+                      task_count, done_count, completion_pct, project_id, created_at, updated_at, code
         """),
         {
             "name": body["name"], "status": body.get("status"),
             "due_date": body.get("dueDate"), "description": body.get("description"),
-            "pid": project_id,
+            "pid": project_id, "seq": seq, "code": code,
         },
     )).fetchone()
     await db.execute(
@@ -103,7 +106,7 @@ async def update_milestone(
         text(f"""
             UPDATE milestones SET {', '.join(sets)} WHERE id = :mid
             RETURNING id, name, status, due_date, description,
-                      task_count, done_count, completion_pct, project_id, created_at, updated_at
+                      task_count, done_count, completion_pct, project_id, created_at, updated_at, code
         """),
         params,
     )).fetchone()

@@ -13,6 +13,8 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from ai_agent.shared.llm_factory import make_llm
+
 load_dotenv()
 
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
@@ -44,11 +46,8 @@ class ConversationAgent:
         """Khởi tạo agent xử lý giao tiếp và lời chào."""
         load_dotenv()
 
-        self.llm = ChatOpenAI(
-            model=os.getenv("MODEL_NAME"),
-            temperature=0.7,
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
+        self.llm = make_llm(
+            purpose="conversation", temperature=0.7,
         ) if llm is None else llm
         # Đặt các tham số
         self.max_retries = DEFAULT_MAX_RETRIES

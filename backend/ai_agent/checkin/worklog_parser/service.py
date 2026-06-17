@@ -5,6 +5,7 @@ from sqlalchemy import text
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from ai_agent.checkin.worklog_parser.prompt import WORKLOG_EXTRACT_PROMPT
+from app.core.code_gen import next_worklog_code
 
 
 def _build_clarify_block(
@@ -76,14 +77,15 @@ class WorklogParserService:
             if task_row:
                 task_id = task_row[0]
 
+        wl_seq, wl_code = await next_worklog_code(project_id, db)
         await db.execute(
             text("""
                 INSERT INTO worklogs
                     (work_date, description, hours, project_id, task_id,
-                     user_id, updated_at)
+                     user_id, seq, code, updated_at)
                 VALUES
                     (:work_date, :description, :hours,
-                     :project_id, :task_id, :user_id, NOW())
+                     :project_id, :task_id, :user_id, :seq, :code, NOW())
             """),
             {
                 "work_date": data["work_date"],
@@ -92,6 +94,7 @@ class WorklogParserService:
                 "project_id": project_id,
                 "task_id": task_id,
                 "user_id": user_id,
+                "seq": wl_seq, "code": wl_code,
             },
         )
         await db.commit()

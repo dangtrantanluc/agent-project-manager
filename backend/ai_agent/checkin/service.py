@@ -1,12 +1,14 @@
 import logging
+import unicodedata
 from datetime import date, datetime
 import pytz
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_agent.checkin import repository as repo
+from ai_agent.checkin.intent_guard import CheckinIntentGuard
 from ai_agent.checkin.constants import (
     CheckinState, CheckinSlot,
-    P_PROJECT, P_TASK, P_SKIP_TASK, P_CANCEL, P_ADD_MORE, P_DONE,
+    P_PROJECT, P_TASK, P_SKIP_TASK, P_CANCEL, P_ADD_MORE, P_EDIT, P_DONE,
     CHECKIN_PREFIX, CHECKIN_TRIGGER,
 )
 from gapo.gapo_client import GapoClient
@@ -16,10 +18,29 @@ _VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 logger = logging.getLogger(__name__)
 
 
+def _strip_accents(text: str) -> str:
+    """Bỏ dấu tiếng Việt + lowercase để khớp từ khoá bất kể biến thể dấu.
+
+    'Huỷ'/'hủy'/'HUỶ' -> 'huy'. Tránh bug khớp cứng theo từng biến thể dấu.
+    """
+    nfkd = unicodedata.normalize("NFKD", text or "")
+    no_accent = "".join(c for c in nfkd if not unicodedata.combining(c))
+    # đ/Đ không tách dấu qua NFKD nên xử lý riêng.
+    return no_accent.replace("đ", "d").replace("Đ", "D").strip().lower()
+
+
+# Từ khoá thoát / bỏ qua / xác nhận — so khớp SAU khi đã _strip_accents.
+_CANCEL_WORDS = {"huy", "cancel", "thoat"}
+_SKIP_WORDS = {"bo qua", "skip"}
+_AFFIRMATIVE_WORDS = {"co", "yes", "ok", "oke", "okay", "dung", "uh", "u", "co nhe", "dong y"}
+
+
 class CheckinFlowService:
     def __init__(self, gapo: GapoClient, worklog_parser: WorklogParserService):
         self.gapo = gapo
         self.parser = worklog_parser
+        # Phân loại text tự do giữa check-in: thuộc flow hay là intent khác.
+        self.intent_guard = CheckinIntentGuard()
 
     # ── Public entry points ────────────────────────────────────────────────────
 
@@ -111,6 +132,19 @@ class CheckinFlowService:
             await repo.cancel_all_active_sessions(db, uid)
             return "Check-in hoàn tất! Cảm ơn bạn."
 
+        if payload == P_EDIT:
+            if session["state"] != CheckinState.CONFIRMING:
+                return "Chỉ sửa được worklog vừa lưu. Gõ /checkin nếu cần bắt đầu lại."
+            pending = session.get("pending_parsed") or {}
+            worklog_id = pending.get("_worklog_id") if isinstance(pending, dict) else None
+            if not worklog_id:
+                return "Không tìm thấy worklog để sửa. Chọn 'Thêm worklog khác' hoặc 'Xong'."
+            await repo.set_session_editing(db, sid, worklog_id)
+            return (
+                f"Sửa worklog #{worklog_id}. Nhập lại nội dung + số giờ.\n"
+                "Ví dụ: *tách module pricing 2h*"
+            )
+
         if payload == P_ADD_MORE:
             project_id = session["current_project_id"]
             if session["state"] == CheckinState.CONFIRMING:
@@ -173,31 +207,85 @@ class CheckinFlowService:
 
     # ── Free-text continuation ─────────────────────────────────────────────────
 
-    async def _continue_flow(self, db: AsyncSession, session: dict, message_text: str) -> str:
+    async def _continue_flow(self, db: AsyncSession, session: dict, message_text: str) -> str | None:
         state = session["state"]
         stripped = message_text.strip()
+        normalized = _strip_accents(stripped)
 
-        # AWAITING_UPDATE: parse and store worklog
-        if state == CheckinState.AWAITING_UPDATE:
+        # 0. Đang chờ user xác nhận thoát check-in (đặt ở state nhập worklog)?
+        pending = session.get("pending_parsed")
+        if isinstance(pending, dict) and pending.get("type") == "escape_confirm":
+            if normalized in _AFFIRMATIVE_WORDS:
+                # User đồng ý thoát -> hủy session, nhường router xử lý intent đã lưu.
+                await repo.cancel_all_active_sessions(db, session["user_id"])
+                return None
+            # Không xác nhận -> ở lại check-in, coi câu này là worklog (mặc định "không").
+            # Xoá cờ escape trước khi parse để không kẹt vòng hỏi.
+            await repo.update_session_pending(db, session["id"], message_text, None)
+            session["pending_parsed"] = None
             return await self._handle_worklog_input(db, session, message_text)
 
-        # CONFIRMING: user sent free text instead of pressing a button
+        # 1. Lệnh rõ ràng — luôn ưu tiên luật cứng (nhanh, chắc, không tốn LLM).
+        if normalized in _CANCEL_WORDS:
+            return await self._handle_payload(db, session, P_CANCEL)
+        if state == CheckinState.AWAITING_TASK and normalized in _SKIP_WORDS:
+            return await self._handle_payload(db, session, P_SKIP_TASK)
+        if stripped.isdigit() and state in (CheckinState.AWAITING_PROJECT, CheckinState.AWAITING_TASK):
+            return await self._handle_numeric_input(db, session, int(stripped))
+
+        # 2. Text tự do -> hỏi LLM: thuộc check-in hay là intent khác?
+        if stripped:
+            verdict = await self.intent_guard.classify(stripped, state=str(state))
+            if not verdict.get("belongs_to_checkin", True):
+                return await self._handle_intent_escape(db, session, message_text, verdict)
+
+        # 3. Thuộc check-in -> xử lý theo state như cũ.
+        if state == CheckinState.AWAITING_EDIT:
+            return await self._handle_edit_input(db, session, message_text)
+        if state == CheckinState.AWAITING_UPDATE:
+            return await self._handle_worklog_input(db, session, message_text)
         if state == CheckinState.CONFIRMING:
             return await self._remind_confirming(db, session)
-
-        # AWAITING_PROJECT / AWAITING_TASK: check for numeric or text-search input
         if state in (CheckinState.AWAITING_PROJECT, CheckinState.AWAITING_TASK):
-            lowered = stripped.lower()
-            if lowered in {"hủy", "huy", "cancel", "thoát", "thoat"}:
-                return await self._handle_payload(db, session, P_CANCEL)
-            if state == CheckinState.AWAITING_TASK and lowered in {"bỏ qua", "bo qua", "skip"}:
-                return await self._handle_payload(db, session, P_SKIP_TASK)
-            if stripped.isdigit():
-                return await self._handle_numeric_input(db, session, int(stripped))
             if stripped:
                 return await self._handle_text_search(db, session, stripped)
 
         return await self._remind_current_state(db, session)
+
+    _INTENT_LABELS = {
+        "create_task": "tạo task mới",
+        "report": "xem báo cáo",
+        "text2sql": "tra cứu dữ liệu",
+        "planning": "lập kế hoạch",
+        "add_member": "thêm thành viên",
+        "task_update": "cập nhật task",
+    }
+
+    async def _handle_intent_escape(
+        self, db: AsyncSession, session: dict, message_text: str, verdict: dict
+    ) -> str | None:
+        """User phát intent khác giữa check-in.
+
+        - Ở state CHỌN project/task: thoát luôn (chưa có dữ liệu để mất) -> router.
+        - Ở state NHẬP worklog / confirm: hỏi xác nhận trước, tránh mất worklog
+          user có thể đang định nhập.
+        """
+        state = session["state"]
+        if state in (CheckinState.AWAITING_PROJECT, CheckinState.AWAITING_TASK):
+            await repo.cancel_all_active_sessions(db, session["user_id"])
+            return None  # nhường router
+
+        # State nhập worklog/confirm -> hỏi xác nhận, lưu cờ escape vào pending_parsed.
+        intent = verdict.get("intent")
+        label = self._INTENT_LABELS.get(intent, "làm việc khác")
+        await repo.update_session_pending(
+            db, session["id"], message_text,
+            {"type": "escape_confirm", "intent": intent, "raw": message_text},
+        )
+        return (
+            f"Bạn đang trong phiên check-in. Thoát để {label}?\n"
+            'Gõ "có" để thoát, hoặc nhập tiếp nội dung worklog để ở lại.'
+        )
 
     async def _handle_numeric_input(self, db: AsyncSession, session: dict, index: int) -> str:
         """Resolve a numbered menu selection (fallback when quick_reply unavailable)."""
@@ -366,17 +454,18 @@ class CheckinFlowService:
             parsed_json=parsed,
         )
 
-        # 9. Move to CONFIRMING (do NOT complete yet — user may want add_more)
-        await repo.set_session_confirming(db, session["id"], parsed)
+        # 9. Move to CONFIRMING (do NOT complete yet — user may want add_more/edit)
+        #    Nhúng worklog_id vào pending_parsed để nút "Sửa" biết sửa worklog nào.
+        await repo.set_session_confirming(db, session["id"], {**parsed, "_worklog_id": worklog_id})
 
         # 10. Build confirm message
         project_name = await repo.get_project_name(db, session["current_project_id"])
         task_name = (
             await repo.get_task_name(db, session["current_task_id"])
-            if session["current_task_id"] else "Khong co task"
+            if session["current_task_id"] else "Không có task"
         )
         summary = (
-            f"Da luu worklog #{worklog_id}\n"
+            f"Đã lưu worklog #{worklog_id}\n"
             f"{project_name} / {task_name}\n"
             f"{hours}h — {work_date_str}"
         )
@@ -385,6 +474,7 @@ class CheckinFlowService:
 
         actions = [
             {"label": "Thêm worklog khác", "payload": P_ADD_MORE},
+            {"label": "Sửa", "payload": P_EDIT},
             {"label": "Xong", "payload": P_DONE},
         ]
         sent = await self.gapo.send_menu(session["thread_id"], summary, actions)
@@ -395,14 +485,104 @@ class CheckinFlowService:
             )
         return ""
 
+    async def _handle_edit_input(self, db: AsyncSession, session: dict, message_text: str) -> str:
+        """User nhập lại nội dung để SỬA worklog vừa lưu (chỉ giờ + mô tả).
+
+        Khác _handle_worklog_input: UPDATE thay vì INSERT, bỏ check duplicate,
+        không đụng status/blocker (giữ side-effect cũ), recompute total_hours.
+        """
+        pending = session.get("pending_parsed") or {}
+        worklog_id = pending.get("_worklog_id") or pending.get("worklog_id") \
+            if isinstance(pending, dict) else None
+        if not worklog_id:
+            await repo.set_session_state(db, session["id"], CheckinState.CONFIRMING)
+            return "Không tìm thấy worklog để sửa. Chọn 'Thêm worklog khác' hoặc 'Xong'."
+
+        wl = await repo.get_worklog(db, worklog_id)
+        if not wl:
+            await repo.set_session_state(db, session["id"], CheckinState.CONFIRMING)
+            return "Worklog không còn tồn tại. Chọn 'Thêm worklog khác' hoặc 'Xong'."
+
+        # Parse lại nội dung mới (dùng đúng parser của worklog).
+        parsed = await self.parser.parse(message_text)
+
+        if parsed.get("needs_clarification"):
+            q = parsed.get("clarification_question") or "Bạn nói rõ thêm giúp mình nhé."
+            return f"{q}\n\n(Gõ \"hủy\" nếu muốn dừng.)"
+        if "error" in parsed:
+            return f"{parsed['error']}"
+
+        try:
+            hours = float(parsed["hours"])
+        except (TypeError, ValueError):
+            return "Không đọc được số giờ. Vui lòng nhập lại, ví dụ: '2h fix bug login'."
+        if hours <= 0 or hours > 24:
+            return "Số giờ không hợp lệ (phải từ 0.5 đến 24). Vui lòng nhập lại."
+
+        # work_date: ưu tiên ngày mới nếu user nói rõ, không thì giữ ngày cũ của worklog.
+        work_date = wl["work_date"]
+        work_date_str = parsed.get("work_date")
+        if work_date_str:
+            try:
+                work_date = date.fromisoformat(work_date_str)
+            except ValueError:
+                work_date = wl["work_date"]
+        work_date_str = str(work_date)
+
+        description = parsed.get("description")
+
+        await repo.update_worklog(
+            db,
+            worklog_id=worklog_id,
+            work_date=work_date,
+            description=description,
+            hours=hours,
+            raw_message=message_text,
+            parsed_json=parsed,
+        )
+        # Recompute total_hours cho task/project (SUM lại từ đầu nên tự đúng).
+        # KHÔNG truyền parsed_json status/blocker để tránh đổi status task khi sửa.
+        await repo.apply_worklog_side_effects(
+            db,
+            project_id=wl["project_id"],
+            task_id=wl["task_id"],
+            user_id=wl["user_id"],
+            work_date=work_date,
+            parsed_json={},
+        )
+
+        # Quay lại CONFIRMING với số liệu mới.
+        await repo.set_session_confirming(db, session["id"], {**parsed, "_worklog_id": worklog_id})
+
+        project_name = await repo.get_project_name(db, wl["project_id"])
+        task_name = (
+            await repo.get_task_name(db, wl["task_id"]) if wl["task_id"] else "Không có task"
+        )
+        summary = (
+            f"Đã cập nhật worklog #{worklog_id}\n"
+            f"{project_name} / {task_name}\n"
+            f"{hours}h — {work_date_str}"
+        )
+        if description:
+            summary += f"\n{description}"
+
+        actions = [
+            {"label": "Thêm worklog khác", "payload": P_ADD_MORE},
+            {"label": "Sửa", "payload": P_EDIT},
+            {"label": "Xong", "payload": P_DONE},
+        ]
+        await self.gapo.send_menu(session["thread_id"], summary, actions)
+        return ""
+
     # ── State reminders ────────────────────────────────────────────────────────
 
     async def _remind_confirming(self, db: AsyncSession, session: dict) -> str:
         """Re-send add_more/done menu when user sends free text during CONFIRMING."""
         project_name = await repo.get_project_name(db, session["current_project_id"])
-        title = f"Da luu worklog cho {project_name}.\nBan muon:"
+        title = f"Đã lưu worklog cho {project_name}.\nBạn muốn:"
         actions = [
             {"label": "Thêm worklog khác", "payload": P_ADD_MORE},
+            {"label": "Sửa", "payload": P_EDIT},
             {"label": "Xong", "payload": P_DONE},
         ]
         await self.gapo.send_menu(session["thread_id"], title, actions)
@@ -417,6 +597,8 @@ class CheckinFlowService:
             return await self._send_task_menu(db, session)
         if state == CheckinState.CONFIRMING:
             return await self._remind_confirming(db, session)
+        if state == CheckinState.AWAITING_EDIT:
+            return "Nhập lại nội dung worklog cần sửa (mô tả + số giờ), hoặc gõ \"hủy\"."
         return "Go /checkin de bat dau check-in moi."
 
     # ── Menu senders ───────────────────────────────────────────────────────────
@@ -477,7 +659,11 @@ class CheckinFlowService:
         )
 
         if tasks:
-            numbered = "\n".join(f"{i + 1}. {t['name']}" for i, t in enumerate(tasks))
+            # Hiển thị mã (vd MTL-T001) trước tên cho dễ tham chiếu; payload vẫn theo id.
+            def _label(t: dict) -> str:
+                return f"{t['code']} {t['name']}" if t.get("code") else t["name"]
+
+            numbered = "\n".join(f"{i + 1}. {_label(t)}" for i, t in enumerate(tasks))
             title = (
                 f"{project_name}\nChọn task bạn đã làm:\n\n"
                 f"{numbered}\n\n"

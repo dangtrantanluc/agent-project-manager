@@ -31,7 +31,8 @@ CREATE TYPE public."AgentAuditSource" AS ENUM (
     'chat',
     'cron',
     'cli',
-    'other'
+    'other',
+    'web'
 );
 
 
@@ -96,6 +97,7 @@ CREATE TYPE public."CheckinState" AS ENUM (
     'CONFIRMING',
     'AWAITING_UPDATE',
     'AWAITING_TASK_CONFIRM',
+    'AWAITING_EDIT',
     'COMPLETED',
     'CANCELLED',
     'EXPIRED',
@@ -111,6 +113,18 @@ CREATE TYPE public."FollowUpStatus" AS ENUM (
     'PENDING',
     'REPLIED',
     'EXPIRED'
+);
+
+
+--
+-- Name: FollowUpKind; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public."FollowUpKind" AS ENUM (
+    'DEADLINE',
+    'RESULT_ISSUES',
+    'BLOCKER_REASON',
+    'GENERIC'
 );
 
 
@@ -221,6 +235,7 @@ CREATE TABLE public.agent_follow_ups (
     replied_at timestamp(3) without time zone,
     reply_text text,
     correlation_id text,
+    kind public."FollowUpKind" DEFAULT 'GENERIC'::public."FollowUpKind" NOT NULL,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -681,6 +696,8 @@ CREATE TABLE public.milestones (
     done_count integer DEFAULT 0 NOT NULL,
     completion_pct integer DEFAULT 0 NOT NULL,
     project_id integer NOT NULL,
+    seq integer,
+    code text,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp(3) without time zone NOT NULL
 );
@@ -714,6 +731,7 @@ CREATE TABLE public.projects (
     id integer NOT NULL,
     name text NOT NULL,
     code text,
+    entity_prefix text,
     status public."ProjectStatus" DEFAULT 'PLANNED'::public."ProjectStatus" NOT NULL,
     priority public."Priority" DEFAULT 'MEDIUM'::public."Priority" NOT NULL,
     start_date date,
@@ -754,6 +772,19 @@ CREATE SEQUENCE public.projects_id_seq
 --
 
 ALTER SEQUENCE public.projects_id_seq OWNED BY public.projects.id;
+
+
+--
+-- Name: project_counters; Type: TABLE; Schema: public; Owner: -
+-- Hands out the next per-project running sequence for task/milestone codes.
+--
+
+CREATE TABLE public.project_counters (
+    project_id integer NOT NULL,
+    next_task_seq integer DEFAULT 1 NOT NULL,
+    next_ms_seq integer DEFAULT 1 NOT NULL,
+    next_wl_seq integer DEFAULT 1 NOT NULL
+);
 
 
 --
@@ -882,6 +913,8 @@ CREATE TABLE public.tasks (
     assignee_id integer,
     milestone_id integer,
     currency_id integer,
+    seq integer,
+    code text,
     created_at timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at timestamp(3) without time zone NOT NULL,
     company_id integer NOT NULL
@@ -972,7 +1005,9 @@ CREATE TABLE public.worklogs (
     raw_message text,
     parsed_json jsonb,
     checkin_session_id integer,
-    slot text
+    slot text,
+    seq integer,
+    code text
 );
 
 
@@ -1272,6 +1307,22 @@ ALTER TABLE ONLY public.projects
 
 
 --
+-- Name: project_counters project_counters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_counters
+    ADD CONSTRAINT project_counters_pkey PRIMARY KEY (project_id);
+
+
+--
+-- Name: project_counters project_counters_project_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.project_counters
+    ADD CONSTRAINT project_counters_project_id_fkey FOREIGN KEY (project_id) REFERENCES public.projects(id) ON DELETE CASCADE;
+
+
+--
 -- Name: scopes scopes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1288,6 +1339,27 @@ ALTER TABLE ONLY public.task_blockers
 
 
 --
+-- Name: task_dependencies; Type: TABLE; Schema: public; Owner: -
+-- "A phụ thuộc B": A (blocked) chỉ làm được sau khi B (depends_on) xong.
+--
+
+CREATE TABLE IF NOT EXISTS public.task_dependencies (
+    id                 serial PRIMARY KEY,
+    blocked_task_id    integer NOT NULL REFERENCES public.tasks(id) ON DELETE CASCADE,
+    depends_on_task_id integer NOT NULL REFERENCES public.tasks(id) ON DELETE CASCADE,
+    created_by         integer REFERENCES public.users(id),
+    created_at         timestamp(3) without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT task_dependencies_no_self CHECK (blocked_task_id <> depends_on_task_id),
+    CONSTRAINT task_dependencies_unique UNIQUE (blocked_task_id, depends_on_task_id)
+);
+
+CREATE INDEX IF NOT EXISTS task_dependencies_blocked_idx
+    ON public.task_dependencies (blocked_task_id);
+CREATE INDEX IF NOT EXISTS task_dependencies_depends_on_idx
+    ON public.task_dependencies (depends_on_task_id);
+
+
+--
 -- Name: task_status task_status_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1301,6 +1373,62 @@ ALTER TABLE ONLY public.task_status
 
 ALTER TABLE ONLY public.tasks
     ADD CONSTRAINT tasks_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tasks tasks_project_seq_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_project_seq_key UNIQUE (project_id, seq);
+
+
+--
+-- Name: tasks tasks_code_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tasks
+    ADD CONSTRAINT tasks_code_key UNIQUE (code);
+
+
+--
+-- Name: projects projects_entity_prefix_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.projects
+    ADD CONSTRAINT projects_entity_prefix_key UNIQUE (entity_prefix);
+
+
+--
+-- Name: worklogs worklogs_project_seq_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.worklogs
+    ADD CONSTRAINT worklogs_project_seq_key UNIQUE (project_id, seq);
+
+
+--
+-- Name: worklogs worklogs_code_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.worklogs
+    ADD CONSTRAINT worklogs_code_key UNIQUE (code);
+
+
+--
+-- Name: milestones milestones_project_seq_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.milestones
+    ADD CONSTRAINT milestones_project_seq_key UNIQUE (project_id, seq);
+
+
+--
+-- Name: milestones milestones_code_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.milestones
+    ADD CONSTRAINT milestones_code_key UNIQUE (code);
 
 
 --

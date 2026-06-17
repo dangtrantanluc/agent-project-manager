@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.code_gen import reserve_task_codes
+
 try:
     import openpyxl
     _HAS_OPENPYXL = True
@@ -252,6 +254,28 @@ async def _resolve_assignee(name: str, db: AsyncSession) -> Optional[int]:
     return row[0] if row else None
 
 
+async def _resolve_assignees_bulk(names: list[str], db: AsyncSession) -> dict[str, int]:
+    """Resolve nhiều tên trong MỘT query (chống N+1). Trả map lower(name)->user_id.
+
+    Khớp substring như _resolve_assignee cũ: mỗi tên thử khớp ILIKE %name%.
+    Tên không khớp sẽ vắng mặt trong map (caller xử lý None).
+    """
+    result: dict[str, int] = {}
+    uniq = {n.strip().lower() for n in names if n and n.strip()}
+    if not uniq:
+        return result
+    rows = (await db.execute(
+        text("SELECT id, full_name FROM users WHERE full_name IS NOT NULL")
+    )).fetchall()
+    # Khớp phía Python để tránh N query ILIKE; danh sách user thường nhỏ.
+    for key in uniq:
+        for uid, full_name in rows:
+            if key in (full_name or "").lower():
+                result[key] = uid
+                break
+    return result
+
+
 async def bulk_create_tasks(
     project_id: int,
     rows: list[ImportConfirmRow],
@@ -266,13 +290,19 @@ async def bulk_create_tasks(
     )).fetchone()
     company_id = project_row[0] if project_row else None
 
-    for row in rows:
-        if row.skip:
-            continue
+    # Chống N+1: resolve toàn bộ assignee + cấp dải mã task trong 2 query (thay vì
+    # 2 query MỖI dòng). INSERT vẫn theo dòng để giữ báo lỗi per-row.
+    active_rows = [r for r in rows if not r.skip]
+    assignee_map = await _resolve_assignees_bulk(
+        [r.assignee_name for r in active_rows if r.assignee_name], db
+    )
+    reserved = await reserve_task_codes(project_id, len(active_rows), db)
+
+    for row, (seq, code) in zip(active_rows, reserved):
         try:
             assignee_id: Optional[int] = None
             if row.assignee_name:
-                assignee_id = await _resolve_assignee(row.assignee_name, db)
+                assignee_id = assignee_map.get(row.assignee_name.strip().lower())
 
             # asyncpg requires datetime.date objects, never strings
             deadline = datetime.date.fromisoformat(row.deadline) if row.deadline else None
@@ -286,13 +316,13 @@ async def bulk_create_tasks(
                 text("""
                     INSERT INTO tasks (
                         name, status, priority, deadline, end_at, description,
-                        project_id, assignee_id, company_id, updated_at
+                        project_id, assignee_id, company_id, seq, code, updated_at
                     ) VALUES (
                         :name,
                         CAST(:status AS "TaskStatus"),
                         CAST(:priority AS "Priority"),
                         :deadline, :end_at, :description,
-                        :project_id, :assignee_id, :company_id, NOW()
+                        :project_id, :assignee_id, :company_id, :seq, :code, NOW()
                     )
                 """),
                 {
@@ -305,6 +335,7 @@ async def bulk_create_tasks(
                     "project_id": project_id,
                     "assignee_id": assignee_id,
                     "company_id": company_id,
+                    "seq": seq, "code": code,
                 },
             )
             created += 1

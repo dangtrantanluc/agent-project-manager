@@ -24,6 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
 from ai_agent.task_update.task_verify_service import TaskVerifyService, TaskFacts
+from app.services.dependency_service import (
+    unfinished_blockers, newly_unblocked, format_blocker_warning, format_unblocked_note,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +126,9 @@ class TaskProgressService:
     def __init__(self, verify_service: TaskVerifyService | None = None):
         # Mượn verify service để resolve "task nào" + helper tên + ca fallback.
         self._verify = verify_service or TaskVerifyService()
+        # Bắt kết quả/khó khăn sau khi update (dùng chung verify cho LLM + helper).
+        from app.services.task_outcome_service import TaskOutcomeService
+        self._outcome = TaskOutcomeService(verify_service=self._verify)
 
     async def update(
         self,
@@ -132,14 +138,15 @@ class TaskProgressService:
         thread_id: str | None = None,
         user_profile: dict | None = None,
         db: AsyncSession | None = None,
+        channel: str = "gapo",
     ) -> dict:
         """Cập nhật tiến độ task theo % trong tin nhắn. Trả dict cùng contract verify()."""
         if db is not None:
-            return await self._update_with_db(message, user_id, thread_id, user_profile, db)
+            return await self._update_with_db(message, user_id, thread_id, user_profile, db, channel)
         async with AsyncSessionLocal() as session:
-            return await self._update_with_db(message, user_id, thread_id, user_profile, session)
+            return await self._update_with_db(message, user_id, thread_id, user_profile, session, channel)
 
-    async def _update_with_db(self, message, user_id, thread_id, user_profile, db) -> dict:
+    async def _update_with_db(self, message, user_id, thread_id, user_profile, db, channel="gapo") -> dict:
         percent = extract_percent(message)
         # Câu khẳng định hoàn thành (không kèm số) -> coi như 100%.
         if percent is None and is_completion(message):
@@ -170,7 +177,8 @@ class TaskProgressService:
 
         # Resolve được qua follow-up/audit/mã -> cập nhật luôn.
         if facts.is_resolved:
-            return await self._finish_update(db, facts, uid, percent, user_profile, message)
+            return await self._finish_update(db, facts, uid, percent, user_profile, message,
+                                             thread_id=thread_id, channel=channel)
 
         # Tìm được task nhưng KHÔNG phải của user -> báo không tìm thấy.
         if facts.task_id is not None:
@@ -183,7 +191,8 @@ class TaskProgressService:
         if len(candidates) == 1:
             resolved = await self._facts_for_task(db, uid, candidates[0][0])
             if resolved.is_resolved:
-                return await self._finish_update(db, resolved, uid, percent, user_profile, message)
+                return await self._finish_update(db, resolved, uid, percent, user_profile, message,
+                                                 thread_id=thread_id, channel=channel)
         if len(candidates) >= 2:
             # Mơ hồ -> đưa NÚT BẤM chọn task (không bắt user gõ lại). Payload mang
             # sẵn task_id + % để khi bấm là cập nhật ngay (không cần lưu state).
@@ -193,8 +202,9 @@ class TaskProgressService:
         return self._verify._reply(self._verify._narrate(facts, user_profile), facts=facts)
 
     async def _finish_update(self, db, facts: TaskFacts, uid: int, percent: int,
-                             user_profile, message: str) -> dict:
-        """CANCELLED-guard + UPDATE + mark follow-up + commit + câu xác nhận."""
+                             user_profile, message: str,
+                             thread_id: str | None = None, channel: str = "gapo") -> dict:
+        """CANCELLED-guard + UPDATE + mark follow-up + bắt outcome + commit + câu xác nhận."""
         if facts.status == "CANCELLED":
             name_part = self._verify._name_part(user_profile)
             return self._verify._reply(
@@ -206,16 +216,59 @@ class TaskProgressService:
         await self._apply_update(db, facts, uid, percent, new_status)
         if facts.follow_up_id is not None:
             await self._verify._mark_followup_replied(db, facts.follow_up_id, message)
-        await db.commit()
+
+        # Phụ thuộc: cảnh báo mềm nếu đánh dấu xong khi task chặn chưa xong; báo
+        # task khác đã sẵn sàng nếu task này vừa DONE và gỡ chặn cho chúng.
         final_status = new_status or facts.status
+        dep_note = await self._dependency_note(db, facts.task_id, final_status=final_status)
+
+        # Bắt KẾT QUẢ/KHÓ KHĂN khi task vừa DONE: nếu câu update đã nêu -> ghi luôn;
+        # ngược lại tạo follow-up RESULT_ISSUES để hỏi (cùng transaction).
+        outcome_note = ""
+        if self._outcome.should_ask_outcome(facts, final_status):
+            inline = self._outcome.inline_extract_outcome(message) if message else None
+            if inline:
+                if await self._outcome._write_result_issues(
+                        db, task_id=facts.task_id, uid=uid,
+                        result=inline["result"], issues=inline["issues"]):
+                    await self._outcome._audit(db, task_id=facts.task_id, uid=uid,
+                                               kind="RESULT_ISSUES", data=inline)
+                    outcome_note = "📝 Đã ghi kết quả/khó khăn bạn nêu."
+            else:
+                fid = await self._outcome.create_followup(
+                    db, task_id=facts.task_id, user_id=uid, thread_id=thread_id,
+                    channel=channel, kind="RESULT_ISSUES",
+                    question=self._outcome.build_question(user_profile, kind="RESULT_ISSUES"))
+                if fid is not None:
+                    outcome_note = self._outcome.build_question(user_profile, kind="RESULT_ISSUES")
+
+        await db.commit()
+        msg = self._confirm_message(facts.task_name, percent, final_status, user_profile)
+        if dep_note:
+            msg = f"{msg}\n\n{dep_note}"
+        if outcome_note:
+            msg = f"{msg}\n{outcome_note}"
         return {
             "type": "task_update",
             "resolved": True,
             "task_id": facts.task_id,
             "status": final_status,
             "progress": percent,
-            "message": self._confirm_message(facts.task_name, percent, final_status, user_profile),
+            "message": msg,
         }
+
+    async def _dependency_note(self, db, task_id: int, final_status: str) -> str:
+        """Dòng cảnh báo/thông báo phụ thuộc (rỗng nếu không liên quan)."""
+        parts: list[str] = []
+        if final_status == "DONE":
+            unblocked = await newly_unblocked(db, task_id)
+            if unblocked:
+                parts.append(format_unblocked_note(unblocked))
+        # Cảnh báo mềm: task này vẫn đang phụ thuộc task chưa xong.
+        blockers = await unfinished_blockers(db, task_id)
+        if blockers:
+            parts.append(format_blocker_warning(blockers))
+        return "\n".join(parts)
 
     async def _apply_update(self, db, facts: TaskFacts, uid: int, percent: int, new_status: str | None) -> None:
         """UPDATE tasks (progress + status nếu có) + recompute milestone + audit_log."""
@@ -307,7 +360,8 @@ class TaskProgressService:
             "menu": menu,
         }
 
-    async def apply_payload(self, message: str, user_id: str, db: AsyncSession | None = None) -> dict:
+    async def apply_payload(self, message: str, user_id: str, db: AsyncSession | None = None,
+                            thread_id: str | None = None, channel: str = "gapo") -> dict:
         """Xử lý payload nút bấm 'TASKUPD|<task_id>|<percent>' -> cập nhật task đó."""
         try:
             _, sid, spct = message.split("|", 2)
@@ -316,16 +370,18 @@ class TaskProgressService:
         except (ValueError, TypeError):
             return self._verify._reply("Mình chưa hiểu lựa chọn này, bạn thử lại nhé.", facts=TaskFacts())
         if db is not None:
-            return await self._apply_payload_with_db(db, uid, task_id, percent)
+            return await self._apply_payload_with_db(db, uid, task_id, percent, thread_id, channel)
         async with AsyncSessionLocal() as session:
-            return await self._apply_payload_with_db(session, uid, task_id, percent)
+            return await self._apply_payload_with_db(session, uid, task_id, percent, thread_id, channel)
 
-    async def _apply_payload_with_db(self, db, uid: int, task_id: int, percent: int) -> dict:
+    async def _apply_payload_with_db(self, db, uid: int, task_id: int, percent: int,
+                                     thread_id: str | None = None, channel: str = "gapo") -> dict:
         facts = await self._facts_for_task(db, uid, task_id)
         if not facts.is_resolved:
             return self._verify._reply(
                 "Mình chưa thấy task này được giao cho bạn, kiểm tra lại giúp mình nhé.", facts=facts)
-        return await self._finish_update(db, facts, uid, percent, None, "")
+        return await self._finish_update(db, facts, uid, percent, None, "",
+                                         thread_id=thread_id, channel=channel)
 
     # ── Lệnh /update: chọn task -> chọn trạng thái (quick-reply, stateless) ────
     # Gapo quick-reply chỉ render tốt ~9-10 nút -> mỗi TRANG 6 task + nút điều hướng
@@ -480,14 +536,16 @@ class TaskProgressService:
         await db.commit()
         return {"message": f"Đã hoãn nhắc task '{row[0]}' 1 ngày. Mai mình sẽ không nhắc task này nữa nhé."}
 
-    async def apply_blocker(self, user_id: str, task_id: int, db: AsyncSession | None = None) -> dict:
+    async def apply_blocker(self, user_id: str, task_id: int, db: AsyncSession | None = None,
+                            *, thread_id: str | None = None, channel: str = "gapo") -> dict:
         """Tạo blocker (chưa giải quyết) cho task -> đẩy điểm rủi ro project lên."""
         if db is not None:
-            return await self._apply_blocker_with_db(db, user_id, task_id)
+            return await self._apply_blocker_with_db(db, user_id, task_id, thread_id, channel)
         async with AsyncSessionLocal() as session:
-            return await self._apply_blocker_with_db(session, user_id, task_id)
+            return await self._apply_blocker_with_db(session, user_id, task_id, thread_id, channel)
 
-    async def _apply_blocker_with_db(self, db, user_id: str, task_id: int) -> dict:
+    async def _apply_blocker_with_db(self, db, user_id: str, task_id: int,
+                                     thread_id: str | None = None, channel: str = "gapo") -> dict:
         try:
             uid = int(user_id)
         except (TypeError, ValueError):
@@ -510,6 +568,10 @@ class TaskProgressService:
             INSERT INTO task_blockers (task_id, severity, description)
             VALUES (:tid, 'MED'::"BlockerSeverity", :desc)
         """), {"tid": task_id, "desc": "Báo blocker nhanh qua /update"})
+        # Hỏi lý do vướng để ghi vào blocker.description + tasks.issues (cùng transaction).
+        fid = await self._outcome.create_followup(
+            db, task_id=task_id, user_id=uid, thread_id=thread_id, channel=channel,
+            kind="BLOCKER_REASON", question="Bạn đang vướng/khó khăn ở đâu?")
         await db.commit()
         # Blocker -> rủi ro project tăng: quét lại near-real-time (best-effort).
         try:
@@ -517,8 +579,9 @@ class TaskProgressService:
             await RiskAlertService.trigger_for_project(row[1])
         except Exception:
             logger.exception("trigger risk sau blocker lỗi task=%s", task_id)
-        return {"message": f"Đã ghi nhận blocker cho task '{row[0]}'. Bạn nhắn thêm chi tiết "
-                           "nếu cần, và cập nhật lại khi gỡ được nhé."}
+        ask = (" Bạn đang vướng/khó khăn ở đâu? (nhắn 'bỏ qua' nếu chưa rõ)"
+               if fid is not None else " Bạn nhắn thêm chi tiết nếu cần, và cập nhật lại khi gỡ được nhé.")
+        return {"message": f"Đã ghi nhận blocker cho task '{row[0]}'.{ask}"}
 
     @staticmethod
     async def _recompute_milestone(db, milestone_id: int) -> None:

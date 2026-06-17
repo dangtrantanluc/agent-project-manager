@@ -36,29 +36,23 @@ MAX_DISPLAYED_ROWS = 10
 
 # Câu user KHẲNG ĐỊNH đã hoàn thành/cập nhật một task đã được nhắc trước đó.
 # Dùng cả ở _keyword_agent (fallback) lẫn _fallback_agent_for_message (ép verify).
-TASK_UPDATE_KEYWORDS = (
-    "update rồi", "đã update", "xong rồi", "đã xong",
-    "hoàn thành rồi", "done", "làm xong", "cập nhật rồi",
+# Luật/từ khoá định tuyến tất định đã chuyển sang intent_rules.py. Import lại để
+# tương thích ngược (test/module khác có thể tham chiếu qua message_router).
+from ai_agent.router.intent_rules import (
+    TASK_UPDATE_KEYWORDS,
+    CREATE_TASK_KEYWORDS,
+    _OUTBOUND_RE,
+    _TASK_CODE_RE,
+    resolve_agents as _resolve_agents_rule,
+    keyword_agent as _keyword_agent_rule,
 )
 
-# Câu NHỜ BOT nhắn/nhắc/push NGƯỜI KHÁC -> outbound (nằm trong agent 'notification').
-# LLM hay nhầm "push X hoàn thành deadline" thành task_update (tưởng tự báo xong),
-# nên ép định tuyến bằng từ khoá. Dùng \b (word boundary) thay substring+space để
-# bắt cả "push!" hay "nhắn" cuối câu. Outbound tự bóc recipient; không có thì
-# nhánh notification sẽ hỏi lại / soạn nhắc.
-_OUTBOUND_RE = re.compile(r"\b(?:push|nhắn|nhắc|giục|đốc thúc|thúc)\b")
-
 # Tập HẸP hơn để HỎI LẠI khi không rõ người nhận: động từ gần như luôn nhắm tới
-# một người cụ thể. Cố ý BỎ "nhắc" (quá rộng — "thông báo nhắc deadline" là soạn
-# nhắc, không phải gửi cho ai) để không cướp nhầm luồng soạn thông báo.
+# một người cụ thể. Cố ý BỎ "nhắc" (quá rộng) để không cướp nhầm luồng soạn thông báo.
+# (Chỉ dùng trong message_router nên giữ ở đây, không chuyển sang intent_rules.)
 _ASKBACK_OUTBOUND_RE = re.compile(r"\b(?:push|nhắn|giục|đốc thúc|thúc)\b")
 
-# Câu GIAO VIỆC / tạo task mới cho người khác -> agent create_task.
-CREATE_TASK_KEYWORDS = ("giao task", "giao việc", "tạo task", "tạo việc", "assign task", "thêm task")
-
-# Mã task hiện hữu "[2.4]" -> câu thao tác trên task ĐÃ CÓ, không phải tạo mới
-# (chặn LLM phân nhầm sang create_task gây treo). Payload nút bấm cập nhật.
-_TASK_CODE_RE = re.compile(r"\[\d+(?:\.\d+)*\]")
+# Payload nút bấm cập nhật task.
 TASKUPD_PAYLOAD_PREFIX = "TASKUPD|"
 
 # Dấu hiệu câu hỏi THAM CHIẾU lại lượt trước (anaphora) -> chèn SQL lượt trước vào
@@ -129,7 +123,7 @@ class AgentMessageRouter:
         {"prefix": "TASKSNOOZE|", "method": "snooze_reminder", "parse": _parse_id_args,
          "session": "close", "reply": "message"},
         {"prefix": "TASKBLOCK|", "method": "apply_blocker", "parse": _parse_id_args,
-         "session": "close", "reply": "message"},
+         "session": "close", "reply": "message", "needs_ctx": True},
     ]
 
     def __init__(self):
@@ -143,6 +137,9 @@ class AgentMessageRouter:
         self.task_verify_service = TaskVerifyService()
         # Cập nhật % dùng lại task_verify_service để resolve "task nào" (không nhân đôi logic).
         self.task_progress_service = TaskProgressService(verify_service=self.task_verify_service)
+        # Bắt kết quả/khó khăn (reply cho follow-up RESULT_ISSUES/BLOCKER_REASON).
+        from app.services.task_outcome_service import TaskOutcomeService
+        self.task_outcome_service = TaskOutcomeService(verify_service=self.task_verify_service)
         self.risk_alert_service = RiskAlertService()
         self.task_create_service = TaskCreateService()
         self.add_member_service = AddMemberService()
@@ -176,6 +173,16 @@ class AgentMessageRouter:
                 res = await self.task_progress_service.menu_my_tasks(user_id, query, db=db)
                 return self._task_menu_reply(res, metadata)
 
+            # /risk -> quét rủi ro NGAY các dự án user liên quan, gửi cảnh báo cho PM
+            # (chạy thật như cron 8h30). Dùng để test thủ công không phải chờ cron.
+            if first_word in ("/risk", "/ruiro"):
+                return await self._handle_risk_command(user_id, db, metadata)
+
+            # /deadline -> chạy NGAY luồng nhắc deadline cho chính người gõ
+            # (giống cron 9h/14h). Dùng để test thủ công không phải chờ cron.
+            if first_word in ("/deadline", "/nhachan", "/nhacdeadline"):
+                return await self._handle_deadline_command(user_id, db, metadata)
+
             # Huỷ phiên.
             if msg_stripped == TASKCANCEL_PAYLOAD:
                 await close_session(user_id)
@@ -184,15 +191,26 @@ class AgentMessageRouter:
 
             # Payload nút bấm task (TASKPAGE/TASKPICK/TASKEXTEND/TASKSNOOZE/TASKBLOCK)
             # -> phân phối qua bảng khai báo _PAYLOAD_GATES.
-            dispatched = await self._dispatch_task_payload(message, user_id, db, metadata)
+            dispatched = await self._dispatch_task_payload(message, user_id, db, metadata,
+                                                           thread_id=thread_id, channel=channel)
             if dispatched is not None:
                 return dispatched
 
             # Bấm trạng thái %/Done -> cập nhật + ĐÓNG phiên.
             if message.startswith(TASKUPD_PAYLOAD_PREFIX):
-                res = await self.task_progress_service.apply_payload(message, user_id, db)
+                res = await self.task_progress_service.apply_payload(
+                    message, user_id, db, thread_id=thread_id, channel=channel)
                 await close_session(user_id)
                 return AgentReply(answer=self._extract_message(res), agent="task_update", metadata=metadata)
+
+            # Trả lời câu hỏi KẾT QUẢ/KHÓ KHĂN (follow-up RESULT_ISSUES/BLOCKER_REASON)
+            # -> ghi thẳng, KHÔNG route như update thường. Đặt TRƯỚC "đang trong phiên".
+            if db is not None and msg_stripped and not msg_stripped.startswith(("/", "TASK")):
+                fu = await self.task_outcome_service.find_pending(db, user_id, thread_id)
+                if fu is not None:
+                    res = await self.task_outcome_service.apply_reply(db, fu, msg_stripped, user_id, {})
+                    return AgentReply(answer=self._extract_message(res),
+                                      agent="task_update", metadata=metadata)
 
             # ĐANG TRONG PHIÊN + câu gõ thẳng (không phải payload) -> coi là TÌM task.
             if msg_stripped and await is_in_session(user_id):
@@ -313,6 +331,7 @@ class AgentMessageRouter:
 
     async def _dispatch_task_payload(
         self, message: str, user_id: str, db, metadata: dict,
+        thread_id: str | None = None, channel: str = "gapo",
     ) -> "AgentReply | None":
         """Phân phối payload nút bấm task qua BẢNG KHAI BÁO (thay vì chuỗi if-gate).
 
@@ -332,7 +351,9 @@ class AgentMessageRouter:
                 res = {"message": "Lựa chọn không hợp lệ."}
             else:
                 method = getattr(self.task_progress_service, gate["method"])
-                res = await method(user_id, *args, db)
+                # needs_ctx: method nhận thêm thread_id/channel (vd apply_blocker tạo follow-up).
+                kwargs = {"thread_id": thread_id, "channel": channel} if gate.get("needs_ctx") else {}
+                res = await method(user_id, *args, db, **kwargs)
             if gate["session"] == "close":
                 await close_session(user_id)
             if gate["reply"] == "menu":
@@ -342,96 +363,12 @@ class AgentMessageRouter:
         return None
 
     def _fallback_agent_for_message(self, message: str, selected: list[str]) -> list[str]:
-        """Chuẩn hoá danh sách agent sẽ chạy.
-
-        Chỉ fallback bằng từ khoá khi LLM trả về đúng ``["conversation"]`` (mặc
-        định/không chắc). Mọi trường hợp khác giữ nguyên danh sách LLM trả về.
-        """
-        agents = [a for a in selected if a] or ["conversation"]
-
-        # Câu xác nhận hoàn thành ("xong rồi"/"done"...) PHẢI vào verify bất kể LLM
-        # phân vào đâu — đây là root-cause fix (LLM hay phân nhầm sang notification/
-        # conversation rồi tự "khen" mà chưa kiểm DB). Trả độc quyền ["task_update"]:
-        # câu này chỉ có một ý định, chạy thêm agent khác chỉ gộp 2 đoạn mâu thuẫn.
-        # Verify tự kiểm có follow-up không; không có thì hỏi lại, vô hại.
-        # (Edge: "làm xong báo cáo giúp tôi" cũng rơi vào đây — hiếm, chấp nhận.)
-        lowered = message.lower()
-
-        # Câu nêu MÃ task "[x.y]" -> thao tác trên task ĐÃ CÓ (cập nhật/kiểm tra),
-        # KHÔNG bao giờ là tạo mới. Ép task_update để LLM không đẩy nhầm create_task
-        # (vốn gọi LLM bóc tách -> treo lâu như log đã thấy).
-        if _TASK_CODE_RE.search(message):
-            return ["task_update"]
-
-        has_create = any(kw in lowered for kw in CREATE_TASK_KEYWORDS)
-        has_update = any(kw in lowered for kw in TASK_UPDATE_KEYWORDS)
-
-        # Câu chứa CẢ hai loại từ khoá ("giao task X cho Y làm xong trước thứ 6" có
-        # 'giao task' lẫn 'làm xong'): ưu tiên create khi có " cho " (giao cho ai đó);
-        # "tôi vừa tạo task xong rồi" không có " cho " -> task_update (verify, vô hại).
-        if has_create and (not has_update or " cho " in lowered):
-            return ["create_task"]
-
-        if has_update:
-            return ["task_update"]
-
-        # Nhờ bot nhắn/nhắc/push NGƯỜI KHÁC -> notification (outbound). Đặt sau
-        # task_update để self-report "xong rồi" vẫn vào verify.
-        if _OUTBOUND_RE.search(lowered):
-            return ["notification"]
-
-        # Câu THÔNG BÁO tiến độ kèm % ("task X mới 60%", "cập nhật ... 80%") -> task_update.
-        # Loại câu HỎI ("dự án được bao nhiêu %?", "... 80% chưa?") để không cướp của report/text2sql.
-        if has_percent(lowered) and not any(q in lowered for q in ("bao nhiêu", "mấy", "?", "chưa", "là bao")):
-            progress_ctx = ("task", "công việc", "tiến độ", "update", "cập nhật",
-                            "làm", "xong", "hoàn thành", "tôi", "mình", "em")
-            if any(c in lowered for c in progress_ctx):
-                return ["task_update"]
-
-        if agents == ["conversation"]:
-            # LLM không chắc → cứu intent bằng từ khoá tiếng Việt.
-            keyword_agent = self._keyword_agent(message)
-            return [keyword_agent] if keyword_agent else agents
-
-        # >1 agent: loại 'conversation' thừa — agent nghiệp vụ đã tự chào & trả lời
-        # đủ ngữ cảnh (qua user_context/memory_context), thêm conversation chỉ lặp ý.
-        business = [a for a in agents if a != "conversation"]
-        if business:
-            logger.info("Loại 'conversation' thừa, giữ agents=%s", business)
-            return business
-        return agents
+        """Wrapper mỏng → intent_rules.resolve_agents (giữ API cũ cho test/caller)."""
+        return _resolve_agents_rule(message, selected)
 
     def _keyword_agent(self, message: str) -> str:
-        lowered = message.lower()
-        task_update_keywords = TASK_UPDATE_KEYWORDS
-        planning_keywords = ("lập kế hoạch", "kế hoạch", "phân chia công việc", "milestone")
-        report_keywords = ("báo cáo", "thống kê", "report", "tiến độ tổng thể")
-        notification_keywords = ("thông báo", "nhắc nhở", "reminder", "notification")
-        data_keywords = (
-            "dự án",
-            "project",
-            "task",
-            "công việc",
-            "deadline",
-            "worklog",
-            "bao nhiêu",
-            "danh sách",
-            "ai là",
-        )
-
-        # task_update kiểm tra TRƯỚC data_keywords: câu "làm xong task X" có cả 'task'
-        # (data) lẫn 'làm xong' (task_update) — phải ưu tiên xác minh hoàn thành.
-        if any(keyword in lowered for keyword in task_update_keywords):
-            return "task_update"
-        if any(keyword in lowered for keyword in planning_keywords):
-            return "planning"
-        if any(keyword in lowered for keyword in report_keywords):
-            return "report"
-        if any(keyword in lowered for keyword in notification_keywords):
-            return "notification"
-        if any(keyword in lowered for keyword in data_keywords):
-            return "text2sql"
-        return "conversation"
+        """Wrapper mỏng → intent_rules.keyword_agent."""
+        return _keyword_agent_rule(message)
 
     def _combine_results(
         self, agent_names: list[str], results: list[Any]
@@ -548,6 +485,7 @@ class AgentMessageRouter:
                 memory_context=memory_context,
                 thread_id=thread_id,
                 user_profile=user_profile or {},
+                channel=channel,
             )
             return self._extract_message(result)
 
@@ -591,6 +529,87 @@ class AgentMessageRouter:
             result = await self._load_user_profile(user_id, db)
         logger.info("profile_load_ms=%.0f", (time.perf_counter() - t) * 1000)
         return result
+
+    async def _handle_risk_command(
+        self, user_id: str, db: AsyncSession | None, metadata: dict
+    ) -> AgentReply:
+        """/risk: quét rủi ro các dự án user liên quan, gửi cảnh báo cho PM (test thủ công)."""
+        import pytz
+        from datetime import datetime
+
+        async def _run(session: AsyncSession) -> AgentReply:
+            profile = await self._load_user_profile(user_id, session)
+            role = (profile or {}).get("role")
+            if role not in ("MANAGER", "ADMIN", "SUPER_ADMIN"):
+                return AgentReply(
+                    answer="Chỉ quản lý (MANAGER/ADMIN) mới quét rủi ro được nhé.",
+                    agent="notification", metadata=metadata,
+                )
+            today = datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).date().isoformat()
+            stats = await self.risk_alert_service.scan_and_alert_for_user(
+                session, user_id=int(user_id), today_iso=today,
+            )
+            scanned, sent, skipped = stats["scanned"], stats["sent"], stats["skipped"]
+            if scanned == 0:
+                answer = "Bạn chưa tham gia dự án nào đang chạy để quét rủi ro."
+            elif sent == 0:
+                # skipped do: đã gửi hôm nay (dedup), không at-risk, hoặc PM chưa link Gapo.
+                answer = (
+                    f"Đã quét {scanned} dự án — không có cảnh báo mới gửi đi "
+                    f"(đã gửi hôm nay, hoặc chưa tới ngưỡng rủi ro, hoặc PM chưa liên kết Gapo)."
+                )
+            else:
+                answer = f"Đã quét {scanned} dự án, gửi {sent} cảnh báo rủi ro cho PM phụ trách."
+            return AgentReply(answer=answer, agent="notification", metadata=metadata)
+
+        if db is not None:
+            return await _run(db)
+        async with AsyncSessionLocal() as own_db:
+            return await _run(own_db)
+
+    async def _handle_deadline_command(
+        self, user_id: str, db: AsyncSession | None, metadata: dict
+    ) -> AgentReply:
+        """/deadline: chạy ngay luồng nhắc deadline cho chính người gõ (test thủ công).
+
+        Tái dùng run_deadline_notifications(only_user_id=...) — gửi digest + nút bấm
+        + tạo follow-up đúng như cron. Job tự gửi qua Gapo nên reply ở đây chỉ là
+        dòng trạng thái. Dedup theo ngày: gõ lần 2 cùng ngày sẽ không gửi lại.
+        """
+        from ai_agent.checkin.scheduler import run_deadline_notifications
+
+        async def _count_due(session: AsyncSession) -> int:
+            row = (await session.execute(text("""
+                SELECT COUNT(*) FROM tasks t
+                JOIN gapo_user_maps g ON g.user_id = t.assignee_id
+                WHERE t.assignee_id = :uid
+                  AND t.deadline IS NOT NULL
+                  AND t.status::text <> 'DONE'
+                  AND (t.snooze_reminder_until IS NULL OR t.snooze_reminder_until < CURRENT_DATE)
+            """), {"uid": int(user_id)})).scalar()
+            return int(row or 0)
+
+        if db is not None:
+            n = await _count_due(db)
+        else:
+            async with AsyncSessionLocal() as own_db:
+                n = await _count_due(own_db)
+
+        if n == 0:
+            return AgentReply(
+                answer="Bạn không có task nào đang chờ deadline để nhắc.",
+                agent="notification", metadata=metadata,
+            )
+
+        # slot=morning để gồm cả due_today + sắp đến hạn (đầy đủ nhất cho test).
+        await run_deadline_notifications(slot="morning", only_user_id=int(user_id))
+        return AgentReply(
+            answer=(
+                "Đã chạy nhắc deadline cho bạn — kiểm tra tin nhắn nhắc + nút bấm phía trên nhé. "
+                "(Nếu không thấy: hôm nay đã nhắc rồi, hoặc chưa task nào tới mốc nhắc.)"
+            ),
+            agent="notification", metadata=metadata,
+        )
 
     async def _load_memory_context(self, conversation_id: str, db: AsyncSession, message: str = "") -> str:
         try:

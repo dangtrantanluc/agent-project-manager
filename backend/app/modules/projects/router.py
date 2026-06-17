@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from typing import Optional
@@ -6,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_agent_user, get_current_user, get_db, require_role, is_restricted
+from app.core.code_gen import generate_project_prefix, ensure_unique_prefix, ensure_unique_entity_prefix
 from app.modules.tasks.ai_import_service import (
     AiImportConfirmBody,
     confirm_ai_import,
@@ -14,6 +16,7 @@ from app.modules.tasks.ai_import_service import (
     serialize_workbook_context,
 )
 from app.modules.tasks.import_service import ImportConfirmBody, bulk_create_tasks, parse_xlsx
+from app.modules.projects.schemas import ProjectCreateIn, ProjectUpdateIn
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -256,17 +259,25 @@ async def weekly_report(
 
 @router.post("", status_code=201)
 async def create_project(
-    body: dict,
+    body: ProjectCreateIn,
     current_user: dict = Depends(require_role("MANAGER", "ADMIN")),
     db: AsyncSession = Depends(get_db),
 ):
+    body = body.model_dump()
+    # Tự sinh mã (prefix) nếu người tạo không nhập — dùng làm tiền tố cho task/milestone.
+    code = body.get("code")
+    if not code:
+        code = await ensure_unique_prefix(generate_project_prefix(body.get("name") or ""), db)
+    # Prefix 3 ký tự cho mã task/milestone/worklog (duy nhất toàn cục): vd MTL-T0001.
+    entity_prefix = await ensure_unique_entity_prefix(code, db)
+
     row = (await db.execute(
         text("""
             INSERT INTO projects (
-                name, code, status, priority, start_date, end_date, description,
+                name, code, entity_prefix, status, priority, start_date, end_date, description,
                 owner_id, customer_name, account_manager_id, currency_id, company_id, updated_at
             ) VALUES (
-                :name, :code, COALESCE(:status, 'PLANNED')::"ProjectStatus",
+                :name, :code, :entity_prefix, COALESCE(:status, 'PLANNED')::"ProjectStatus",
                 COALESCE(:priority, 'MEDIUM')::"Priority",
                 :start_date, :end_date, :description,
                 :owner_id, :customer_name, :account_manager_id, :currency_id, :company_id, NOW()
@@ -278,7 +289,7 @@ async def create_project(
                       created_at, updated_at
         """),
         {
-            "name": body.get("name"), "code": body.get("code"),
+            "name": body.get("name"), "code": code, "entity_prefix": entity_prefix,
             "status": body.get("status"), "priority": body.get("priority"),
             "start_date": body.get("startDate"), "end_date": body.get("endDate"),
             "description": body.get("description"),
@@ -317,10 +328,11 @@ async def get_project(
 @router.patch("/{project_id}")
 async def update_project(
     project_id: int,
-    body: dict,
+    body: ProjectUpdateIn,
     current_user: dict = Depends(require_role("MANAGER", "ADMIN")),
     db: AsyncSession = Depends(get_db),
 ):
+    body = body.model_dump(exclude_unset=True)
     existing = (await db.execute(
         text("SELECT id FROM projects WHERE id = :pid"),
         {"pid": project_id},
@@ -532,7 +544,10 @@ async def import_tasks_preview(
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file .xlsx")
 
     try:
-        result = parse_xlsx(content, sheet_name=sheet, filename=filename)
+        # openpyxl parse XML đồng bộ → chạy trong thread để không block event loop.
+        result = await asyncio.to_thread(
+            parse_xlsx, content, sheet_name=sheet, filename=filename
+        )
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -582,8 +597,9 @@ async def ai_import_preview(
         raise HTTPException(status_code=400, detail="V1 chỉ hỗ trợ file .xlsx")
 
     try:
-        preview = parse_ai_import_xlsx(content, filename=filename)
-        workbook_context = serialize_workbook_context(content)
+        # openpyxl parse đồng bộ → đẩy sang thread, tránh block event loop.
+        preview = await asyncio.to_thread(parse_ai_import_xlsx, content, filename=filename)
+        workbook_context = await asyncio.to_thread(serialize_workbook_context, content)
         preview = await enrich_with_planning_agent(preview, workbook_context)
     except (ValueError, RuntimeError) as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -87,9 +87,9 @@ def test_build_reasons_only_nonzero():
 
 def test_detect_filters_and_sorts():
     db = _FakeSession({"from projects": [
-        (1, "Alpha", 10, None, 4, 0, 0, 0, 0, 0),
-        (2, "Beta", 11, None, 0, 0, 1, 0, 0, 0),
-        (3, "Gamma", 12, None, 1, 0, 1, 0, 0, 0),
+        (1, "Alpha", 10, None, 4, 0, 0, 0, 0, 0, 0),
+        (2, "Beta", 11, None, 0, 0, 1, 0, 0, 0, 0),
+        (3, "Gamma", 12, None, 1, 0, 1, 0, 0, 0, 0),
     ]})
     risks = asyncio.run(detect_at_risk_projects(db))
     ids = [r.project_id for r in risks]
@@ -117,7 +117,7 @@ def test_build_draft_message_template_no_confirm_question():
 def _alert_responses(*, pm_thread=None, pm_user="900", exists=False):
     return {
         # detect_at_risk_projects: 1 project HIGH, owner=10
-        "from projects p": [(1, "Alpha", 10, None, 4, 0, 0, 0, 0, 0)],
+        "from projects p": [(1, "Alpha", 10, None, 4, 0, 0, 0, 0, 0, 0)],
         # dedup check
         "from risk_alerts where correlation_id": [(1,)] if exists else [],
         # _resolve_pm_channel

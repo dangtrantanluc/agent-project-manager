@@ -1,4 +1,6 @@
-import { vi } from "vitest";
+import "@testing-library/jest-dom/vitest";
+import { afterEach, vi } from "vitest";
+import { cleanup } from "@testing-library/react";
 
 const store = new Map<string, string>();
 
@@ -19,5 +21,12 @@ const localStorageMock = {
   },
 };
 
+// jsdom cung cấp window thật (cần cho render React) — chỉ override localStorage
+// để test có store sạch, KHÔNG stub cả window (sẽ phá document/render).
 vi.stubGlobal("localStorage", localStorageMock);
-vi.stubGlobal("window", { localStorage: localStorageMock });
+
+// Unmount component & dọn DOM sau mỗi test để tránh rò rỉ giữa các test.
+afterEach(() => {
+  cleanup();
+  store.clear();
+});

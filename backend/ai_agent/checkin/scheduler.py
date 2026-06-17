@@ -8,7 +8,16 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 
-from ai_agent.checkin.constants import CheckinSlot, ADVISORY_LOCK_KEY
+from ai_agent.checkin.constants import (
+    CheckinSlot,
+    ADVISORY_LOCK_KEY,
+    LOCK_CHECKIN,
+    LOCK_REMINDER,
+    LOCK_MISSING,
+    LOCK_EXPIRE_STALE,
+    LOCK_RISK_SCAN,
+    LOCK_DEADLINE,
+)
 
 _VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
 _scheduler = AsyncIOScheduler(timezone=_VN_TZ)
@@ -86,39 +95,35 @@ def stop_checkin_scheduler() -> None:
     logger.info("[Scheduler] Check-in scheduler stopped")
 
 
-async def _with_advisory_lock(coro):
+async def _with_advisory_lock(coro, lock_key: int = ADVISORY_LOCK_KEY):
     from database import AsyncSessionLocal
     from sqlalchemy import text
 
     async with AsyncSessionLocal() as db:
         locked = (await db.execute(
-            text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}
+            text("SELECT pg_try_advisory_lock(:k)"), {"k": lock_key}
         )).scalar()
         if not locked:
-            logger.info("[Scheduler] Advisory lock busy, skipping run")
+            logger.info("[Scheduler] Advisory lock %s busy, skipping run", lock_key)
             return
         try:
             await coro
         finally:
             await db.execute(
-                text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY}
+                text("SELECT pg_advisory_unlock(:k)"), {"k": lock_key}
             )
 
 
 async def run_checkin_slot(slot: str) -> None:
     async def _run():
         from database import AsyncSessionLocal
-        from langchain_openai import ChatOpenAI
+        from ai_agent.shared.llm_factory import make_llm
         from ai_agent.checkin import repository as repo
         from ai_agent.checkin.service import CheckinFlowService
         from gapo.gapo_client import GapoClient
         from ai_agent.checkin.worklog_parser.service import WorklogParserService
 
-        llm = ChatOpenAI(
-            model=os.getenv("MODEL_NAME"),
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("BASE_URL"),
-        )
+        llm = make_llm(purpose="checkin_slot")
         gapo = GapoClient()
         parser = WorklogParserService(llm=llm)
         svc = CheckinFlowService(gapo=gapo, worklog_parser=parser)
@@ -146,7 +151,7 @@ async def run_checkin_slot(slot: str) -> None:
                         error=str(e),
                     )
 
-    await _with_advisory_lock(_run())
+    await _with_advisory_lock(_run(), LOCK_CHECKIN)
 
 
 async def run_reminder_slot(slot: str) -> None:
@@ -182,7 +187,7 @@ async def run_reminder_slot(slot: str) -> None:
                 except Exception as e:
                     logger.error(f"[Scheduler] Reminder error session={s['id']}: {e}")
 
-    await _with_advisory_lock(_run())
+    await _with_advisory_lock(_run(), LOCK_REMINDER)
 
 
 async def run_missing_summary() -> None:
@@ -254,7 +259,7 @@ async def run_missing_summary() -> None:
                 result={"notified_admins": notified_admins},
             )
 
-    await _with_advisory_lock(_run())
+    await _with_advisory_lock(_run(), LOCK_MISSING)
 
 
 async def run_expire_stale() -> None:
@@ -279,7 +284,7 @@ async def run_expire_stale() -> None:
             await db.commit()
         logger.info("[Scheduler] run_expire_stale follow_ups=%s", followups)
 
-    await _with_advisory_lock(_run())
+    await _with_advisory_lock(_run(), LOCK_EXPIRE_STALE)
 
 
 async def run_risk_scan(today: date | None = None) -> None:
@@ -298,7 +303,7 @@ async def run_risk_scan(today: date | None = None) -> None:
             stats = await service.scan_and_alert(db, today_iso=target_day.isoformat())
         logger.info("[Scheduler] run_risk_scan today=%s %s", target_day, stats)
 
-    await _with_advisory_lock(_run())
+    await _with_advisory_lock(_run(), LOCK_RISK_SCAN)
 
 
 def _deadline_notify_date(deadline: date) -> date:
@@ -310,11 +315,24 @@ def _deadline_notify_date(deadline: date) -> date:
     return notify_date
 
 
+def _deadline_notify_date_week(deadline: date) -> date:
+    """Ngày gửi nhắc "trước 1 tuần" (deadline - 7), dời về Thứ Sáu nếu rơi cuối tuần."""
+    notify_date = deadline - timedelta(days=7)
+    if notify_date.weekday() == 5:  # Saturday -> Friday
+        return notify_date - timedelta(days=1)
+    if notify_date.weekday() == 6:  # Sunday -> Friday
+        return notify_date - timedelta(days=2)
+    return notify_date
+
+
 def _deadline_reminder_type(deadline: date, target_day: date) -> str | None:
+    # Ưu tiên mốc GẦN hơn: đến hạn hôm nay > sắp đến hạn (~2 ngày) > trước 1 tuần.
     if deadline == target_day:
         return "due_today"
     if _deadline_notify_date(deadline) == target_day:
         return "upcoming"
+    if _deadline_notify_date_week(deadline) == target_day:
+        return "upcoming_week"
     return None
 
 
@@ -334,6 +352,7 @@ def _group_due_deadline_tasks(rows, target_day: date) -> tuple[dict[tuple[int, s
             assignee_name,
             status,
             priority,
+            task_code,
         ) = row
         reminder_type = _deadline_reminder_type(deadline, target_day)
         if reminder_type is None:
@@ -343,6 +362,7 @@ def _group_due_deadline_tasks(rows, target_day: date) -> tuple[dict[tuple[int, s
         due_by_recipient[(assignee_id, str(thread_id))].append({
             "task_id": task_id,
             "task_name": task_name,
+            "task_code": task_code,
             "deadline": deadline,
             "assignee_id": assignee_id,
             "assignee_name": assignee_name,
@@ -385,13 +405,17 @@ def _deadline_quick_actions(tasks: list[dict]) -> tuple[str, list[dict]]:
     return ("Bấm task để cập nhật nhanh:", actions)
 
 
-async def run_deadline_notifications(today: date | None = None, slot: str = "morning") -> None:
+async def run_deadline_notifications(
+    today: date | None = None, slot: str = "morning", only_user_id: int | None = None
+) -> None:
     """Gửi nhắc deadline.
 
-    slot="morning" (9h): nhắc cả task đến hạn hôm nay (due_today) và task sắp
-    đến hạn (~2 ngày, upcoming).
-    slot="afternoon" (14h): chỉ nhắc lại task đến hạn HÔM NAY mà CHƯA hoàn thành.
+    slot="morning" (9h): nhắc task đến hạn hôm nay (due_today), sắp đến hạn
+    (~2 ngày, upcoming) và còn ~1 tuần (upcoming_week).
+    slot="afternoon" (14h): chỉ nhắc lại task đến hạn HÔM NAY mà CHƯA hoàn thành
+    (upcoming/upcoming_week đã nhắc buổi sáng nên bỏ qua).
     Task đã DONE tự động bị loại ở mệnh đề WHERE nên "hoàn thành rồi thì thôi".
+    only_user_id != None: chỉ nhắc cho 1 user (dùng cho lệnh /deadline test thủ công).
     """
     async def _run():
         from database import AsyncSessionLocal
@@ -409,7 +433,7 @@ async def run_deadline_notifications(today: date | None = None, slot: str = "mor
                 SELECT t.id, t.name, t.deadline, t.assignee_id,
                        p.name AS project_name, g.gapo_thread_id,
                        u.full_name AS assignee_name, t.status::text AS status,
-                       t.priority::text AS priority
+                       t.priority::text AS priority, t.code
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 JOIN users u ON u.id = t.assignee_id
@@ -419,8 +443,9 @@ async def run_deadline_notifications(today: date | None = None, slot: str = "mor
                   AND t.status::text <> 'DONE'
                   -- Bỏ qua task user đã bấm "😴 Hoãn nhắc 1 ngày".
                   AND (t.snooze_reminder_until IS NULL OR t.snooze_reminder_until < CURRENT_DATE)
+                  AND (CAST(:only_uid AS integer) IS NULL OR t.assignee_id = CAST(:only_uid AS integer))
                 ORDER BY t.deadline ASC, t.id ASC
-            """))).fetchall()
+            """), {"only_uid": only_user_id})).fetchall()
 
             due_by_recipient, skipped = _group_due_deadline_tasks(rows, target_day)
 
@@ -578,4 +603,4 @@ async def run_deadline_notifications(today: date | None = None, slot: str = "mor
                 skipped,
             )
 
-    await _with_advisory_lock(_run())
+    await _with_advisory_lock(_run(), LOCK_DEADLINE)

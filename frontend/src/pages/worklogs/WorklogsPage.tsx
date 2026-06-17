@@ -4,7 +4,7 @@ import { Plus, Pencil, Trash2, Search, X } from "lucide-react";
 import { Link } from "react-router-dom";
 import { deleteWorklog, listWorklogs, type Worklog } from "@/features/worklogs/api";
 import { listProjects } from "@/features/projects/api";
-import { formatDate, formatHours } from "@/lib/format";
+import { formatDate, formatDateTime, formatHours } from "@/lib/format";
 import { useAuth } from "@/features/auth/store";
 import { WorklogFormModal } from "./WorklogFormModal";
 import { toast } from "sonner";
@@ -176,7 +176,15 @@ export function WorklogsPage() {
                   key={w.id}
                   className="border-b border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/50 align-top"
                 >
-                  <td className="p-3 whitespace-nowrap">{formatDate(w.workDate)}</td>
+                  <td className="p-3 whitespace-nowrap">
+                    <div>{formatDate(w.workDate)}</div>
+                    <div className="text-xs text-slate-400">
+                      🕒 {formatDateTime(w.createdAt)}
+                      {w.updatedAt && w.updatedAt !== w.createdAt && (
+                        <span className="ml-1 text-amber-600" title={`Sửa lúc ${formatDateTime(w.updatedAt)}`}>· đã sửa</span>
+                      )}
+                    </div>
+                  </td>
                   <td className="p-3">
                     <Link
                       to={`/projects/${w.project.id}?tab=worklogs`}

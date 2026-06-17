@@ -69,8 +69,10 @@ class AddMemberService:
         if llm is not None:
             self._llm = llm.with_structured_output(AddMemberExtraction, method="function_calling")
         elif model and api_key and base_url:
-            base = ChatOpenAI(model=model, timeout=15, max_retries=1, temperature=0.1,
-                              api_key=api_key, base_url=base_url, reasoning_effort="none")
+            from ai_agent.shared.llm_factory import make_llm
+            base = make_llm(purpose="add_member", timeout=15, max_retries=1,
+                            temperature=0.1, reasoning_effort="none",
+                            model=model, api_key=api_key, base_url=base_url)
             self._llm = base.with_structured_output(AddMemberExtraction, method="function_calling")
         else:
             logger.warning("AddMemberService LLM chưa cấu hình; không thêm thành viên qua chat được.")

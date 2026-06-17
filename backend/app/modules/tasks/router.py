@@ -6,8 +6,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_agent_user, get_current_user, get_db, require_role, is_restricted, project_access_exists_sql
+from app.core.code_gen import next_task_code
+from app.services.dependency_service import would_create_cycle
 from app.services.task_assignment_notifier import notify_task_assigned, notify_group_new_task
 from app.services.risk_alert_service import RiskAlertService
+from app.modules.tasks.schemas import TaskCreateIn, TaskUpdateIn
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -57,7 +60,21 @@ _SELECT_TASK = """
            ), '[]'::json) AS tags,
            -- PHẢI ở cuối SELECT: _row_to_dict đọc theo chỉ số r[N]; chèn giữa sẽ lệch tags/assignee.
            (SELECT COUNT(*) FROM task_blockers b
-            WHERE b.task_id = t.id AND b.resolved_at IS NULL) AS open_blockers
+            WHERE b.task_id = t.id AND b.resolved_at IS NULL) AS open_blockers,
+           t.code,
+           -- dependsOn: các task mà task này phụ thuộc (B). PHẢI ở cuối (đọc theo r[N]).
+           COALESCE((
+               SELECT json_agg(json_build_object('id', dt.id, 'name', dt.name,
+                                                  'code', dt.code, 'status', dt.status::text))
+               FROM task_dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
+               WHERE d.blocked_task_id = t.id
+           ), '[]'::json) AS depends_on,
+           -- blocks: các task phụ thuộc task này (A).
+           COALESCE((
+               SELECT json_agg(json_build_object('id', bt.id, 'name', bt.name, 'code', bt.code))
+               FROM task_dependencies d JOIN tasks bt ON bt.id = d.blocked_task_id
+               WHERE d.depends_on_task_id = t.id
+           ), '[]'::json) AS blocks
     FROM tasks t
     LEFT JOIN users u ON u.id = t.assignee_id
     LEFT JOIN milestones m ON m.id = t.milestone_id
@@ -105,6 +122,19 @@ def _row_to_dict(r) -> dict:
         # Số blocker chưa gỡ (open). Chỉ có ở row từ _SELECT_TASK; row RETURNING
         # (create/update/transition) ngắn hơn -> mặc định 0.
         "blockerCount": (r[20] if len(r) > 20 else 0),
+        # Mã hiển thị (vd MTL-T001). Chỉ có ở row từ _SELECT_TASK; row RETURNING
+        # ngắn hơn -> None (caller re-read qua _SELECT_TASK để hydrate).
+        "code": (r[21] if len(r) > 21 else None),
+        # Phụ thuộc: dependsOn = task này chờ (B); blocks = task chờ nó (A).
+        # Chỉ có ở row từ _SELECT_TASK; RETURNING ngắn hơn -> [].
+        "dependsOn": (
+            (json.loads(r[22]) if isinstance(r[22], str) else (r[22] or []))
+            if len(r) > 22 else []
+        ),
+        "blocks": (
+            (json.loads(r[23]) if isinstance(r[23], str) else (r[23] or []))
+            if len(r) > 23 else []
+        ),
     }
 
 
@@ -217,7 +247,7 @@ async def list_tasks(
 @router.post("", status_code=201)
 @router.post("/by-project/{project_id}", status_code=201)
 async def create_task(
-    body: dict,
+    body: TaskCreateIn,
     background_tasks: BackgroundTasks,
     project_id: Optional[int] = None,
     current_user: dict = Depends(get_current_user),
@@ -226,7 +256,11 @@ async def create_task(
     if not _is_privileged(current_user):
         raise HTTPException(status_code=403, detail="Chỉ quản lý mới được tạo task")
 
-    target_project_id = project_id or body["projectId"]
+    # Validate ở biên xong → dùng dict cho phần thân giữ nguyên.
+    body = body.model_dump()
+    target_project_id = project_id or body.get("projectId")
+    if not target_project_id:
+        raise HTTPException(status_code=422, detail="Thiếu projectId")
     project_row = (await db.execute(
         text("SELECT company_id FROM projects WHERE id = :pid"),
         {"pid": target_project_id},
@@ -234,16 +268,19 @@ async def create_task(
     if not project_row:
         raise HTTPException(status_code=404, detail="Project không tồn tại")
 
+    seq, code = await next_task_code(target_project_id, db)
     row = (await db.execute(
         text("""
             INSERT INTO tasks (
                 name, status, priority, deadline, end_at, description,
-                project_id, assignee_id, milestone_id, currency_id, company_id, updated_at
+                project_id, assignee_id, milestone_id, currency_id, company_id,
+                seq, code, updated_at
             ) VALUES (
                 :name, COALESCE(:status, 'TODO')::"TaskStatus",
                 COALESCE(:priority, 'MEDIUM')::"Priority",
                 :deadline, :end_at, :description,
-                :project_id, :assignee_id, :milestone_id, :currency_id, :company_id, NOW()
+                :project_id, :assignee_id, :milestone_id, :currency_id, :company_id,
+                :seq, :code, NOW()
             )
             RETURNING id, name, status, priority, deadline, end_at,
                       description, result, issues, total_hours,
@@ -259,6 +296,7 @@ async def create_task(
             "milestone_id": body.get("milestoneId"),
             "currency_id": body.get("currencyId"),
             "company_id": project_row[0],
+            "seq": seq, "code": code,
         },
     )).fetchone()
 
@@ -431,14 +469,119 @@ async def get_task(
     return _row_to_dict(row)
 
 
+# ── Lịch sử hoạt động của task (TaskActivityTimeline) ────────────────────────────
+_ACTIVITY_STATUS_LABEL = {
+    "TODO": "Cần làm", "IN_PROGRESS": "Đang làm",
+    "CANCELLED": "Đã huỷ", "DONE": "Hoàn thành",
+}
+_ACTIVITY_LIMIT = 50
+
+
+def _activity_status(s) -> str:
+    return _ACTIVITY_STATUS_LABEL.get(str(s), str(s) if s else "?")
+
+
+def _build_activity_event(tool, source, actor, args, result, at) -> dict:
+    """Map 1 dòng (audit/blocker) -> sự kiện {at, type, icon, source, actor, summary}."""
+    args = args or {}
+    result = result or {}
+    if tool == "task_progress_update":
+        op, np = args.get("old_progress"), result.get("new_progress")
+        os_, ns = args.get("old_status"), result.get("new_status")
+        summary = f"Cập nhật tiến độ {op}% → {np}%"
+        if os_ != ns:
+            summary += f" ({_activity_status(os_)} → {_activity_status(ns)})"
+        return {"type": "progress", "icon": "📈", "summary": summary,
+                "source": source, "actor": actor, "at": at}
+    if tool == "task_outcome_update":
+        if args.get("kind") == "BLOCKER_REASON":
+            summary = "Ghi lý do đang kẹt"
+        else:
+            parts = [p for p, v in (("kết quả", result.get("result_added")),
+                                    ("khó khăn", result.get("issues_added"))) if v]
+            summary = "Ghi " + (" & ".join(parts) or "ghi chú")
+        return {"type": "outcome", "icon": "📝", "summary": summary,
+                "source": source, "actor": actor, "at": at}
+    if tool == "task_status_transition":
+        summary = f"Đổi trạng thái: {_activity_status(args.get('old_status'))} → {_activity_status(result.get('new_status'))}"
+        return {"type": "transition", "icon": "🔄", "summary": summary,
+                "source": source, "actor": actor, "at": at}
+    if tool == "create_task_from_chat":
+        return {"type": "created", "icon": "✨", "summary": "Tạo task qua chat",
+                "source": source, "actor": actor, "at": at}
+    if tool == "blocker_open":
+        return {"type": "blocker_open", "icon": "⛔",
+                "summary": f"Báo blocker: {(args.get('desc') or '').strip() or '(không mô tả)'}",
+                "source": source, "actor": actor, "at": at}
+    if tool == "blocker_resolved":
+        return {"type": "blocker_resolved", "icon": "✅", "summary": "Gỡ blocker",
+                "source": source, "actor": actor, "at": at}
+    return {"type": "other", "icon": "•", "summary": tool, "source": source, "actor": actor, "at": at}
+
+
+@router.get("/{task_id}/activity")
+async def task_activity(
+    task_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dòng thời gian: đổi %/status, ghi kết quả/khó khăn, tạo/gỡ blocker (mới nhất trước)."""
+    # Quyền: chỉ xem task user truy cập được (giống GET /{task_id}).
+    where = "WHERE t.id = :tid"
+    # :tid (int) cho cột task_id; :tid_txt (text) cho so sánh args_json->>'task_id'
+    # — tránh asyncpg nhập nhằng kiểu khi dùng chung 1 param cho cả 2.
+    params: dict = {"tid": task_id, "tid_txt": str(task_id), "lim": _ACTIVITY_LIMIT}
+    if is_restricted(current_user):
+        where += f" AND {project_access_exists_sql('t.project_id')}"
+        params["access_uid"] = current_user["id"]
+    exists = (await db.execute(text(f"SELECT 1 FROM tasks t {where}"), params)).fetchone()
+    if not exists:
+        raise HTTPException(status_code=404, detail="Task không tồn tại")
+
+    rows = (await db.execute(text("""
+        SELECT at, tool, source, actor, args_json, result_json FROM (
+            SELECT a.created_at AS at, a.tool AS tool, a.source::text AS source,
+                   u.full_name AS actor, a.args_json AS args_json, a.result_json AS result_json
+            FROM agent_audit_log a
+            LEFT JOIN users u ON u.id = (a.args_json->>'user_id')::int
+            WHERE a.args_json->>'task_id' = :tid_txt
+              AND a.tool IN ('task_progress_update','task_outcome_update',
+                             'create_task_from_chat','task_status_transition')
+            UNION ALL
+            SELECT created_at, 'blocker_open', 'chat', NULL,
+                   json_build_object('desc', description, 'sev', severity::text)::jsonb, NULL
+            FROM task_blockers WHERE task_id = :tid
+            UNION ALL
+            SELECT resolved_at, 'blocker_resolved', 'system', NULL, NULL, NULL
+            FROM task_blockers WHERE task_id = :tid AND resolved_at IS NOT NULL
+        ) ev
+        ORDER BY at DESC
+        LIMIT :lim
+    """), params)).fetchall()
+
+    events = [
+        _build_activity_event(
+            r[1], r[2], r[3],
+            r[4] if isinstance(r[4], dict) else (json.loads(r[4]) if r[4] else {}),
+            r[5] if isinstance(r[5], dict) else (json.loads(r[5]) if r[5] else {}),
+            r[0].isoformat() if r[0] else None,
+        )
+        for r in rows
+    ]
+    return {"events": events, "truncated": len(events) >= _ACTIVITY_LIMIT}
+
+
 @router.patch("/{task_id}")
 async def update_task(
     task_id: int,
-    body: dict,
+    body: TaskUpdateIn,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # exclude_unset: chỉ giữ field client thực sự gửi → giữ ngữ nghĩa PATCH cũ
+    # (vòng lặp `if js in body` bên dưới).
+    body = body.model_dump(exclude_unset=True)
     existing = (await db.execute(
         text("SELECT id, milestone_id, assignee_id FROM tasks WHERE id = :tid"),
         {"tid": task_id},
@@ -558,6 +701,16 @@ async def transition_task(
     if row[1]:
         await _recompute_milestone(row[1], db)
 
+    # Audit để Lịch sử task (TaskActivityTimeline) thấy cả lần đổi status từ web/UI.
+    await db.execute(text("""
+        INSERT INTO agent_audit_log (tool, args_json, result_json, source, created_at)
+        VALUES ('task_status_transition', CAST(:args AS jsonb), CAST(:result AS jsonb),
+                CAST('web' AS "AgentAuditSource"), NOW())
+    """), {
+        "args": json.dumps({"task_id": task_id, "user_id": current_user["id"], "old_status": row[0]}),
+        "result": json.dumps({"new_status": new_status}),
+    })
+
     await db.commit()
     background_tasks.add_task(RiskAlertService.trigger_for_project, updated[10])
     return await _fetch_task_dict(updated[0], db, current_user["id"])
@@ -661,3 +814,90 @@ async def resolve_blocker(
         "resolvedAt": row[4].isoformat() if row[4] else None,
         "createdAt": row[5].isoformat(),
     }
+
+
+# ── Phụ thuộc công việc (dependencies) ───────────────────────────────────────────
+
+async def _list_depends_on(db: AsyncSession, task_id: int) -> list[dict]:
+    """Danh sách task mà task_id phụ thuộc (B), kèm trạng thái."""
+    rows = (await db.execute(
+        text("""
+            SELECT dt.id, dt.name, dt.code, dt.status::text
+            FROM task_dependencies d JOIN tasks dt ON dt.id = d.depends_on_task_id
+            WHERE d.blocked_task_id = :tid
+            ORDER BY dt.deadline NULLS LAST, dt.id
+        """),
+        {"tid": task_id},
+    )).fetchall()
+    return [{"id": r[0], "name": r[1], "code": r[2], "status": r[3]} for r in rows]
+
+
+@router.post("/{task_id}/dependencies", status_code=201)
+async def add_dependency(
+    task_id: int,
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Đặt 'task_id phụ thuộc dependsOnTaskId' (task_id chỉ làm được sau khi kia xong)."""
+    depends_on_id = body.get("dependsOnTaskId")
+    if not depends_on_id:
+        raise HTTPException(status_code=400, detail="Thiếu dependsOnTaskId.")
+    if depends_on_id == task_id:
+        raise HTTPException(status_code=400, detail="Task không thể phụ thuộc chính nó.")
+
+    blocked = (await db.execute(
+        text("SELECT project_id, assignee_id FROM tasks WHERE id = :tid"),
+        {"tid": task_id},
+    )).fetchone()
+    if not blocked:
+        raise HTTPException(status_code=404, detail="Task không tồn tại")
+    await _ensure_can_modify_task(db, current_user, blocked[1])
+
+    depends_on = (await db.execute(
+        text("SELECT project_id FROM tasks WHERE id = :tid"),
+        {"tid": depends_on_id},
+    )).fetchone()
+    if not depends_on:
+        raise HTTPException(status_code=404, detail="Task phụ thuộc không tồn tại")
+    if depends_on[0] != blocked[0]:
+        raise HTTPException(status_code=400, detail="Chỉ liên kết phụ thuộc trong cùng dự án.")
+
+    if await would_create_cycle(db, blocked_task_id=task_id, depends_on_task_id=depends_on_id):
+        raise HTTPException(status_code=400, detail="Không thể tạo phụ thuộc vòng (A→B→…→A).")
+
+    await db.execute(
+        text("""
+            INSERT INTO task_dependencies (blocked_task_id, depends_on_task_id, created_by)
+            VALUES (:a, :b, :uid)
+            ON CONFLICT (blocked_task_id, depends_on_task_id) DO NOTHING
+        """),
+        {"a": task_id, "b": depends_on_id, "uid": current_user["id"]},
+    )
+    await db.commit()
+    return {"dependsOn": await _list_depends_on(db, task_id)}
+
+
+@router.delete("/{task_id}/dependencies/{dep_task_id}", status_code=204)
+async def remove_dependency(
+    task_id: int,
+    dep_task_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    blocked = (await db.execute(
+        text("SELECT assignee_id FROM tasks WHERE id = :tid"),
+        {"tid": task_id},
+    )).fetchone()
+    if not blocked:
+        raise HTTPException(status_code=404, detail="Task không tồn tại")
+    await _ensure_can_modify_task(db, current_user, blocked[0])
+
+    await db.execute(
+        text("""
+            DELETE FROM task_dependencies
+            WHERE blocked_task_id = :a AND depends_on_task_id = :b
+        """),
+        {"a": task_id, "b": dep_task_id},
+    )
+    await db.commit()

@@ -97,9 +97,10 @@ class TaskVerifyService:
             os.getenv("MODEL_NAME"), os.getenv("API_KEY"), os.getenv("BASE_URL"),
         )
         if model and api_key and base_url:
-            return ChatOpenAI(
-                model=model, timeout=60, api_key=api_key, base_url=base_url,
-                reasoning_effort="none",
+            from ai_agent.shared.llm_factory import make_llm
+            return make_llm(
+                purpose="task_verify", timeout=60, reasoning_effort="none",
+                model=model, api_key=api_key, base_url=base_url,
             )
         logger.warning("TaskVerifyService LLM chưa cấu hình; dùng câu trả lời tất định.")
         return None
@@ -141,7 +142,32 @@ class TaskVerifyService:
             await self._mark_followup_replied(db, facts.follow_up_id, message)
             await db.commit()
 
-        return self._reply(self._narrate(facts, user_profile), facts=facts)
+        narrated = self._narrate(facts, user_profile)
+        dep_note = await self._dependency_note(db, facts)
+        if dep_note:
+            narrated = f"{narrated}\n\n{dep_note}"
+        return self._reply(narrated, facts=facts)
+
+    async def _dependency_note(self, db, facts: TaskFacts) -> str:
+        """Cảnh báo mềm phụ thuộc cho luồng verify (không % ): nếu task resolve được.
+
+        - status DONE: báo task khác đã sẵn sàng (newly_unblocked).
+        - vẫn còn task chặn chưa xong: nhắc nhẹ.
+        """
+        if facts.task_id is None:
+            return ""
+        from app.services.dependency_service import (
+            unfinished_blockers, newly_unblocked, format_blocker_warning, format_unblocked_note,
+        )
+        parts: list[str] = []
+        if (facts.status or "").upper() == "DONE":
+            unblocked = await newly_unblocked(db, facts.task_id)
+            if unblocked:
+                parts.append(format_unblocked_note(unblocked))
+        blockers = await unfinished_blockers(db, facts.task_id)
+        if blockers:
+            parts.append(format_blocker_warning(blockers))
+        return "\n".join(parts)
 
     @staticmethod
     def _reply(message: str, *, facts: TaskFacts) -> dict:
@@ -268,6 +294,10 @@ class TaskVerifyService:
             FROM agent_follow_ups
             WHERE user_id = :uid AND thread_id = :thread_id
               AND status = CAST('PENDING' AS "FollowUpStatus")
+              -- Bỏ follow-up outcome (kết quả/khó khăn) — chúng do TaskOutcomeService
+              -- xử lý ở seam riêng; verify chỉ resolve nhắc deadline/generic.
+              AND kind NOT IN (CAST('RESULT_ISSUES' AS "FollowUpKind"),
+                               CAST('BLOCKER_REASON' AS "FollowUpKind"))
               AND created_at >= NOW() - (CAST(:ttl AS int) * INTERVAL '1 hour')
             ORDER BY created_at DESC
         """), {"uid": uid, "thread_id": str(thread_id), "ttl": FOLLOW_UP_TTL_HOURS})).fetchall()
