@@ -69,4 +69,15 @@ def test_resolve_tasks_falls_back_to_name():
     db = _FakeDB([[(1, "Fix login", "1.1", 2, 3), (2, "Fix logout", "1.2", 2, 4)]])
     out = asyncio.run(resolve_tasks(db, "Fix", 10))
     assert len(out) == 2
-    assert db.calls[0][1]["like"] == "%fix%"
+    assert db.calls[0][1]["tok0"] == "%fix%"
+
+
+def test_resolve_tasks_matches_tokens_out_of_order():
+    # "mẫu mail" phải khớp "Mẫu Email & WhatsApp" qua AND nhiều LIKE theo từ
+    # (bỏ stopword "task"), không đòi substring liền mạch.
+    db = _FakeDB([[(26, "Mẫu Email & WhatsApp", "MTL-T0026", 5, 8)]])
+    out = asyncio.run(resolve_tasks(db, "task mẫu mail", 10))
+    assert len(out) == 1 and out[0]["id"] == 26
+    params = db.calls[0][1]
+    assert params["tok0"] == "%mẫu%" and params["tok1"] == "%mail%"
+    assert "task" not in str(db.calls[0][0]).lower() or "tok2" not in params

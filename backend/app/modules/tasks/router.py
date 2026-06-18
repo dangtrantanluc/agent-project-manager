@@ -221,7 +221,16 @@ async def list_tasks(
     if q:
         where += " AND t.name ILIKE :q"; params["q"] = f"%{q}%"
 
-    order_by = "t.deadline NULLS LAST, t.priority DESC"
+    # Sort "việc cần làm trước" (mặc định, tối ưu UX): (1) task đang kẹt lên đầu,
+    # (2) việc còn mở trước — DONE/CANCELLED chìm xuống đáy, (3) deadline sớm trước
+    # (NULL cuối), (4) ưu tiên cao trước (enum: URGENT > HIGH > MEDIUM > LOW).
+    order_by = (
+        "(EXISTS (SELECT 1 FROM task_blockers b "
+        "WHERE b.task_id = t.id AND b.resolved_at IS NULL)) DESC, "
+        "(t.status IN ('DONE'::\"TaskStatus\", 'CANCELLED'::\"TaskStatus\")) ASC, "
+        "t.deadline ASC NULLS LAST, "
+        "t.priority DESC, t.id ASC"
+    )
     if sort == "updatedAt:desc":
         order_by = "t.updated_at DESC"
     elif sort == "updatedAt:asc":

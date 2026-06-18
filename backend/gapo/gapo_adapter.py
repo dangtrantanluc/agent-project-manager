@@ -609,8 +609,20 @@ class GapoAdapter:
     def _is_bot_mentioned(self, payload: GapoWebhookPayload, bot_id) -> bool:
         metadata = (payload.message.metadata or {}) if payload.message else {}
         mentions = metadata.get("mentions") or []
+        # ID bot (~5.8e18) vượt MAX_SAFE_INTEGER (9.0e15) nên payload.to_bot_id bị
+        # làm tròn mất vài chữ số cuối (vd ...229 → ...000). mention.target lại được
+        # Gapo gửi dạng STRING nên còn nguyên. Vì vậy KHÔNG so với bot_id (số) mà so
+        # với tập ID đáng tin lấy từ env (GAPO_BOT_ID/BOT_ID giữ nguyên vẹn) + client.
+        trusted = {
+            str(x) for x in (
+                bot_id,
+                os.getenv("GAPO_BOT_ID"),
+                os.getenv("BOT_ID"),
+                self.client.bot_id,
+            ) if x
+        }
         return any(
-            str(m.get("target")) == str(bot_id)
+            str(m.get("target")) in trusted
             for m in mentions if isinstance(m, dict)
         )
         

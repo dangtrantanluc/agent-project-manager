@@ -18,6 +18,20 @@ PRIVILEGED_ROLES = {"MANAGER", "ADMIN", "SUPER_ADMIN"}
 _TASK_CODE_JIRA = re.compile(r"\b([A-Z]+\d*-[A-Za-z]\d+)\b", re.IGNORECASE)
 _TASK_CODE_NUM = re.compile(r"\[(\d+(?:\.\d+)*)\]")
 
+# Bỏ tiền tố thừa người dùng hay gõ trước tên ("task mẫu mail" -> "mẫu mail")
+# để không kéo theo từ rác vào điều kiện khớp tên.
+_REF_STOPWORDS = {"task", "công", "việc", "cái", "the"}
+
+
+def _name_tokens(ref: str) -> list[str]:
+    """Tách ref thành các từ có nghĩa (>=2 ký tự, bỏ stopword) để khớp AÐ theo từ.
+
+    Cho phép gõ thiếu/đảo từ ("mẫu mail" khớp "Mẫu Email & WhatsApp") thay vì
+    đòi cả chuỗi phải là substring liền mạch.
+    """
+    toks = re.findall(r"\w+", ref.lower(), flags=re.UNICODE)
+    return [t for t in toks if len(t) >= 2 and t not in _REF_STOPWORDS]
+
 
 def is_privileged(role: str | None) -> bool:
     return str(role or "").upper() in PRIVILEGED_ROLES
@@ -97,16 +111,43 @@ async def resolve_tasks(db: AsyncSession, ref: str, sender_id: int | None) -> li
         if rows:
             return [_task_row(r) for r in rows]
 
-    like = f"%{ref.lower()}%"
-    rows = (await db.execute(text(f"""
-        SELECT t.id, t.name, t.code, t.project_id, t.assignee_id
-        FROM tasks t
-        WHERE lower(t.name) LIKE :like {scope}
-          AND t.status::text NOT IN ('DONE', 'CANCELLED')
-        ORDER BY t.updated_at DESC
-        LIMIT 10
-    """), {"like": like, "s": sender_id})).fetchall()
-    return [_task_row(r) for r in rows]
+    open_scope = f"{scope}\n          AND t.status::text NOT IN ('DONE', 'CANCELLED')"
+
+    # Khớp theo TỪ: mỗi token của ref phải xuất hiện trong tên (AND nhiều LIKE),
+    # nên "mẫu mail" vẫn khớp "Mẫu Email & WhatsApp" dù đảo/thiếu từ. Substring
+    # liền mạch cũ là trường hợp con của cái này.
+    tokens = _name_tokens(ref)
+    if tokens:
+        conds = " AND ".join(f"lower(t.name) LIKE :tok{i}" for i in range(len(tokens)))
+        params = {f"tok{i}": f"%{tok}%" for i, tok in enumerate(tokens)}
+        params["s"] = sender_id
+        rows = (await db.execute(text(f"""
+            SELECT t.id, t.name, t.code, t.project_id, t.assignee_id
+            FROM tasks t
+            WHERE {conds} {open_scope}
+            ORDER BY t.updated_at DESC
+            LIMIT 10
+        """), params)).fetchall()
+        if rows:
+            return [_task_row(r) for r in rows]
+
+    # Fallback mờ: từ-gần-đúng (pg_trgm) bắc cầu viết tắt như "mail" ~ "email".
+    # Tắt êm nếu extension chưa cài (giống name_resolver). Ngưỡng 0.3 để không loãng.
+    try:
+        rows = (await db.execute(text(f"""
+            SELECT t.id, t.name, t.code, t.project_id, t.assignee_id,
+                   word_similarity(:ref, t.name) AS sim
+            FROM tasks t
+            WHERE word_similarity(:ref, t.name) > 0.3 {open_scope}
+            ORDER BY sim DESC, t.updated_at DESC
+            LIMIT 10
+        """), {"ref": ref.lower(), "s": sender_id})).fetchall()
+        if rows:
+            return [_task_row(r) for r in rows]
+    except Exception:
+        pass  # pg_trgm chưa cài — bỏ qua nhánh mờ, giữ hành vi cũ.
+
+    return []
 
 
 def resolve_one(

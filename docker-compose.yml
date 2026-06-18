@@ -31,6 +31,8 @@ services:
       - ./init/task_dependencies.sql:/docker-entrypoint-initdb.d/010-task-dependencies.sql:ro
       # Sửa worklog vừa lưu trong check-in (thêm state AWAITING_EDIT).
       - ./init/checkin_edit_worklog.sql:/docker-entrypoint-initdb.d/011-checkin-edit-worklog.sql:ro
+      # pg_trgm + GIN index cho khớp tên task gần-đúng (fallback mờ resolve_tasks).
+      - ./init/pg_trgm.sql:/docker-entrypoint-initdb.d/012-pg-trgm.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d agent_pm"]
       interval: 10s
@@ -79,8 +81,11 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-password123}
       MINIO_BUCKET: ${MINIO_BUCKET:-avatars}
       MINIO_SECURE: "false"
-      # URL công khai trình duyệt dùng để tải ảnh (qua port S3 expose ra host).
-      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-http://localhost:9000}
+      # URL công khai trình duyệt dùng để tải ảnh. Để RỖNG -> backend sinh URL
+      # tương đối /avatars/<key>, trình duyệt tải qua nginx frontend (cùng origin
+      # :8090) thay vì gọi thẳng port 9000 (hay bị Firefox/firewall chặn).
+      # Dùng `-` thay vì `:-` để giá trị rỗng trong .env KHÔNG bị fallback default.
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL-http://localhost:9000}
     working_dir: /app
     # Publish ra host:8000 để router NAT (WAN:3637 -> 192.168.1.147:8000) đẩy
     # được webhook Gapo (POST /webhook/gapo) tới backend. LƯU Ý BẢO MẬT: việc này
@@ -123,8 +128,8 @@ services:
     image: decolua/9router:latest
     container_name: 9router
     # Proxy LLM nội bộ (backend/agent gọi qua hostname `9router`). Không map ra host.
-    expose:
-      - "20128"
+    ports:
+      - "20128:20128"
     volumes:
       - ./data:/app/data
     environment:

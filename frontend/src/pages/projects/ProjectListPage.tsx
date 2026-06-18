@@ -20,6 +20,7 @@ import { TagChips } from "@/components/ui/TagChips";
 import { formatDate, statusColors, statusLabels, priorityColors } from "@/lib/format";
 import { ProjectFormModal } from "./ProjectFormModal";
 import { useAuth } from "@/features/auth/store";
+import { toast } from "sonner";
 
 const STATUSES: ProjectStatus[] = ["PLANNED", "PENDING", "IN_PROGRESS", "DONE", "CANCELLED"];
 
@@ -47,7 +48,20 @@ export function ProjectListPage() {
 
   const del = useMutation({
     mutationFn: (id: number) => deleteProject(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["projects"] });
+      toast.success("Đã xóa dự án.");
+    },
+    onError: (e: any) => {
+      // Backend (require_role) ném 403 với {detail: "Yêu cầu quyền: ADMIN"}.
+      // Xóa dự án chỉ ADMIN được phép — báo rõ thay vì im lặng.
+      const status = e?.response?.status;
+      if (status === 403) {
+        toast.error("Bạn không có quyền xóa dự án. Thao tác này cần quyền ADMIN.");
+        return;
+      }
+      toast.error(e?.response?.data?.detail ?? "Xóa dự án thất bại, bạn thử lại nhé.");
+    },
   });
 
   const transition = useMutation({
